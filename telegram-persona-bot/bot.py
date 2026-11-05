@@ -29,6 +29,7 @@ MAX_HISTORY = int(os.getenv("MAX_HISTORY", "30"))
 
 DATA_DIR = Path(__file__).parent / "data"
 PERSONA_FILE = DATA_DIR / "persona.json"
+HISTORY_FILE = DATA_DIR / "history.json"
 
 logging.basicConfig(
     format="%(asctime)s %(levelname)s %(name)s: %(message)s", level=logging.INFO
@@ -37,8 +38,23 @@ log = logging.getLogger("persona-bot")
 
 client = AsyncOpenAI(api_key=MOONSHOT_API_KEY, base_url=MOONSHOT_BASE_URL)
 
-# ذاكرة المحادثة لكل شات (تنمسح لو أعدت تشغيل البوت)
+# ذاكرة المحادثة لكل شات — تنحفظ في ملف عشان تبقى بعد إعادة التشغيل
 histories: dict[int, deque] = defaultdict(lambda: deque(maxlen=MAX_HISTORY))
+
+
+def load_histories() -> None:
+    try:
+        raw = json.loads(HISTORY_FILE.read_text(encoding="utf-8"))
+    except (FileNotFoundError, json.JSONDecodeError):
+        return
+    for chat_id, msgs in raw.items():
+        histories[int(chat_id)].extend(msgs)
+
+
+def save_histories() -> None:
+    DATA_DIR.mkdir(exist_ok=True)
+    data = {str(k): list(v) for k, v in histories.items() if v}
+    HISTORY_FILE.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
 
 # القواعد الثابتة اللي تلف الهوية — هنا يتم إلزام الموديل بالهوية حرفياً
 LOCK_RULES = """\
@@ -115,7 +131,8 @@ async def cmd_setpersona(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         )
         return
     save_persona(text)
-    histories.clear()  # عشان ما تتأثر الهوية الجديدة بكلام قديم
+    histories.clear()
+    save_histories()  # عشان ما تتأثر الهوية الجديدة بكلام قديم
     await msg.reply_text("تم حفظ الهوية الجديدة ومسح الذاكرة القديمة ✅")
 
 
@@ -127,6 +144,7 @@ async def cmd_persona(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
 async def cmd_reset(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     histories.pop(update.effective_chat.id, None)
+    save_histories()
     await update.message.reply_text("تم مسح ذاكرة المحادثة.")
 
 
@@ -134,6 +152,7 @@ async def cmd_resetall(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     if not await owner_only(update):
         return
     histories.clear()
+    save_histories()
     await update.message.reply_text("تم مسح ذاكرة كل المحادثات.")
 
 
@@ -164,12 +183,14 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
     history.append({"role": "user", "content": user_text})
     history.append({"role": "assistant", "content": reply})
+    save_histories()
     await send_long(update, reply)
 
 
 def main() -> None:
     if OWNER_ID == 0:
         log.warning("OWNER_ID غير محدد — أوامر تغيير الهوية لن تعمل لأحد.")
+    load_histories()
     app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("setpersona", cmd_setpersona))

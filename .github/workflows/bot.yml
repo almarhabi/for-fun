@@ -1,0 +1,75 @@
+name: Telegram bot 24h
+
+# GitHub يوقف أي تشغيل بعد 6 ساعات، فالبوت يشتغل ~5:40 ساعة
+# ثم يحفظ بياناته ويشغّل نفسه من جديد. الجدولة احتياط لو توقف لأي سبب.
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "*/30 * * * *"
+  push:
+    branches: [telegram-persona-bot]
+    paths:
+      - "telegram-persona-bot/**"
+      - ".github/workflows/bot.yml"
+
+# نسخة وحدة بس تشتغل بنفس الوقت (تليجرام ما يقبل نسختين)
+# لو رفعت كود جديد، توقف النسخة القديمة وتشتغل الجديدة فوراً
+concurrency:
+  group: telegram-bot
+  cancel-in-progress: ${{ github.event_name == 'push' }}
+
+permissions:
+  contents: read
+  actions: write
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 355
+    defaults:
+      run:
+        working-directory: telegram-persona-bot
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: telegram-persona-bot/requirements.txt
+
+      - run: pip install -r requirements.txt
+
+      # استرجاع الهوية وذاكرة المحادثات من التشغيل السابق
+      - uses: actions/cache/restore@v4
+        with:
+          path: telegram-persona-bot/data
+          key: bot-data-${{ github.run_id }}
+          restore-keys: bot-data-
+
+      - name: Run bot
+        id: bot
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          MOONSHOT_API_KEY: ${{ secrets.MOONSHOT_API_KEY }}
+          OWNER_ID: ${{ secrets.OWNER_ID }}
+          KIMI_MODEL: ${{ vars.KIMI_MODEL || 'kimi-k3.1-pro' }}
+        run: |
+          mkdir -p data
+          start=$(date +%s)
+          timeout --signal=SIGINT 340m python bot.py || true
+          # لو طاح بسرعة (مثلاً مفتاح غلط) لا تعيد التشغيل فوراً — الجدولة بتحاول بعد 30 دقيقة
+          if [ $(( $(date +%s) - start )) -gt 300 ]; then echo "restart=true" >> "$GITHUB_OUTPUT"; fi
+
+      - name: Save data
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: telegram-persona-bot/data
+          key: bot-data-${{ github.run_id }}-${{ github.run_attempt }}
+
+      - name: Restart
+        if: steps.bot.outputs.restart == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run bot.yml --ref "${{ github.ref_name }}"
