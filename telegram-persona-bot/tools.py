@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+from urllib.parse import urlparse
 
 import httpx
 from bs4 import BeautifulSoup
@@ -55,18 +56,23 @@ async def _open_url(url: str) -> str:
     return text[:8000]
 
 
-async def run_tool(name: str, raw_args: str) -> str:
+async def run_tool(name: str, raw_args: str) -> tuple[str, list[dict]]:
+    """يشغل الأداة ويرجع (النتيجة للموديل، المصادر للعرض)."""
+    sources: list[dict] = []
     try:
         args = json.loads(raw_args or "{}")
         if name == "web_search":
-            out = await asyncio.to_thread(_search, args["query"], args.get("max_results", 5))
+            results = await asyncio.to_thread(_search, args["query"], args.get("max_results", 5))
+            sources = [{"title": r["title"], "url": r["url"]} for r in results if r.get("url")]
+            out = json.dumps(results, ensure_ascii=False)
         elif name == "open_url":
             out = await _open_url(args["url"])
+            sources = [{"title": "", "url": args["url"]}]
         else:
             out = f"أداة غير معروفة: {name}"
     except Exception as e:  # نرجع الخطأ للموديل بدل ما يطيح البوت
         out = f"فشلت الأداة: {e}"
-    return out if isinstance(out, str) else json.dumps(out, ensure_ascii=False)
+    return out, sources
 
 
 def describe_call(name: str, raw_args: str) -> str:
@@ -77,5 +83,6 @@ def describe_call(name: str, raw_args: str) -> str:
     if name == "web_search":
         return f"🔎 بحث: {args.get('query', '')}"
     if name == "open_url":
-        return f"🌐 فتح: {args.get('url', '')}"
+        host = urlparse(args.get("url", "")).netloc.removeprefix("www.")
+        return f"📖 قراءة: {host or args.get('url', '')}"
     return f"🛠 {name}"
