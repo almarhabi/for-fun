@@ -180,7 +180,7 @@ def system_prompt() -> str:
 
 EFFORTS = ["default", "low", "medium", "high", "max"]
 EFFORT_API = {"max": "xhigh"}  # أسماء OpenRouter
-BOOL_KEYS = ("show_thinking", "web_search", "clear_screen")
+BOOL_KEYS = ("show_thinking", "web_search")
 PARAMS = {
     "model": (str, "الموديل"),
     "provider": (str, "المزود"),
@@ -190,10 +190,9 @@ PARAMS = {
     "max_tokens": (int, "أقصى طول للرد"),
     "show_thinking": (bool, "إظهار التفكير"),
     "web_search": (bool, "البحث في الإنترنت"),
-    "clear_screen": (bool, "مسح الرسائل مع المحادثة الجديدة"),
 }
 DEFAULTS = {"model": DEFAULT_MODEL, "provider": DEFAULT_PROVIDER, "effort": "default", "temperature": None, "top_p": None,
-            "max_tokens": None, "show_thinking": True, "web_search": True, "clear_screen": True}
+            "max_tokens": None, "show_thinking": True, "web_search": True}
 
 
 def cfg(key: str):
@@ -688,12 +687,15 @@ def error_html(e: Exception, owner: bool) -> str:
     return text
 
 
+regen_msg: dict[int, int] = {}  # الرسالة اللي عليها زر 🔄 في كل شات
+
+
 async def drop_old_buttons(bot, chat_id: int) -> None:
     """زر إعادة التوليد يبقى على آخر رد بس."""
-    turn = last_turn.get(chat_id)
-    if turn and turn.response_ids:
+    mid = regen_msg.pop(chat_id, None)
+    if mid:
         with contextlib.suppress(TelegramError):
-            await bot.edit_message_reply_markup(chat_id, turn.response_ids[-1], reply_markup=None)
+            await bot.edit_message_reply_markup(chat_id, mid, reply_markup=None)
 
 
 async def _generate(bot, chat_id: int, turn: Turn) -> None:
@@ -765,6 +767,8 @@ async def _generate(bot, chat_id: int, turn: Turn) -> None:
     await ui.finish()
     turn.response_ids = ui.message_ids()
     last_turn[chat_id] = turn
+    if turn.response_ids:
+        regen_msg[chat_id] = turn.response_ids[-1]
     track(chat_id, *turn.response_ids)
     reply = ui.reply_md.strip()
     if reply and not ui.error:
@@ -1033,7 +1037,7 @@ def welcome_html(owner: bool) -> str:
         "• تعدّل رسالتك ✏️ وأرد عليها من جديد",
         "• ترد على أي رسالة عشان تسألني عنها",
         "",
-        f"<b>{NEW_CHAT_BTN}</b> تحت أو /new — يبدأ من الصفر ويمسح القديم.",
+        f"<b>{NEW_CHAT_BTN}</b> تحت أو /new — يبدأ من الصفر (الرسائل القديمة تبقى في الشات).",
     )
     if owner:
         text += "\n\n" + lines_html(
@@ -1055,20 +1059,17 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def cmd_new(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """محادثة جديدة: البوت ينسى كل شي صار قبل، والرسائل القديمة تنمسح من الشاشة."""
+    """محادثة جديدة: البوت ينسى كل شي صار قبل، والرسائل القديمة تبقى في الشات مثل ما هي."""
     chat_id = update.effective_chat.id
     ui = active.get(chat_id)
     if ui:
         ui.stop()
     pending.pop(chat_id, None)
     async with chat_locks[chat_id]:
+        await drop_old_buttons(context.bot, chat_id)  # زر 🔄 القديم ما عاد يخص المحادثة الجديدة
         histories.pop(chat_id, None)
         save_histories()
         last_turn.pop(chat_id, None)
-        ids = screen.pop(chat_id, []) + [update.message.message_id]
-        _write_json(SCREEN_FILE, {str(k): v for k, v in screen.items() if v})
-        if cfg("clear_screen"):
-            await delete_many(context.bot, chat_id, ids)
         await send_html(context.bot, chat_id, lines_html(
             "✨ <b>محادثة جديدة</b>",
             "بدأنا من الصفر — ما أتذكر أي شي من المحادثة اللي قبل.",
@@ -1286,7 +1287,6 @@ def settings_keyboard() -> InlineKeyboardMarkup:
         [btn(p.split("/")[0], "provider", p, prov) for p in PROVIDERS],
         [btn("الاثنين", "provider", ",".join(PROVIDERS), prov), btn("أي مزود", "provider", "any", prov)],
         [toggle("التفكير", "show_thinking"), toggle("البحث", "web_search")],
-        [toggle("مسح الرسائل مع المحادثة الجديدة", "clear_screen")],
     ])
 
 

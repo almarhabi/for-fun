@@ -502,12 +502,14 @@ async def scenario():
     bot.save_setting("show_thinking", True)
 
     # 14) محادثة جديدة
-    tracked = list(bot.screen[OWNER])
+    before_new = set(S["msgs"])
     user_msg("🆕 محادثة جديدة")
     await wait_idle()
-    remaining = [i for i in tracked if i in S["msgs"]]
+    remaining = [i for i in before_new if i in S["msgs"]]
     check("new: memory cleared", not bot.histories.get(OWNER))
-    check("new: screen cleared", not remaining, remaining[:5])
+    check("new: old messages kept", len(remaining) == len(before_new), (len(remaining), len(before_new)))
+    with_regen = [i for i in remaining if "regen" in json.dumps(S["msgs"][i].get("reply_markup") or {})]
+    check("new: old regen button removed", not with_regen, [S["msgs"][i].get("text", "")[:60] for i in with_regen])
     check("new: banner", "محادثة جديدة" in last_bot()["text"])
 
     # 15) ضغط على الشبكة (429) — الرد لازم يكمل كامل
