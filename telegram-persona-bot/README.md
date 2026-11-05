@@ -136,8 +136,9 @@
 ملف `.github/workflows/bot2.yml` يشغّل بوتاً ثانياً بنفس الكود لكن **مستقل تماماً**: توكن وموديل ومزود
 وبيانات (هوية/قواعد/ذاكرة) منفصلة في كاش خاص (`bot2-data-`). ما يشترك مع الأول إلا الكود والسيرفر.
 
-أضف أسراراً بلاحقة `_2`:
-- `TELEGRAM_BOT_TOKEN_2` · `OPENROUTER_API_KEY_2` · `OWNER_ID_2`
+يكفي تضيف **توكن البوت الثاني فقط** — المفتاح ورقمك يرجعان لنفس الأول تلقائياً:
+- `TELEGRAM_BOT_TOKEN_2` (مطلوب)
+- (اختياري) `OPENROUTER_API_KEY_2` و`OWNER_ID_2` لو تبيهما مختلفين؛ بدونهما يستخدم `OPENROUTER_API_KEY` و`OWNER_ID` الأصليين
 - (اختياري) `GH_PAT_2` · `PERSONA_KEY_2`
 - الموديل الافتراضي `z-ai/glm-5.3` والمزود `baidu/fp8` — تغيّرهما من **Variables**: `OPENROUTER_MODEL_2` و`OPENROUTER_PROVIDER_2`. و`USE_TOR_2=true` لتور.
 

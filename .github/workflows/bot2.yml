@@ -38,14 +38,15 @@ jobs:
 
       - name: Check secrets
         env:
+          # التوكن لازم يكون خاص بالبوت الثاني؛ المفتاح والـ ID يرجعان لنفس الأول تلقائياً
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN_2 }}
-          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY_2 }}
-          OWNER_ID: ${{ secrets.OWNER_ID_2 }}
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY_2 || secrets.OPENROUTER_API_KEY }}
+          OWNER_ID: ${{ secrets.OWNER_ID_2 || secrets.OWNER_ID }}
         run: |
           missing=0
-          for n in TELEGRAM_BOT_TOKEN OPENROUTER_API_KEY OWNER_ID; do
-            if [ -z "${!n}" ]; then echo "::error::Secret ${n}_2 is missing — add it in Settings > Secrets and variables > Actions > Secrets"; missing=1;
-            else echo "${n}_2: OK"; fi
+          if [ -z "$TELEGRAM_BOT_TOKEN" ]; then echo "::error::Secret TELEGRAM_BOT_TOKEN_2 ناقص — أضف توكن بوت ثانٍ في Settings > Secrets and variables > Actions"; missing=1; else echo "TELEGRAM_BOT_TOKEN_2: OK"; fi
+          for n in OPENROUTER_API_KEY OWNER_ID; do
+            if [ -z "${!n}" ]; then echo "::error::لا يوجد $n (لا _2 ولا الأصلي)"; missing=1; else echo "$n: OK (مشترك مع الأول أو _2)"; fi
           done
           [ "$missing" = 0 ] || exit 1
           key=$(printf '%s' "$OPENROUTER_API_KEY" | tr -d '\r\n' | sed -E 's/^[[:space:]"'"'"']+//; s/[[:space:]"'"'"']+$//; s/^[Bb]earer[[:space:]]+//')
@@ -84,8 +85,8 @@ jobs:
         id: bot
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN_2 }}
-          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY_2 }}
-          OWNER_ID: ${{ secrets.OWNER_ID_2 }}
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY_2 || secrets.OPENROUTER_API_KEY }}
+          OWNER_ID: ${{ secrets.OWNER_ID_2 || secrets.OWNER_ID }}
           OPENROUTER_MODEL: ${{ vars.OPENROUTER_MODEL_2 || 'z-ai/glm-5.3' }}
           OPENROUTER_PROVIDER: ${{ vars.OPENROUTER_PROVIDER_2 || 'baidu/fp8' }}
           GH_PAT: ${{ secrets.GH_PAT_2 }}
