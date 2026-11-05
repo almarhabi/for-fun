@@ -11,15 +11,19 @@ from urllib.parse import parse_qs, urlparse
 PORT = 18555
 OWNER = 111
 os.environ.update(TELEGRAM_BOT_TOKEN="123:TEST", OPENROUTER_API_KEY="x", OWNER_ID=str(OWNER),
-                  TELEGRAM_API_BASE=f"http://127.0.0.1:{PORT}")
+                  TELEGRAM_API_BASE=f"http://127.0.0.1:{PORT}",
+                  TELEGRAPH_API_BASE=f"http://127.0.0.1:{PORT}/tph",
+                  GITHUB_API_BASE=f"http://127.0.0.1:{PORT}/gh", GITHUB_PAT="ghp_test")
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
-import bot, render
+import bot, render, telegraph
 from openai.types.chat import ChatCompletionChunk
 
 DATA = pathlib.Path(tempfile.mkdtemp())
 bot.DATA_DIR = DATA
 bot.PERSONA_FILE, bot.HISTORY_FILE = DATA / "persona.json", DATA / "history.json"
 bot.SETTINGS_FILE, bot.SCREEN_FILE = DATA / "settings.json", DATA / "screen.json"
+bot.TELEGRAPH_FILE = DATA / "telegraph.json"
+bot.tph = telegraph.Telegraph(bot.TELEGRAPH_FILE, short_name="TestBot")
 bot.EDIT_INTERVAL = 0.15
 bot.GROUP_WAIT = 0.4
 
@@ -27,6 +31,99 @@ bot.GROUP_WAIT = 0.4
 S = {"lock": threading.Lock(), "updates": [], "uid": 1, "mid": 1000, "msgs": {}, "calls": [], "flaky": False}
 BOT_USER = {"id": 999, "is_bot": True, "first_name": "T", "username": "test_bot"}
 FILES = {}
+
+# ---------------- Telegra.ph وهمي ----------------
+TPH = {"pages": {}, "n": 0, "fail": False}
+
+
+def tph_api(method, p):
+    if TPH["fail"]:
+        return {"ok": False, "error": "SERVER_ERROR"}
+    if method == "createAccount":
+        return {"ok": True, "result": {"access_token": "tok123", "short_name": p.get("short_name", "")}}
+    if method == "createPage":
+        if p.get("access_token") != "tok123":
+            return {"ok": False, "error": "ACCESS_TOKEN_INVALID"}
+        TPH["n"] += 1
+        path = f"page-{TPH['n']}"
+        TPH["pages"][path] = {"title": p.get("title", ""), "content": json.loads(p.get("content", "[]"))}
+        return {"ok": True, "result": {"url": f"https://telegra.ph/{path}", "path": path}}
+    return {"ok": False, "error": "UNKNOWN_METHOD"}
+
+
+def tph_text(path):
+    def walk(n, out):
+        if isinstance(n, str):
+            out.append(n); return
+        a = n.get("attrs") or {}
+        if a.get("href"):
+            out.append(a["href"])
+        for c in n.get("children", []):
+            walk(c, out)
+    out = []
+    for node in TPH["pages"][path]["content"]:
+        walk(node, out)
+    return "".join(out)
+
+# ---------------- GitHub وهمي ----------------
+GH = {"login": "owner", "repos": {"owner/site": {"default_branch": "main", "private": False,
+      "files": {"README.md": "# site"}, "branches": {"main"}}}, "prs": [], "calls": []}
+
+
+def gh_api(method, path, query, body):
+    GH["calls"].append((method, path, body))
+    parts = path.strip("/").split("/")  # user | user/repos | repos/{o}/{r}/...
+    if path == "/user" and method == "GET":
+        return 200, {"login": GH["login"]}
+    if path == "/user/repos":
+        if method == "GET":
+            return 200, [{"full_name": f} for f in GH["repos"]]
+        if method == "POST":
+            name = body["name"]; full = f"{GH['login']}/{name}"
+            GH["repos"][full] = {"default_branch": "main", "private": body.get("private", True),
+                                 "files": {"README.md": "# " + name} if body.get("auto_init", True) else {},
+                                 "branches": {"main"}}
+            return 201, {"full_name": full, "html_url": f"https://github.com/{full}", "default_branch": "main"}
+    if len(parts) >= 3 and parts[0] == "repos":
+        full = f"{parts[1]}/{parts[2]}"
+        repo = GH["repos"].get(full)
+        if repo is None:
+            return 404, {"message": "Not Found"}
+        sub = parts[3:]
+        if not sub and method == "GET":
+            return 200, {"full_name": full, "default_branch": repo["default_branch"]}
+        if sub and sub[0] == "contents":
+            fpath = "/".join(sub[1:])
+            if method == "GET":
+                if fpath in repo["files"]:
+                    import base64 as b64
+                    return 200, {"type": "file", "path": fpath, "sha": "sha_" + fpath, "size": len(repo["files"][fpath]),
+                                 "encoding": "base64", "content": b64.b64encode(repo["files"][fpath].encode()).decode()}
+                # dir listing?
+                entries = [{"name": k.split("/")[len(fpath.split("/")) if fpath else 0], "type": "file"}
+                           for k in repo["files"] if (not fpath or k.startswith(fpath + "/"))]
+                if entries and fpath == "":
+                    entries = [{"name": k.split("/")[0], "type": "file"} for k in repo["files"]]
+                if entries:
+                    return 200, entries
+                return 404, {"message": "Not Found"}
+            if method == "PUT":
+                import base64 as b64
+                repo["files"][fpath] = b64.b64decode(body["content"]).decode()
+                return 200, {"content": {"html_url": f"https://github.com/{full}/blob/main/{fpath}"},
+                             "commit": {"sha": "c0ffee123456"}}
+            if method == "DELETE":
+                repo["files"].pop(fpath, None)
+                return 200, {"commit": {"sha": "dead123456"}}
+        if sub[:2] == ["git", "ref"]:  # git/ref/heads/{branch}
+            return 200, {"object": {"sha": "basesha123"}}
+        if sub[:2] == ["git", "refs"] and method == "POST":
+            repo["branches"].add(body["ref"].split("/")[-1])
+            return 201, {"ref": body["ref"]}
+        if sub == ["pulls"] and method == "POST":
+            GH["prs"].append(body)
+            return 201, {"number": len(GH["prs"]), "html_url": f"https://github.com/{full}/pull/{len(GH['prs'])}"}
+    return 404, {"message": "Not Found"}
 
 
 def new_msg(chat_id, text=None, markup=None, extra=None):
@@ -57,8 +154,27 @@ class H(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _q(self):
+        return {k: v[0] for k, v in parse_qs(urlparse(self.path).query).items()}
+
+    def _body(self):
+        n = int(self.headers.get("Content-Length", 0))
+        try:
+            return json.loads(self.rfile.read(n) or b"{}")
+        except Exception:
+            return {}
+
+    def _gh(self, http_method):
+        path = urlparse(self.path).path.split("/gh", 1)[1]
+        body = self._body() if http_method in ("PUT", "POST", "DELETE") else {}
+        with S["lock"]:
+            code, obj = gh_api(http_method, path, self._q(), body)
+        self._reply(obj, code)
+
     def do_GET(self):
         path = urlparse(self.path).path
+        if "/gh/" in path or path.endswith("/gh"):
+            return self._gh("GET")
         for k, v in FILES.items():
             if path.endswith(k):
                 self.send_response(200)
@@ -69,7 +185,22 @@ class H(BaseHTTPRequestHandler):
         self.send_response(404)
         self.end_headers()
 
+    def do_PUT(self):
+        return self._gh("PUT")
+
+    def do_DELETE(self):
+        return self._gh("DELETE")
+
     def do_POST(self):
+        if "/gh/" in self.path:
+            return self._gh("POST")
+        if "/tph/" in self.path:
+            method = self.path.rsplit("/", 1)[-1]
+            data = {}
+            n = int(self.headers.get("Content-Length", 0))
+            for k, v in parse_qs(self.rfile.read(n).decode(), keep_blank_values=True).items():
+                data[k] = v[0]
+            return self._reply(tph_api(method, data))
         method = self.path.rsplit("/", 1)[-1]
         n = int(self.headers.get("Content-Length", 0))
         raw = self.rfile.read(n)
@@ -402,24 +533,57 @@ async def scenario():
     bot.save_setting("effort", "default")
     bot.save_setting("provider", bot.DEFAULT_PROVIDER)
 
-    # 6) رد طويل جداً ينقسم
+    # 6) رد طويل جداً → صفحة Telegra.ph وحدة (ما ينقسم وما ينقص)
     long_md = "\n\n".join(f"## قسم {i}\n**نقطة مهمة** رقم {i}: " + "نص عربي طويل " * 40 for i in range(12))
     long_md += "\n```python\n" + "print('x')\n" * 300 + "```\nالنهاية"
+    before = len(TPH["pages"])
     SCRIPT["rounds"] = [text_deltas(long_md, 120)]
     user_msg("رد طويل")
     await wait_idle()
-    pages = bot.last_turn[OWNER].response_ids
-    joined = "".join(strip(S["msgs"][i]["text"]) for i in pages if i in S["msgs"])
-    check("long: split into pages", len(pages) >= 4, len(pages))
-    check("long: nothing lost", "قسم 0" in joined and "قسم 11" in joined and "النهاية" in joined)
-    check("long: regen only on last page", all("reply_markup" not in S["msgs"][i] for i in pages[:-1]))
+    reply_ids = [i for i in bot.last_turn[OWNER].response_ids if i in S["msgs"] and "💭" not in S["msgs"][i]["text"]]
+    check("long: single message (no split)", len(reply_ids) == 1, len(reply_ids))
+    link_msg = S["msgs"][reply_ids[0]]
+    check("long: telegra.ph link", "telegra.ph/" in link_msg["text"] and "الرد كامل" in link_msg["text"], link_msg["text"][:120])
+    check("long: one page created", len(TPH["pages"]) == before + 1)
+    page_path = sorted(TPH["pages"])[-1]
+    flat = tph_text(page_path)
+    check("long: page has everything (nothing lost)",
+          "قسم 0" in flat and "قسم 11" in flat and "النهاية" in flat and "print('x')" in flat, flat[:80])
+    check("long: regen on the link message", "regen" in json.dumps(link_msg.get("reply_markup") or {}))
 
-    # 6b) الموديل يقسم الرد بنفسه
-    SCRIPT["rounds"] = [text_deltas("## الجزء الأول\nكلام الجزء الأول.\n\n<<<split>>>\n\n## الجزء الثاني\nكلام الجزء الثاني.", 4)]
-    user_msg("رد مقسوم")
+    # 6b) رد متوسط يدخل رسالة وحدة بلا صفحة
+    before = len(TPH["pages"])
+    SCRIPT["rounds"] = [text_deltas("## عنوان\n**نقطة** صغيرة وواضحة.\n\nسطر ثاني.", 4)]
+    user_msg("رد قصير")
     await wait_idle()
-    pages = [S["msgs"][i]["text"] for i in bot.last_turn[OWNER].response_ids if i in S["msgs"] and "💭" not in S["msgs"][i]["text"]]
-    check("model split: two messages at marker", len(pages) == 2 and "الجزء الأول" in pages[0] and "الجزء الثاني" in pages[1], pages)
+    reply_ids = [i for i in bot.last_turn[OWNER].response_ids if i in S["msgs"] and "💭" not in S["msgs"][i]["text"]]
+    check("short: single inline message", len(reply_ids) == 1 and "telegra.ph" not in S["msgs"][reply_ids[0]]["text"])
+    check("short: no telegraph page created", len(TPH["pages"]) == before)
+
+    # 6c) لو Telegra.ph وقف، يرجع للتقسيم بلا ما يضيع شي
+    TPH["fail"] = True
+    SCRIPT["rounds"] = [text_deltas(long_md, 120)]
+    user_msg("رد طويل والصفحة واقفة")
+    await wait_idle()
+    reply_ids = [i for i in bot.last_turn[OWNER].response_ids if i in S["msgs"] and "💭" not in S["msgs"][i]["text"]]
+    joined = "".join(strip(S["msgs"][i]["text"]) for i in reply_ids)
+    check("telegraph down: fell back to split", len(reply_ids) >= 2, len(reply_ids))
+    check("telegraph down: nothing lost", "قسم 0" in joined and "قسم 11" in joined and "النهاية" in joined)
+    TPH["fail"] = False
+
+    # 6d) رد ضخم جداً (~25 ألف حرف) → صفحة وحدة كاملة، البداية والنهاية موجودة
+    huge = "# بداية_العلامة\n\n" + "\n\n".join(f"فقرة رقم {i} فيها نص عربي طويل ومفيد. " * 6 for i in range(130)) + "\n\nنهاية_العلامة"
+    before = len(TPH["pages"])
+    SCRIPT["rounds"] = [text_deltas(huge, 200)]
+    user_msg("رد ضخم")
+    await wait_idle(timeout=40)
+    reply_ids = [i for i in bot.last_turn[OWNER].response_ids if i in S["msgs"] and "💭" not in S["msgs"][i]["text"]]
+    check("huge: single telegra.ph message", len(reply_ids) == 1 and "telegra.ph/" in S["msgs"][reply_ids[0]]["text"],
+          (len(reply_ids), len(huge)))
+    if len(TPH["pages"]) > before:
+        flat = tph_text(sorted(TPH["pages"])[-1])
+        check("huge: page keeps start+end", "بداية_العلامة" in flat and "نهاية_العلامة" in flat
+              and "فقرة رقم 0" in flat and "فقرة رقم 129" in flat, len(flat))
 
     # 7) صورة
     FILES["ph1"] = b"\xff\xd8fakejpeg"
@@ -529,6 +693,65 @@ async def scenario():
     await wait_idle(timeout=60)
     S["flaky"] = False
     check("flaky: full reply delivered", "نهاية الرد" in strip(last_bot()["text"]) and "بداية الرد" in strip(last_bot()["text"]), strip(last_bot()["text"])[:100])
+
+    # 16) ما فيه أي تعليمات تجبر الموديل يختصر أو يقسم
+    sp = bot.system_prompt(False)
+    check("no length/split instruction", "<<<split>>>" not in sp and "3000" not in sp and "2500" not in sp, sp[-400:])
+
+    # 17) أدوات GitHub للمالك فقط
+    def tool_names(call):
+        return {t["function"]["name"] for t in call.get("tools", [])}
+    SCRIPT["rounds"] = [text_deltas("أوكي")]
+    user_msg("اكتب لي ملف")  # المالك
+    await wait_idle()
+    check("github: tools offered to owner", {"gh_put_file", "gh_list_repos"} <= tool_names(MODEL_CALLS[-1]), tool_names(MODEL_CALLS[-1]))
+    check("github: note in owner system prompt", "gh_" in MODEL_CALLS[-1]["messages"][0]["content"])
+    SCRIPT["rounds"] = [text_deltas("أوكي")]
+    user_msg("اكتب لي ملف", user=OTHER, chat={"id": 222, "type": "private"})  # غير المالك
+    await wait_idle()
+    nonowner = MODEL_CALLS[-1]
+    check("github: tools NOT offered to non-owner", not any(n.startswith("gh_") for n in tool_names(nonowner)), tool_names(nonowner))
+    check("github: no note in non-owner prompt", "gh_" not in nonowner["messages"][0]["content"])
+
+    # 18) المالك ينفّذ على GitHub بلا موافقة (إنشاء ملف ثم قراءته)
+    GH["repos"]["owner/app"] = {"default_branch": "main", "private": True, "files": {}, "branches": {"main"}}
+    SCRIPT["rounds"] = [
+        [{"tool_calls": [{"index": 0, "id": "g1", "type": "function", "function": {
+            "name": "gh_put_file", "arguments": json.dumps(
+                {"repo": "app", "path": "hello.py", "content": "print('hi')", "message": "add"})}}]}],
+        text_deltas("سويت الملف ✅"),
+    ]
+    user_msg("أنشئ hello.py في app")
+    await wait_idle()
+    check("github: file created via tool", GH["repos"]["owner/app"]["files"].get("hello.py") == "print('hi')",
+          GH["repos"]["owner/app"]["files"])
+    tool_res = [m for m in MODEL_CALLS[-1]["messages"] if m.get("role") == "tool"][-1]["content"]
+    check("github: tool result ok", '"ok": true' in tool_res.lower() or '"ok":true' in tool_res.lower(), tool_res[:120])
+    check("github: reply delivered", "سويت الملف" in strip(last_bot()["text"]))
+
+    # 18b) سلسلة GitHub كاملة في طلب واحد: مستودع جديد → فرع → ملف على الفرع → PR
+    def gh_call(idx, name, args):
+        return {"tool_calls": [{"index": 0, "id": f"c{idx}", "type": "function",
+                "function": {"name": name, "arguments": json.dumps(args, ensure_ascii=False)}}]}
+    SCRIPT["rounds"] = [
+        [gh_call(1, "gh_create_repo", {"name": "proj", "private": True})],
+        [gh_call(2, "gh_create_branch", {"repo": "proj", "branch": "feature"})],
+        [gh_call(3, "gh_put_file", {"repo": "proj", "path": "app.py", "content": "print(1)",
+                                    "message": "feat", "branch": "feature"})],
+        [gh_call(4, "gh_open_pr", {"repo": "proj", "title": "Feature", "head": "feature", "base": "main"})],
+        text_deltas("جهّزت المستودع والفرع والـ PR ✅"),
+    ]
+    prs_before = len(GH["prs"])
+    user_msg("أنشئ مستودع proj وحط فيه app.py على فرع وافتح PR")
+    await wait_idle(timeout=40)
+    check("github chain: repo created", "owner/proj" in GH["repos"])
+    check("github chain: branch created", "feature" in GH["repos"].get("owner/proj", {}).get("branches", set()))
+    check("github chain: file on branch", GH["repos"].get("owner/proj", {}).get("files", {}).get("app.py") == "print(1)")
+    check("github chain: PR opened", len(GH["prs"]) == prs_before + 1 and "جهّزت" in strip(last_bot()["text"]))
+
+    # 19) حتى لو انطلبت أداة GitHub من غير مالك، التنفيذ يرفضها
+    r = await bot.dispatch_tool("gh_put_file", json.dumps({"repo": "app", "path": "x", "content": "y", "message": "m"}), False)
+    check("github: dispatch refuses non-owner", "صاحب البوت" in r[0] and GH["repos"]["owner/app"]["files"].get("x") is None, r[0])
 
     check("no invalid/raw html sent", not PROBLEMS, PROBLEMS[:5])
 

@@ -39,7 +39,9 @@ from telegram.ext import (
     filters,
 )
 
+import github_tools
 import render
+import telegraph
 from render import RLM, esc
 from tools import TOOLS, describe_call, run_tool
 
@@ -69,12 +71,14 @@ PERSONA_FILE = DATA_DIR / "persona.json"
 HISTORY_FILE = DATA_DIR / "history.json"
 SETTINGS_FILE = DATA_DIR / "settings.json"
 SCREEN_FILE = DATA_DIR / "screen.json"
+TELEGRAPH_FILE = DATA_DIR / "telegraph.json"
 
-MAX_TOOL_ROUNDS = 6
+MAX_TOOL_ROUNDS = 10     # يكفي لمهام GitHub (قراءة، تعديل، عدة ملفات، PR)
 EDIT_INTERVAL = 1.0      # تليجرام يسمح بتعديل الرسالة تقريباً مرة بالثانية
 GROUP_WAIT = 1.2         # انتظار بقية الأجزاء (ألبوم صور أو رسالة طويلة انقسمت)
 MAX_FILE_BYTES = 10 * 1024 * 1024
 MAX_FILE_CHARS = 60_000
+SINGLE_MAX = 3900        # لو الرد أطول من كذا (حروف HTML) ننشره كصفحة Telegra.ph مرتبة
 
 logging.basicConfig(format="%(asctime)s %(levelname)s %(name)s: %(message)s", level=logging.INFO)
 log = logging.getLogger("persona-bot")
@@ -84,6 +88,8 @@ for noisy in ("httpx", "primp", "ddgs"):
 client = AsyncOpenAI(api_key=OPENROUTER_API_KEY, base_url=OPENROUTER_BASE_URL,
                      default_headers={"X-Title": "Persona Telegram Bot"})
 NO_PREVIEW = LinkPreviewOptions(is_disabled=True)
+PREVIEW = LinkPreviewOptions(is_disabled=False, prefer_large_media=False)
+tph = telegraph.Telegraph(TELEGRAPH_FILE, short_name="PersonaBot")
 
 
 # ================= التخزين =================
@@ -148,17 +154,19 @@ LOCK_RULES = """\
 # قواعد الشكل — أقل أولوية من الهوية
 STYLE_RULES = """\
 قواعد شكل الرد (طبّقها ما لم تحدد الهوية شيئاً مختلفاً، والهوية دائماً تغلب):
-- رتّب الرد: فقرات قصيرة، وسطر فاضي بين كل فكرة والثانية.
-- استخدم **الخط العريض** للكلمات والنقاط المهمة، وعناوين قصيرة بـ ## للردود الطويلة فقط.
+- اكتب بالطول اللي تشوفه مناسب للرد، قصير أو طويل، بلا أي حد على عدد الحروف. لا تختصر ولا تقطع ردك عشان الطول؛ الطول يتكفّل فيه البرنامج تلقائياً.
+- رتّب الرد بفقرات وسطر فاضي بين الأفكار، وعناوين بـ ## أو ### عند الحاجة.
+- استخدم **الخط العريض** للكلمات والنقاط المهمة.
 - القوائم تكون بـ "-" أو "1." وكل عنصر في سطر.
 - لا تخلط كلمات إنجليزية داخل الجمل العربية إلا لاسم علم أو مصطلح تقني ما له بديل عربي.
 - لا تستخدم علامات الاقتباس المزخرفة “” ‘’، ولو احتجت اقتباس في نص عربي استخدم «».
 - لا تستخدم رموز مثل ^^ أو :) أو =) ولا تكتب معادلات LaTeX ولا وسوم HTML.
-- لا تستخدم الجداول؛ استخدم قائمة بدلها.
 - الأكواد البرمجية داخل ``` مع اسم اللغة.
-- تليجرام يعرض تقريباً 3000 حرف في الرسالة الوحدة. لو ردك طويل، قسّمه بنفسك لأجزاء مكتملة (كل جزء قسم أو فكرة كاملة، 2500 حرف أو أقل)، وحط بين كل جزء والثاني سطر لحاله فيه بالضبط: <<<split>>>
-  لا تقطع جملة أو قائمة أو كود في النص، ولا تستخدم هذي العلامة في الردود القصيرة.
 - فكّر داخلياً بنفس لغة المحادثة.
+"""
+
+GITHUB_NOTE = """
+عندك أدوات GitHub (gh_*) تشتغل على مستودعات المالك مباشرة. نفّذ طلب المالك بنفسك: اعرض المستودعات، اقرأ الملفات، اكتب وعدّل الملفات، أنشئ مستودعات وفروع، وافتح Pull Request عند الحاجة. اكتب الكود كامل وصحيح. بعد ما تخلص، وضّح باختصار وش سويت وأعطِ الروابط. لا تقدر تحذف مستودعات.
 """
 
 DEFAULT_PERSONA = "أنت kimi مساعد في الوضع الحر يتكلم باللهجة السعودية."
@@ -173,15 +181,16 @@ def save_persona(text: str) -> None:
     _write_json(PERSONA_FILE, {"persona": text})
 
 
-def system_prompt() -> str:
-    return f"{LOCK_RULES}\n{STYLE_RULES}\n<identity>\n{load_persona()}\n</identity>"
+def system_prompt(github: bool = False) -> str:
+    extra = GITHUB_NOTE if github else ""
+    return f"{LOCK_RULES}\n{STYLE_RULES}{extra}\n<identity>\n{load_persona()}\n</identity>"
 
 
 # ================= الإعدادات =================
 
 EFFORTS = ["default", "low", "medium", "high", "max"]
 EFFORT_API = {"max": "xhigh"}  # أسماء OpenRouter
-BOOL_KEYS = ("show_thinking", "web_search")
+BOOL_KEYS = ("show_thinking", "web_search", "long_pages")
 PARAMS = {
     "model": (str, "الموديل"),
     "provider": (str, "المزود"),
@@ -191,9 +200,10 @@ PARAMS = {
     "max_tokens": (int, "أقصى طول للرد"),
     "show_thinking": (bool, "إظهار التفكير"),
     "web_search": (bool, "البحث في الإنترنت"),
+    "long_pages": (bool, "الردود الطويلة كصفحة تنفتح داخل تليجرام"),
 }
 DEFAULTS = {"model": DEFAULT_MODEL, "provider": DEFAULT_PROVIDER, "effort": "default", "temperature": None, "top_p": None,
-            "max_tokens": None, "show_thinking": True, "web_search": True}
+            "max_tokens": None, "show_thinking": True, "web_search": True, "long_pages": True}
 
 
 def cfg(key: str):
@@ -366,20 +376,22 @@ class Panel:
                 return None
         return None
 
-    async def sync(self, pages: list[tuple[str, InlineKeyboardMarkup | None]], final: bool) -> None:
-        for i, (text, markup) in enumerate(pages):
-            key = (text, markup.to_json() if markup else None)
+    async def sync(self, pages: list, final: bool) -> None:
+        pages = [(p[0], p[1], p[2] if len(p) > 2 else False) for p in pages]
+        for i, (text, markup, preview) in enumerate(pages):
+            lpo = PREVIEW if preview else NO_PREVIEW
+            key = (text, markup.to_json() if markup else None, preview)
             if i < len(self.msgs):
                 if self.shown[i] == key:
                     continue
                 ok = await self._do(final, self.msgs[i].edit_text, text=text, parse_mode=ParseMode.HTML,
-                                    reply_markup=markup, link_preview_options=NO_PREVIEW)
+                                    reply_markup=markup, link_preview_options=lpo)
                 if ok:
                     self.shown[i] = key
             else:
                 msg = await self._do(final, self.bot.send_message, chat_id=self.chat_id, text=text,
                                      parse_mode=ParseMode.HTML, reply_markup=markup,
-                                     link_preview_options=NO_PREVIEW)
+                                     link_preview_options=lpo)
                 if isinstance(msg, Message):
                     self.msgs.append(msg)
                     self.shown.append(key)
@@ -409,8 +421,9 @@ def remember_thinking(text: str) -> str:
 class ResponseUI:
     """يعرض رد واحد: رسالة تفكير تتحدث أولاً، ثم رسالة الرد تنكتب قدام المستخدم."""
 
-    def __init__(self, bot, chat_id: int, show_thinking: bool):
+    def __init__(self, bot, chat_id: int, show_thinking: bool, long_pages: bool = True):
         self.bot, self.chat_id, self.show_thinking = bot, chat_id, show_thinking
+        self.long_pages = long_pages
         self.think = Panel(bot, chat_id)
         self.reply = Panel(bot, chat_id)
         self.parts: list[list[str]] = []      # [["r", تفكير] أو ["s", خطوة بحث]]
@@ -490,47 +503,69 @@ class ResponseUI:
     def _full_thinking(self) -> str:
         return "\n\n".join(t for _, t in self.parts)
 
-    def reply_pages(self, final: bool) -> list:
-        if not final and not self._reply_active():
+    def _final_extras(self) -> list[str]:
+        extras = []
+        if self.stopped:
+            extras.append(RLM + "<i>⏹ تم إيقاف الرد</i>")
+        if self.error:
+            extras.append(self.error)
+        return extras
+
+    def live_pages(self) -> list:
+        """معاينة حيّة: رسالة وحدة تتحدث وهو يكتب. ما نقسّم ولا ننشر صفحة إلا عند النهاية."""
+        if not self._reply_active():
             return []
-        chunks = render.split_md(self.reply_md.strip("\n")) if self.reply_md.strip() else [""]
-        pages = []
-        for i, chunk in enumerate(chunks):
-            last = i == len(chunks) - 1
-            h = render.page_html(chunk, partial=not final and last)
-            if last and not final:
-                if not h and self.status:
-                    h = RLM + f"<i>{esc(self.status)}</i>"
-                h = f"{h} {render.CURSOR}" if h else render.CURSOR
-            if last and final:
-                extras = []
-                if self.stopped:
-                    extras.append(RLM + "<i>⏹ تم إيقاف الرد</i>")
-                if self.error:
-                    extras.append(self.error)
-                if not h and not extras:
-                    extras.append(RLM + "<i>…</i>")
-                h = "\n\n".join(x for x in [h, *extras] if x)
-            pages.append([h, None])
-        if final:
-            if self.sources:
-                src = render.sources_html(self.sources)
-                if len(pages[-1][0]) + len(src) < 3900:
-                    pages[-1][0] += "\n\n" + src
-                else:
-                    pages.append([src, None])
-            pages[-1][1] = REGEN_KB
-        else:
-            pages[-1][1] = STOP_KB
+        h = render.live_tail_html(self.reply_md) if self.reply_md.strip() else ""
+        if not h and self.status:
+            h = RLM + f"<i>{esc(self.status)}</i>"
+        h = f"{h} {render.CURSOR}" if h else render.CURSOR
+        return [(h, STOP_KB, False)]
+
+    async def final_reply_pages(self) -> list:
+        """تسليم الرد النهائي: رسالة وحدة لو قصير، صفحة Telegra.ph لو طويل، وتقسيم احتياطي."""
+        md = self.reply_md.strip("\n")
+        extras = self._final_extras()
+        src_html = render.sources_html(self.sources) if self.sources else ""
+        if not md:
+            body = "\n\n".join(extras) if extras else RLM + "<i>…</i>"
+            return [(body, REGEN_KB, False)]
+        full = render.render(md, partial=False)  # كامل بلا قص؛ القرار على الطول الحقيقي
+        tail = ("\n\n" + "\n\n".join(extras)) if extras else ""
+        if len(full) + len(src_html) + len(tail) <= SINGLE_MAX:  # يكفي رسالة وحدة
+            body = full + (("\n\n" + src_html) if src_html else "") + tail
+            return [(body, REGEN_KB, False)]
+        if self.long_pages and not self.stopped:  # رد طويل → صفحة تنفتح داخل تليجرام
+            try:
+                nodes = render.to_telegraph_nodes(md)
+                if self.sources:
+                    nodes.append({"tag": "hr"})
+                    nodes.append({"tag": "h3", "children": ["المصادر"]})
+                    nodes.append({"tag": "ul", "children": [
+                        {"tag": "li", "children": [{"tag": "a", "attrs": {"href": s["url"]},
+                                                    "children": [s.get("title") or s["url"]]}]}
+                        for s in self.sources if s.get("url")]})
+                url = await tph.create_page(render.telegraph_title(md), nodes)
+                head = lines_html("📄 <b>الرد كامل</b> — طويل، فخليته بصفحة مرتبة تنفتح جوّا تليجرام:",
+                                  f'<a href="{esc(url)}">📖 افتح الرد كامل</a>')
+                return [(head + tail, REGEN_KB, True)]
+            except Exception:
+                log.warning("telegraph failed; splitting instead", exc_info=True)
+        chunks = render.split_md(md)  # احتياطي: تقسيم — نضمن إن ما ينقص شي
+        pages = [[render.page_html(c, False), None, False] for c in chunks]
+        if src_html:
+            pages.append([src_html, None, False])
+        if extras:
+            pages[-1][0] += "\n\n" + "\n\n".join(extras)
+        pages[-1][1] = REGEN_KB
         return [tuple(p) for p in pages]
 
-    async def flush(self, final: bool = False) -> None:
+    async def flush(self) -> None:
         async with self._lock:
-            if not final and time.monotonic() < self._cooldown:
+            if time.monotonic() < self._cooldown:
                 return
             try:
-                await self.think.sync(self.think_pages(final), final)
-                await self.reply.sync(self.reply_pages(final), final)
+                await self.think.sync(self.think_pages(False), False)
+                await self.reply.sync(self.live_pages(), False)
             except RetryAfter as e:
                 self._cooldown = time.monotonic() + e.retry_after
             except TelegramError as e:
@@ -556,7 +591,12 @@ class ResponseUI:
             self._loop_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await self._loop_task
-        await self.flush(final=True)
+        async with self._lock:
+            with contextlib.suppress(TelegramError):
+                await self.think.sync(self.think_pages(True), True)
+            pages = await self.final_reply_pages()
+            with contextlib.suppress(TelegramError):
+                await self.reply.sync(pages, True)
 
     def message_ids(self) -> list[int]:
         return self.think.ids() + self.reply.ids()
@@ -699,40 +739,67 @@ async def drop_old_buttons(bot, chat_id: int) -> None:
             await bot.edit_message_reply_markup(chat_id, mid, reply_markup=None)
 
 
+def active_tools(owner: bool, use_search: bool) -> list:
+    """أدوات البحث للجميع، وأدوات GitHub للمالك فقط (ولو التوكن مضبوط)."""
+    tools = list(TOOLS) if use_search else []
+    if owner and github_tools.enabled():
+        tools += github_tools.GITHUB_TOOLS
+    return tools
+
+
+def describe_tool(name: str, args: str) -> str:
+    if github_tools.is_github_tool(name):
+        return github_tools.describe_github(name, args)
+    return describe_call(name, args)
+
+
+async def dispatch_tool(name: str, args: str, owner: bool):
+    """ينفّذ الأداة. أدوات GitHub للمالك فقط — فحص ثاني حتى لو انطلبت بالغلط."""
+    if github_tools.is_github_tool(name):
+        if not owner:
+            return "هذي الأداة لصاحب البوت فقط.", []
+        return await github_tools.run_github(name, args), []
+    return await run_tool(name, args)
+
+
 async def _generate(bot, chat_id: int, turn: Turn) -> None:
     """يولد رد كامل (لازم يكون قفل الشات ماسك)."""
     overrides = turn.overrides
+    owner = is_owner_id(turn.user_id)
+    github_on = owner and github_tools.enabled()
     show_thinking = overrides.get("show_thinking", cfg("show_thinking"))
+    long_pages = overrides.get("long_pages", cfg("long_pages"))
     kw = request_kwargs(overrides)
     use_search = overrides.get("web_search", cfg("web_search")) and tools_key(kw) not in no_tools
+    tools_list = active_tools(owner, use_search)
     rounds, final_details = 0, []
     await drop_old_buttons(bot, chat_id)
 
     history = histories[chat_id]
-    messages = [{"role": "system", "content": system_prompt()}, *history,
+    messages = [{"role": "system", "content": system_prompt(github_on)}, *history,
                 {"role": "user", "content": turn.content}]
-    ui = ResponseUI(bot, chat_id, show_thinking)
+    ui = ResponseUI(bot, chat_id, show_thinking, long_pages)
     ui.task = asyncio.current_task()
     active[chat_id] = ui
     try:
         await ui.start()
         for round_no in range(MAX_TOOL_ROUNDS + 1):
-            if not use_search:
+            if not tools_list:
                 tool_kwargs = {}
             elif round_no < MAX_TOOL_ROUNDS:
-                tool_kwargs = {"tools": TOOLS}
-            else:  # خلصت الجولات — لازم يجاوب بدون بحث إضافي
-                tool_kwargs = {"tools": TOOLS, "tool_choice": "none"}
+                tool_kwargs = {"tools": tools_list}
+            else:  # خلصت الجولات — لازم يجاوب بدون أدوات إضافية
+                tool_kwargs = {"tools": tools_list, "tool_choice": "none"}
             ui.begin_round()
             try:
                 content, reasoning, details, calls = await stream_round(ui, messages, kw, tool_kwargs)
             except APIError as e:
-                # بعض المزودين ما يدعمون الأدوات: نكمل بدون بحث بدل ما يفشل الرد
+                # بعض المزودين ما يدعمون الأدوات: نكمل بدونها بدل ما يفشل الرد
                 if not tool_kwargs or "tool" not in str(e).lower():
                     raise
                 no_tools.add(tools_key(kw))
-                use_search, tool_kwargs = False, {}
-                ui.add_step("⚠️ البحث غير مدعوم مع هذا المزود — كمّلت بدونه")
+                tools_list, tool_kwargs = [], {}
+                ui.add_step("⚠️ الأدوات غير مدعومة مع هذا المزود — كمّلت بدونها")
                 ui.begin_round()
                 content, reasoning, details, calls = await stream_round(ui, messages, kw, tool_kwargs)
             rounds += 1
@@ -749,8 +816,8 @@ async def _generate(bot, chat_id: int, turn: Turn) -> None:
                 assistant["reasoning_details"] = details  # نرجعها مثل ما هي عشان يكمل تفكيره
             messages.append(assistant)
             for c in calls:
-                ui.add_step(describe_call(c["name"], c["args"]))
-                result, sources = await run_tool(c["name"], c["args"])
+                ui.add_step(describe_tool(c["name"], c["args"]))
+                result, sources = await dispatch_tool(c["name"], c["args"], owner)
                 ui.add_sources(sources)
                 messages.append({"role": "tool", "tool_call_id": c["id"], "content": result})
     except asyncio.CancelledError:
@@ -1041,6 +1108,9 @@ def welcome_html(owner: bool) -> str:
         f"<b>{NEW_CHAT_BTN}</b> تحت أو /new — يبدأ من الصفر (الرسائل القديمة تبقى في الشات).",
     )
     if owner:
+        gh = ("• 🐙 متصل بـ GitHub — أعطني أمر وأكتب/أعدّل/أنشئ مباشرة (مستودعات، ملفات، فروع، PR)"
+              if github_tools.enabled() else
+              "• 🐙 GitHub غير مربوط — أضف السر GITHUB_PAT لأقدر أكتب وأعدّل على مستودعاتك")
         text += "\n\n" + lines_html(
             "👑 <b>أوامر المالك</b>",
             "• /setpersona — تحديد الهوية",
@@ -1049,6 +1119,7 @@ def welcome_html(owner: bool) -> str:
             "• /set <code>إعداد قيمة</code> — مثل <code>/set temperature 0.7</code>",
             "• /resetall — مسح ذاكرة كل المحادثات",
             "• إعدادات لرسالة وحدة: <code>effort=max web_search=off سؤالك</code>",
+            gh,
         )
     return text
 
@@ -1268,6 +1339,7 @@ def settings_html() -> str:
 
     rows = ["⚙️ <b>الإعدادات</b>", ""]
     rows += [f"• <b>{desc}:</b> {show(k)}" for k, (_, desc) in PARAMS.items()]
+    rows += [f"• <b>GitHub:</b> {'✅ متصل' if github_tools.enabled() else '❌ غير مربوط (أضف GITHUB_PAT)'}"]
     rows += ["", "<i>للأرقام:</i> <code>/set temperature 0.7</code> · <code>/set max_tokens 2000</code> · <code>/set top_p off</code>"]
     return lines_html(*rows)
 
@@ -1288,6 +1360,7 @@ def settings_keyboard() -> InlineKeyboardMarkup:
         [btn(p.split("/")[0], "provider", p, prov) for p in PROVIDERS],
         [btn("الاثنين", "provider", ",".join(PROVIDERS), prov), btn("أي مزود", "provider", "any", prov)],
         [toggle("التفكير", "show_thinking"), toggle("البحث", "web_search")],
+        [toggle("الردود الطويلة كصفحة", "long_pages")],
     ])
 
 
