@@ -49,7 +49,22 @@ jobs:
             if [ -z "${!n}" ]; then echo "::error::Secret $n is missing — add it in Settings > Secrets and variables > Actions > Secrets"; missing=1;
             else echo "$n: OK"; fi
           done
-          exit $missing
+          [ "$missing" = 0 ] || exit 1
+          # نتأكد إن OpenRouter يقبل المفتاح قبل التشغيل (بدون ما نطبع المفتاح)
+          key=$(printf '%s' "$OPENROUTER_API_KEY" | tr -d '\r\n' | sed -E 's/^[[:space:]"'"'"']+//; s/[[:space:]"'"'"']+$//; s/^[Bb]earer[[:space:]]+//')
+          case "$key" in
+            sk-or-*) ;;
+            *) echo "::warning::OPENROUTER_API_KEY ما يبدأ بـ sk-or- — غالباً منسوخ غلط أو مو مفتاح OpenRouter" ;;
+          esac
+          code=$(curl -s -o /tmp/key.json -w '%{http_code}' -H "Authorization: Bearer $key" https://openrouter.ai/api/v1/key)
+          if [ "$code" = "404" ]; then  # المسار القديم
+            code=$(curl -s -o /tmp/key.json -w '%{http_code}' -H "Authorization: Bearer $key" https://openrouter.ai/api/v1/auth/key)
+          fi
+          if [ "$code" != "200" ]; then
+            echo "::error::OpenRouter رفض المفتاح (HTTP $code): $(head -c 300 /tmp/key.json) — انسخ مفتاح جديد من openrouter.ai/keys وحدّث السر OPENROUTER_API_KEY"
+            exit 1
+          fi
+          echo "OpenRouter key OK: $(jq -c '.data | {limit, limit_remaining, usage, is_free_tier}' /tmp/key.json)"
 
       - run: pip install -r requirements.txt
 

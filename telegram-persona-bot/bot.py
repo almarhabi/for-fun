@@ -46,11 +46,21 @@ from tools import TOOLS, describe_call, run_tool
 load_dotenv()
 
 TELEGRAM_BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
-OPENROUTER_API_KEY = os.environ["OPENROUTER_API_KEY"]
+def clean_key(key: str) -> str:
+    """ينظف المفتاح من الأخطاء الشائعة وقت النسخ: مسافات، علامات تنصيص، كلمة Bearer."""
+    key = key.strip().strip("\"'").strip()
+    if key.lower().startswith("bearer "):
+        key = key[7:].strip()
+    return key
+
+
+OPENROUTER_API_KEY = clean_key(os.environ["OPENROUTER_API_KEY"])
 OPENROUTER_BASE_URL = os.getenv("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1")
 DEFAULT_MODEL = os.getenv("OPENROUTER_MODEL", "").strip() or "moonshotai/kimi-k3.1-pro"
 # المزود داخل OpenRouter (أكثر من واحد بفاصلة). "any" = أي مزود مع بديل تلقائي
-DEFAULT_PROVIDER = os.getenv("OPENROUTER_PROVIDER", "").strip() or "relace/fp4"
+PROVIDERS = ["relace/fp4", "inference-net/mxfp4/us"]
+# الافتراضي: الاثنين (بدون أي مزود ثالث) — لو واحد وقف يشتغل الثاني
+DEFAULT_PROVIDER = os.getenv("OPENROUTER_PROVIDER", "").strip() or ",".join(PROVIDERS)
 OWNER_ID = int(os.getenv("OWNER_ID", "").strip() or "0")
 MAX_HISTORY = int(os.getenv("MAX_HISTORY", "30"))
 
@@ -658,7 +668,8 @@ def error_hint(e: Exception) -> str:
     code = getattr(e, "status_code", None)
     msg = str(e).lower()
     if code == 401:
-        return "مفتاح OpenRouter غلط أو منتهي."
+        return ("OpenRouter رفض المفتاح. تأكد إن السر OPENROUTER_API_KEY فيه المفتاح كامل "
+                "(يبدأ بـ sk-or-v1-) من openrouter.ai/keys، وإن المفتاح ما انحذف.")
     if code == 402 or "credit" in msg:
         return "الرصيد في OpenRouter ما يكفي."
     if code == 429:
@@ -1272,7 +1283,8 @@ def settings_keyboard() -> InlineKeyboardMarkup:
         [InlineKeyboardButton("🧠 مستوى التفكير:", callback_data="noop")],
         [btn({"default": "افتراضي"}.get(x, x), "effort", x, e) for x in EFFORTS],
         [InlineKeyboardButton("🔌 المزود:", callback_data="noop")],
-        [btn(DEFAULT_PROVIDER, "provider", DEFAULT_PROVIDER, prov), btn("أي مزود", "provider", "any", prov)],
+        [btn(p.split("/")[0], "provider", p, prov) for p in PROVIDERS],
+        [btn("الاثنين", "provider", ",".join(PROVIDERS), prov), btn("أي مزود", "provider", "any", prov)],
         [toggle("التفكير", "show_thinking"), toggle("البحث", "web_search")],
         [toggle("مسح الرسائل مع المحادثة الجديدة", "clear_screen")],
     ])

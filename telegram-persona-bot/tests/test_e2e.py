@@ -329,7 +329,7 @@ async def scenario():
           MODEL_CALLS[-1]["messages"][-2].get("reasoning_details") == [{"type": "reasoning.text", "text": "المستخدم يسأل عن كيمي، لازم أبحث.", "index": 0, "format": "unknown"}],
           MODEL_CALLS[-1]["messages"][-2])
     check("openrouter: provider + reasoning sent", MODEL_CALLS[0]["model"] == "moonshotai/kimi-k3.1-pro" and
-          MODEL_CALLS[0]["extra_body"] == {"reasoning": {"enabled": True}, "provider": {"only": ["relace/fp4"], "allow_fallbacks": False}},
+          MODEL_CALLS[0]["extra_body"] == {"reasoning": {"enabled": True}, "provider": {"only": ["relace/fp4", "inference-net/mxfp4/us"], "allow_fallbacks": False}},
           MODEL_CALLS[0].get("extra_body"))
 
     # 3) إيقاف الرد
@@ -393,6 +393,10 @@ async def scenario():
     user_msg("اختبار الإعدادات")
     await wait_idle()
     check("settings: effort max -> xhigh, provider any", MODEL_CALLS[-1]["extra_body"] == {"reasoning": {"effort": "xhigh"}}, MODEL_CALLS[-1]["extra_body"])
+    bot.save_setting("provider", "inference-net/mxfp4/us")
+    user_msg("مزود واحد")
+    await wait_idle()
+    check("settings: single provider", MODEL_CALLS[-1]["extra_body"]["provider"] == {"only": ["inference-net/mxfp4/us"], "allow_fallbacks": False}, MODEL_CALLS[-1]["extra_body"])
     bot.save_setting("effort", "default")
     bot.save_setting("provider", bot.DEFAULT_PROVIDER)
 
