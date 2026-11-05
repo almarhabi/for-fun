@@ -9,10 +9,11 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 from openai import AsyncOpenAI
-from telegram import Update
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ChatAction, ParseMode
 from telegram.ext import (
     Application,
+    CallbackQueryHandler,
     CommandHandler,
     ContextTypes,
     MessageHandler,
@@ -136,6 +137,9 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             "/setpersona <النص> — تحديد الهوية (أو رد على رسالة فيها الهوية)\n"
             "/persona — عرض الهوية الحالية\n"
             "/reset — مسح ذاكرة هذه المحادثة\n"
+            "/settings — لوحة التحكم (effort، الموديل، التفكير، البحث)\n"
+            "/set <إعداد> <قيمة> — مثل /set temperature 0.7\n"
+            "/effort low|high|max|default\n"
             "/thinking — إظهار/إخفاء سلسلة التفكير\n"
             "/search — تشغيل/إيقاف البحث في الإنترنت\n"
             "/resetall — مسح ذاكرة كل المحادثات"
@@ -184,20 +188,146 @@ async def cmd_resetall(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     await update.message.reply_text("تم مسح ذاكرة كل المحادثات.")
 
 
-async def cmd_thinking(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+# ---------- إعدادات الموديل ----------
+
+MODELS = ["kimi-k3.1-pro", "kimi-k3.1-pro-highspeed"]
+EFFORTS = ["default", "low", "high", "max"]
+
+# key: (النوع، الوصف). None = استخدم الافتراضي حق الموديل
+PARAMS = {
+    "model": (str, "الموديل"),
+    "effort": (str, "مستوى التفكير (reasoning_effort): default/low/high/max"),
+    "temperature": (float, "العشوائية 0-2"),
+    "top_p": (float, "top_p 0-1"),
+    "max_tokens": (int, "أقصى طول للرد"),
+    "show_thinking": (bool, "إظهار سلسلة التفكير"),
+    "web_search": (bool, "البحث في الإنترنت"),
+}
+DEFAULTS = {"model": KIMI_MODEL, "effort": "default", "temperature": None, "top_p": None,
+            "max_tokens": None, "show_thinking": True, "web_search": True}
+
+
+def cfg(key: str):
+    return setting(key, DEFAULTS[key])
+
+
+def parse_value(key: str, raw: str):
+    typ = PARAMS[key][0]
+    raw = raw.strip()
+    if raw.lower() in ("off", "none", "default", "افتراضي") and key not in ("show_thinking", "web_search"):
+        return "default" if key == "effort" else (KIMI_MODEL if key == "model" else None)
+    if typ is bool:
+        if raw.lower() in ("on", "true", "1", "yes", "تشغيل"):
+            return True
+        if raw.lower() in ("off", "false", "0", "no", "ايقاف", "إيقاف"):
+            return False
+        raise ValueError("اكتب on أو off")
+    if key == "effort" and raw.lower() not in EFFORTS:
+        raise ValueError("القيم: " + " / ".join(EFFORTS))
+    return typ(raw.lower() if key == "effort" else raw)
+
+
+def request_kwargs(overrides: dict | None = None) -> dict:
+    o = overrides or {}
+    get = lambda k: o.get(k, cfg(k))
+    kw = {"model": get("model")}
+    if get("effort") != "default":
+        kw["reasoning_effort"] = get("effort")
+    for k in ("temperature", "top_p", "max_tokens"):
+        if get(k) is not None:
+            kw[k] = get(k)
+    return kw
+
+
+def settings_text() -> str:
+    lines = ["⚙️ الإعدادات الحالية:\n"]
+    for k, (_, desc) in PARAMS.items():
+        v = cfg(k)
+        v = "افتراضي" if v is None else ("✅" if v is True else "❌" if v is False else v)
+        lines.append(f"• {desc}: {v}")
+    lines.append(
+        "\nللأرقام: /set temperature 0.7 — /set max_tokens 2000 — /set top_p off"
+        "\nلرسالة وحدة بس: ابدأها بالإعدادات، مثل:\neffort=low temperature=0.3 سؤالك هنا"
+    )
+    return "\n".join(lines)
+
+
+def settings_keyboard() -> InlineKeyboardMarkup:
+    def btn(label, key, value, current):
+        mark = "• " if current == value else ""
+        return InlineKeyboardButton(mark + label, callback_data=f"set:{key}:{value}")
+
+    e, m = cfg("effort"), cfg("model")
+    rows = [
+        [btn(x, "effort", x, e) for x in EFFORTS],
+        [btn(x.replace("kimi-k3.1-", ""), "model", x, m) for x in MODELS],
+        [
+            InlineKeyboardButton(("🧠 التفكير ظاهر" if cfg("show_thinking") else "🧠 التفكير مخفي"),
+                                 callback_data=f"set:show_thinking:{'off' if cfg('show_thinking') else 'on'}"),
+            InlineKeyboardButton(("🔎 البحث شغال" if cfg("web_search") else "🔎 البحث مقفل"),
+                                 callback_data=f"set:web_search:{'off' if cfg('web_search') else 'on'}"),
+        ],
+    ]
+    return InlineKeyboardMarkup(rows)
+
+
+async def cmd_settings(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not await owner_only(update):
         return
-    new = not setting("show_thinking", True)
-    save_setting("show_thinking", new)
-    await update.message.reply_text("سلسلة التفكير: " + ("ظاهرة 🧠" if new else "مخفية"))
+    await update.message.reply_text(settings_text(), reply_markup=settings_keyboard())
+
+
+async def on_settings_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    q = update.callback_query
+    if not is_owner(update):
+        await q.answer("لصاحب البوت فقط", show_alert=True)
+        return
+    _, key, raw = q.data.split(":", 2)
+    save_setting(key, parse_value(key, raw))
+    await q.answer("تم ✅")
+    await q.edit_message_text(settings_text(), reply_markup=settings_keyboard())
+
+
+async def cmd_set(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await owner_only(update):
+        return
+    if len(context.args) < 2 or context.args[0] not in PARAMS:
+        await update.message.reply_text("الاستخدام: /set <الإعداد> <القيمة>\nالإعدادات: " + ", ".join(PARAMS))
+        return
+    key = context.args[0]
+    try:
+        save_setting(key, parse_value(key, " ".join(context.args[1:])))
+    except ValueError as e:
+        await update.message.reply_text(f"قيمة غلط: {e}")
+        return
+    await update.message.reply_text(settings_text(), reply_markup=settings_keyboard())
+
+
+async def cmd_effort(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    context.args = ["effort", *(context.args or ["default"])]
+    await cmd_set(update, context)
+
+
+async def cmd_thinking(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    context.args = ["show_thinking", "off" if cfg("show_thinking") else "on"]
+    await cmd_set(update, context)
 
 
 async def cmd_search(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not await owner_only(update):
-        return
-    new = not setting("web_search", True)
-    save_setting("web_search", new)
-    await update.message.reply_text("البحث في الإنترنت: " + ("شغال 🔎" if new else "مقفل"))
+    context.args = ["web_search", "off" if cfg("web_search") else "on"]
+    await cmd_set(update, context)
+
+
+def split_overrides(text: str) -> tuple[dict, str]:
+    """يقرأ إعدادات مكتوبة في بداية الرسالة مثل: effort=low temperature=0.3 السؤال"""
+    overrides, words = {}, text.split(" ")
+    while words and "=" in words[0]:
+        k, _, v = words[0].partition("=")
+        if k not in PARAMS:
+            break
+        overrides[k] = parse_value(k, v)
+        words.pop(0)
+    return overrides, " ".join(words).strip()
 
 
 # ---------- المحادثة ----------
@@ -228,8 +358,19 @@ async def send_thinking(update: Update, steps: list[str]) -> None:
 async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     chat_id = update.effective_chat.id
     user_text = update.message.text
+    overrides = {}
+    if is_owner(update):
+        try:
+            overrides, user_text = split_overrides(user_text)
+        except ValueError as e:
+            await update.message.reply_text(f"إعداد غلط في الرسالة: {e}")
+            return
+        if not user_text:
+            await update.message.reply_text("اكتب سؤالك بعد الإعدادات.")
+            return
     history = histories[chat_id]
-    use_search = setting("web_search", True)
+    use_search = overrides.get("web_search", cfg("web_search"))
+    kw = request_kwargs(overrides)
 
     await context.bot.send_chat_action(chat_id, ChatAction.TYPING)
 
@@ -240,7 +381,7 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     try:
         for _ in range(MAX_TOOL_ROUNDS):
             kwargs = {"tools": TOOLS} if use_search else {}
-            resp = await client.chat.completions.create(model=KIMI_MODEL, messages=messages, **kwargs)
+            resp = await client.chat.completions.create(messages=messages, **kw, **kwargs)
             msg = resp.choices[0].message
             thinking.append(reasoning_of(msg))
             if not msg.tool_calls:
@@ -257,20 +398,23 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         else:
             # خلصت الجولات وهو باقي يبحث — نطلب منه يجاوب بدون أدوات
             resp = await client.chat.completions.create(
-                model=KIMI_MODEL, messages=messages, tools=TOOLS, tool_choice="none"
+                messages=messages, tools=TOOLS, tool_choice="none", **kw
             )
             msg = resp.choices[0].message
             thinking.append(reasoning_of(msg))
         reply = (msg.content or "").strip() or "..."
-    except Exception:
+    except Exception as e:
         log.exception("Kimi API error")
-        await update.message.reply_text("صار خطأ مؤقت، جرّب بعد شوي.")
+        text = "صار خطأ مؤقت، جرّب بعد شوي."
+        if is_owner(update):  # المالك يشوف تفاصيل الخطأ عشان يعرف أي إعداد رفضه الموديل
+            text += f"\n\n(للمالك) {type(e).__name__}: {str(e)[:500]}"
+        await update.message.reply_text(text)
         return
 
     history.append({"role": "user", "content": user_text})
     history.append({"role": "assistant", "content": reply})
     save_histories()
-    if setting("show_thinking", True):
+    if overrides.get("show_thinking", cfg("show_thinking")):
         await send_thinking(update, thinking)
     await send_long(update, reply)
 
@@ -287,8 +431,12 @@ def main() -> None:
     app.add_handler(CommandHandler("resetall", cmd_resetall))
     app.add_handler(CommandHandler("thinking", cmd_thinking))
     app.add_handler(CommandHandler("search", cmd_search))
+    app.add_handler(CommandHandler("settings", cmd_settings))
+    app.add_handler(CommandHandler("set", cmd_set))
+    app.add_handler(CommandHandler("effort", cmd_effort))
+    app.add_handler(CallbackQueryHandler(on_settings_button, pattern=r"^set:"))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_message))
-    log.info("البوت شغال بموديل %s", KIMI_MODEL)
+    log.info("البوت شغال بموديل %s", cfg("model"))
     app.run_polling()
 
 
