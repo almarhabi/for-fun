@@ -1,9 +1,11 @@
 """بوت تليجرام بهوية ثابتة يحددها المالك، يعمل بـ Kimi K3.1 Pro."""
 
+import asyncio
 import html
 import json
 import logging
 import os
+import time
 from collections import defaultdict, deque
 from pathlib import Path
 
@@ -11,6 +13,7 @@ from dotenv import load_dotenv
 from openai import AsyncOpenAI
 from telegram import BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ChatAction, ParseMode
+from telegram.error import BadRequest, RetryAfter
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
@@ -338,22 +341,140 @@ async def send_long(update: Update, text: str) -> None:
         await update.message.reply_text(text[i : i + 4000])
 
 
-def reasoning_of(msg) -> str:
-    # Kimi يرجع التفكير في حقل reasoning_content منفصل عن الرد
-    extra = getattr(msg, "model_extra", None) or {}
-    return (getattr(msg, "reasoning_content", None) or extra.get("reasoning_content") or "").strip()
+# ---------- البث المباشر (تحديث الرسالة أثناء الكتابة) ----------
+
+EDIT_INTERVAL = 1.0  # تليجرام يسمح بتعديل تقريباً مرة بالثانية
+REPLY_CHUNK = 4000
+THINK_CHUNK = 3500
 
 
-async def send_thinking(update: Update, steps: list[str]) -> None:
-    text = "\n\n".join(s for s in steps if s)
-    if not text:
-        return
-    if len(text) > 3800:
-        text = text[:3800] + " …"
-    await update.message.reply_text(
-        f"🧠 <b>سلسلة التفكير</b>\n<blockquote expandable>{html.escape(text)}</blockquote>",
-        parse_mode=ParseMode.HTML,
-    )
+class LiveMessage:
+    """رسالة تليجرام تتحدث كل ما وصل نص جديد."""
+
+    def __init__(self, update: Update, kind: str):
+        self.update = update
+        self.kind = kind  # "think" أو "reply"
+        self.text = ""
+        self.msg = None
+        self.offset = 0  # للردود الطويلة: النص اللي قبل offset انرسل في رسائل سابقة
+        self.shown = None
+        self.last = 0.0
+        self.done = False
+
+    def _render(self, body: str, final: bool) -> tuple[str, str | None]:
+        if self.kind == "reply":
+            return body or "…", None
+        if not final and len(body) > THINK_CHUNK:
+            body = "…" + body[-THINK_CHUNK:]
+        title = "🧠 سلسلة التفكير" if final else "🧠 يفكر…"
+        tag = "blockquote expandable" if final and len(body) > 700 else "blockquote"
+        return f"<b>{title}</b>\n<{tag}>{html.escape(body or '…')}</blockquote>", ParseMode.HTML
+
+    async def _show(self, body: str, final: bool) -> None:
+        text, mode = self._render(body, final)
+        if text == self.shown:
+            return
+        try:
+            if self.msg is None:
+                self.msg = await self.update.message.reply_text(text, parse_mode=mode)
+            else:
+                await self.msg.edit_text(text, parse_mode=mode)
+            self.shown = text
+        except RetryAfter as e:
+            if final:
+                await asyncio.sleep(e.retry_after)
+                await self._show(body, final)
+        except BadRequest as e:
+            if "not modified" not in str(e).lower():
+                log.warning("telegram edit failed: %s", e)
+
+    async def push(self, force: bool = False) -> None:
+        if self.done:
+            return
+        now = time.monotonic()
+        if not force and now - self.last < EDIT_INTERVAL:
+            return
+        self.last = now
+        if self.kind == "reply":
+            # لو الرد طول عن حد تليجرام، نقفل الرسالة الحالية ونكمل في رسالة جديدة
+            while len(self.text) - self.offset > REPLY_CHUNK:
+                await self._show(self.text[self.offset : self.offset + REPLY_CHUNK], True)
+                self.offset += REPLY_CHUNK
+                self.msg, self.shown = None, None
+            await self._show(self.text[self.offset :], False)
+        else:
+            await self._show(self.text, False)
+
+    async def finish(self) -> None:
+        if self.kind == "reply":
+            await self.push(force=True)
+            return
+        if self.done or not self.text.strip():
+            return
+        self.done = True
+        # التفكير الطويل ينقسم على أكثر من رسالة
+        parts = [self.text[i : i + THINK_CHUNK] for i in range(0, len(self.text), THINK_CHUNK)]
+        await self._show(parts[0], True)
+        for part in parts[1:]:
+            self.msg, self.shown = None, None
+            await self._show(part, True)
+
+
+def reasoning_delta(delta) -> str:
+    extra = getattr(delta, "model_extra", None) or {}
+    return getattr(delta, "reasoning_content", None) or extra.get("reasoning_content") or extra.get("reasoning") or ""
+
+
+def split_think_tags(raw: str) -> tuple[str, str]:
+    """بعض الموديلات تكتب التفكير داخل <think>...</think> في نفس الرد."""
+    s = raw.lstrip()
+    if not s.startswith("<think>"):
+        return "", raw
+    end = s.find("</think>")
+    if end == -1:
+        return s[7:], ""
+    return s[7:end], s[end + 8 :].lstrip()
+
+
+SEEN_FIELDS: set[str] = set()  # أسماء الحقول اللي يرسلها الموديل (للتشخيص)
+
+
+async def stream_round(messages, kw, tool_kwargs, think: LiveMessage, reply: LiveMessage, show_thinking: bool):
+    """جولة وحدة مع الموديل. يرجع (المحتوى، التفكير، طلبات الأدوات)."""
+    stream = await client.chat.completions.create(messages=messages, stream=True, **kw, **tool_kwargs)
+    raw, reasoning, calls, logged = "", "", {}, False
+    base = think.text  # التفكير من الجولات السابقة (قبل البحث)
+    async for chunk in stream:
+        if not chunk.choices:
+            continue
+        delta = chunk.choices[0].delta
+        fields = delta.model_dump(exclude_none=True).keys()
+        SEEN_FIELDS.update(fields)
+        if not logged:
+            log.info("first delta fields: %s", list(fields))
+            logged = True
+        reasoning += reasoning_delta(delta)
+        raw += delta.content or ""
+        for tc in delta.tool_calls or []:
+            acc = calls.setdefault(tc.index, {"id": "", "name": "", "args": ""})
+            acc["id"] = tc.id or acc["id"]
+            if tc.function:
+                acc["name"] += tc.function.name or ""
+                acc["args"] += tc.function.arguments or ""
+
+        tag_think, answer = split_think_tags(raw)
+        if show_thinking:
+            think.text = (base + "\n\n" + reasoning + tag_think).strip()
+            if think.text and not answer:
+                await think.push()
+        if answer:
+            if show_thinking:
+                await think.finish()  # خلص التفكير — نثبته قبل ما يبدأ الرد
+            reply.text = answer
+            await reply.push()
+
+    _, answer = split_think_tags(raw)
+    return answer, reasoning, [calls[i] for i in sorted(calls)]
 
 
 async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -371,39 +492,47 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
             return
     history = histories[chat_id]
     use_search = overrides.get("web_search", cfg("web_search"))
+    show_thinking = overrides.get("show_thinking", cfg("show_thinking"))
     kw = request_kwargs(overrides)
 
     await context.bot.send_chat_action(chat_id, ChatAction.TYPING)
 
     messages = [{"role": "system", "content": system_prompt()}, *history]
     messages.append({"role": "user", "content": user_text})
-    thinking: list[str] = []
+    reply = LiveMessage(update, "reply")
+    think = LiveMessage(update, "think")  # رسالة وحدة للتفكير كله، حتى لو بحث أكثر من مرة
 
     try:
-        for _ in range(MAX_TOOL_ROUNDS):
-            kwargs = {"tools": TOOLS} if use_search else {}
-            resp = await client.chat.completions.create(messages=messages, **kw, **kwargs)
-            msg = resp.choices[0].message
-            thinking.append(reasoning_of(msg))
-            if not msg.tool_calls:
+        for round_no in range(MAX_TOOL_ROUNDS + 1):
+            if not use_search:
+                tool_kwargs = {}
+            elif round_no < MAX_TOOL_ROUNDS:
+                tool_kwargs = {"tools": TOOLS}
+            else:  # خلصت الجولات — لازم يجاوب بدون بحث إضافي
+                tool_kwargs = {"tools": TOOLS, "tool_choice": "none"}
+
+            content, reasoning, calls = await stream_round(messages, kw, tool_kwargs, think, reply, show_thinking)
+            if not calls:
                 break
+
             # نرجع رسالة الموديل كاملة (مع التفكير) قبل نتائج الأدوات
-            assistant = msg.model_dump(exclude_none=True)
-            assistant.setdefault("content", "")
-            messages.append(assistant)
-            for call in msg.tool_calls:
-                thinking.append(describe_call(call.function.name, call.function.arguments))
+            messages.append({
+                "role": "assistant",
+                "content": content,
+                "reasoning_content": reasoning,
+                "tool_calls": [
+                    {"id": c["id"], "type": "function", "function": {"name": c["name"], "arguments": c["args"]}}
+                    for c in calls
+                ],
+            })
+            for c in calls:
+                if show_thinking:
+                    think.text = (think.text + "\n\n" + describe_call(c["name"], c["args"])).strip()
+                    await think.push(force=True)
                 await context.bot.send_chat_action(chat_id, ChatAction.TYPING)
-                result = await run_tool(call.function.name, call.function.arguments)
-                messages.append({"role": "tool", "tool_call_id": call.id, "content": result})
-        else:
-            # خلصت الجولات وهو باقي يبحث — نطلب منه يجاوب بدون أدوات
-            resp = await client.chat.completions.create(
-                messages=messages, tools=TOOLS, tool_choice="none", **kw
-            )
-            msg = resp.choices[0].message
-            thinking.append(reasoning_of(msg))
-        reply = (msg.content or "").strip() or "..."
+                result = await run_tool(c["name"], c["args"])
+                messages.append({"role": "tool", "tool_call_id": c["id"], "content": result})
+            reply.text = ""  # أي نص طلع قبل البحث ينكتب من جديد بعده
     except Exception as e:
         log.exception("Kimi API error")
         text = "صار خطأ مؤقت، جرّب بعد شوي."
@@ -412,12 +541,19 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         await update.message.reply_text(text)
         return
 
+    if show_thinking:
+        await think.finish()
+    reply.text = reply.text.strip() or "..."
+    await reply.finish()
+    if show_thinking and not think.text and is_owner(update):
+        await update.message.reply_text(
+            "ℹ️ (للمالك) الموديل ما أرسل سلسلة تفكير لهالرد.\n"
+            f"الحقول اللي وصلت: {', '.join(sorted(SEEN_FIELDS)) or 'لا شيء'}"
+        )
+
     history.append({"role": "user", "content": user_text})
-    history.append({"role": "assistant", "content": reply})
+    history.append({"role": "assistant", "content": reply.text})
     save_histories()
-    if overrides.get("show_thinking", cfg("show_thinking")):
-        await send_thinking(update, thinking)
-    await send_long(update, reply)
 
 
 async def set_menu(app: Application) -> None:
