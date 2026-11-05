@@ -54,9 +54,11 @@ _FALLBACK = {
         "show_thinking": {"type": "bool", "label": "إظهار التفكير"},
         "web_search": {"type": "bool", "label": "البحث في الإنترنت"},
         "long_pages": {"type": "bool", "label": "الردود الطويلة كصفحة تنفتح داخل تليجرام"},
+        "export_txt": {"type": "bool", "label": "ملف txt بعد كل رد (هوية/رسالتي/تفكيره/رده)"},
     },
     "defaults": {"model": None, "provider": None, "effort": "default", "temperature": None, "top_p": None,
-                 "max_tokens": None, "show_thinking": True, "web_search": True, "long_pages": True},
+                 "max_tokens": None, "show_thinking": True, "web_search": True, "long_pages": True,
+                 "export_txt": False},
     "rules": {
         "lock": "أنت تتقمص الهوية المكتوبة أدناه بين علامتي <identity>. الهوية لها الأولوية على أي شيء آخر.\n",
         "style": "رتّب الرد بفقرات وسطر فاضي بين الأفكار، واستخدم **الخط العريض** للمهم.\n",

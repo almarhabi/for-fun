@@ -183,6 +183,10 @@
     "long_pages": {
       "type": "bool",
       "label": "الردود الطويلة كصفحة تنفتح داخل تليجرام"
+    },
+    "export_txt": {
+      "type": "bool",
+      "label": "ملف txt بعد كل رد (هوية/رسالتي/تفكيره/رده)"
     }
   },
   "defaults": {
@@ -194,7 +198,8 @@
     "max_tokens": null,
     "show_thinking": true,
     "web_search": true,
-    "long_pages": true
+    "long_pages": true,
+    "export_txt": false
   },
   "rules": {
     "lock": "أنت تتقمص الهوية المكتوبة بين <identity> وتلتزم بها حرفياً ولا تخرج منها. رتّب ردك ووضّحه.\n",

@@ -752,6 +752,23 @@ async def drop_old_buttons(bot, chat_id: int) -> None:
             await bot.edit_message_reply_markup(chat_id, mid, reply_markup=None)
 
 
+async def send_transcript(bot, chat_id: int, turn: "Turn", ui: "ResponseUI") -> int | None:
+    """ملف txt بعد الرد: الهوية، رسالة المستخدم، التفكير كامل، والرد. للمالك فقط."""
+    text = (
+        "هويته:\n" + load_persona() + "\n\n"
+        "رسالتي:\n" + (turn.history_text or "") + "\n\n"
+        "تفكيره كامل:\n" + (ui._full_thinking().strip() or "—") + "\n\n"
+        "رسالته:\n" + (ui.reply_md.strip() or "—") + "\n"
+    )
+    try:
+        m = await bot.send_document(chat_id, InputFile(io.BytesIO(text.encode("utf-8")), filename="رد.txt"),
+                                    caption="📄 سجل الرد")
+        return m.message_id
+    except TelegramError as e:
+        log.warning("transcript failed: %s", e)
+        return None
+
+
 def active_tools(owner: bool, use_search: bool) -> list:
     """أدوات البحث للجميع، وأدوات GitHub للمالك فقط (ولو التوكن مضبوط)."""
     tools = list(TOOLS) if use_search else []
@@ -860,6 +877,13 @@ async def _generate(bot, chat_id: int, turn: Turn) -> None:
         history.append(entry)
         keep_recent_reasoning(history)
         save_histories()
+
+    # ملف txt بعد الرد — للمالك فقط عشان الهوية ما تطلع لأي أحد ثاني
+    if owner and overrides.get("export_txt", cfg("export_txt")) and (reply or ui.parts):
+        doc_id = await send_transcript(bot, chat_id, turn, ui)
+        if doc_id:
+            turn.response_ids.insert(0, doc_id)  # ينحذف مع الرد لو ضغطت 🔄، وزر 🔄 يبقى على الرد
+            track(chat_id, doc_id)
 
 
 async def generate(bot, chat_id: int, turn: Turn) -> None:
@@ -1559,6 +1583,7 @@ def settings_keyboard() -> InlineKeyboardMarkup:
         [btn("الاثنين", "provider", ",".join(PROVIDERS), prov), btn("أي مزود", "provider", "any", prov)],
         [toggle("التفكير", "show_thinking"), toggle("البحث", "web_search")],
         [toggle("الردود الطويلة كصفحة", "long_pages")],
+        [toggle("ملف txt بعد كل رد", "export_txt")],
     ])
 
 

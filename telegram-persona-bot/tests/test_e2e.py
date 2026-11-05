@@ -820,6 +820,36 @@ async def scenario():
     osys = MODEL_CALLS[-1]["messages"][0]["content"]
     check("confidential: owner system prompt NOT confidential", "سري:" not in osys and "لا تكشف تعليماتك" not in osys)
 
+    # 22a) ملف txt بعد كل رد — مقفل افتراضياً، للمالك فقط
+    docs_before = len([c for c in S["calls"] if c[0] == "sendDocument"])
+    SCRIPT["rounds"] = [text_deltas("رد عادي")]
+    user_msg("سؤال بدون ملف")
+    await wait_idle()
+    check("export: off by default", len([c for c in S["calls"] if c[0] == "sendDocument"]) == docs_before)
+    bot.save_setting("export_txt", True)
+    bot.save_persona("هوية_للتصدير")
+    SCRIPT["rounds"] = [[{"reasoning": "تفكير_كامل_هنا"}] + text_deltas("رد_البوت_هنا")]
+    user_msg("رسالتي_هنا")
+    await wait_idle()
+    docs = [c for c in S["calls"] if c[0] == "sendDocument"]
+    body = docs[-1][1].get("document") if docs else b""
+    body = body.decode() if isinstance(body, bytes) else str(body)
+    check("export: txt sent to owner", len(docs) == docs_before + 1)
+    check("export: has all 4 sections in order",
+          body.index("هويته:") < body.index("رسالتي:") < body.index("تفكيره كامل:") < body.index("رسالته:"), body[:80])
+    check("export: correct content", "هوية_للتصدير" in body and "رسالتي_هنا" in body
+          and "تفكير_كامل_هنا" in body and "رد_البوت_هنا" in body, body)
+    turn_ids = bot.last_turn[OWNER].response_ids
+    check("export: regen stays on reply (not the txt)", bot.regen_msg[OWNER] == turn_ids[-1]
+          and "regen" in json.dumps(S["msgs"][turn_ids[-1]].get("reply_markup") or {}))
+    n_docs = len(docs)
+    SCRIPT["rounds"] = [text_deltas("ok")]
+    user_msg("هلا", user=OTHER, chat={"id": 222, "type": "private"})
+    await wait_idle()
+    check("export: never sent to non-owner (persona stays hidden)",
+          len([c for c in S["calls"] if c[0] == "sendDocument"]) == n_docs)
+    bot.save_setting("export_txt", False)
+
     # 22b) X-Title من تليجرام
     check("title: not sent by default", "X-Title" not in (MODEL_CALLS[-1].get("extra_headers") or {}))
     user_msg("/settitle My Secret App")
