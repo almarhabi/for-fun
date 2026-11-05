@@ -39,7 +39,7 @@
 ## OpenRouter
 
 - كل طلب ينرسل بـ `reasoning: {enabled: true}` (أو `effort` لو اخترت مستوى)، و`provider: {only: ["relace/fp4", "inference-net/mxfp4/us"], allow_fallbacks: false}`.
-- `reasoning_details` يرجع للموديل مثل ما هو: بين جولات البحث، وفي آخر ردين من المحادثة، عشان يكمل تفكيره من حيث وقف.
+- `reasoning_details` يرجع للموديل مثل ما هو: بين جولات البحث، وفي آخر 10 ردود من المحادثة، عشان يكمل تفكيره من حيث وقف.
 - مستويات التفكير: افتراضي · low · medium · high · max (`xhigh` في OpenRouter).
 - من ⚙️ الإعدادات تختار: relace بس، inference-net بس، الاثنين، أو «أي مزود» (أو `/set provider any`)، وترجع بـ `/set provider default`.
 - قبل كل تشغيل يتأكد إن OpenRouter يقبل المفتاح، ولو رفضه يطلع السبب في صفحة Actions.
