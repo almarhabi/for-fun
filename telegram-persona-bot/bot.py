@@ -62,7 +62,7 @@ PROVIDERS = ["relace/fp4", "inference-net/mxfp4/us"]
 # الافتراضي: الاثنين (بدون أي مزود ثالث) — لو واحد وقف يشتغل الثاني
 DEFAULT_PROVIDER = os.getenv("OPENROUTER_PROVIDER", "").strip() or ",".join(PROVIDERS)
 OWNER_ID = int(os.getenv("OWNER_ID", "").strip() or "0")
-MAX_HISTORY = int(os.getenv("MAX_HISTORY", "30"))
+MAX_HISTORY = int(os.getenv("MAX_HISTORY", "20"))  # 10 رسائل لكل طرف
 
 DATA_DIR = Path(__file__).parent / "data"
 PERSONA_FILE = DATA_DIR / "persona.json"
@@ -583,8 +583,8 @@ def tools_key(kw: dict) -> str:
     return kw["model"] + "|" + json.dumps(kw.get("extra_body", {}).get("provider"), sort_keys=True)
 
 
-def keep_recent_reasoning(history: deque, keep: int = 2) -> None:
-    """نخلي reasoning_details في آخر ردين بس عشان ما تكبر التكلفة."""
+def keep_recent_reasoning(history: deque, keep: int = 10) -> None:
+    """نخلي reasoning_details في آخر 10 ردود (كل ردود الذاكرة)."""
     seen = 0
     for msg in reversed(history):
         if msg.get("role") == "assistant" and "reasoning_details" in msg:
