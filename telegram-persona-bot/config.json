@@ -53,7 +53,47 @@
       ],
       "action": "persona",
       "menu": "owner",
-      "menu_label": "عرض الهوية الحالية"
+      "menu_label": "عرض الهوية"
+    },
+    {
+      "names": [
+        "setrules"
+      ],
+      "action": "setrules",
+      "menu": "owner",
+      "menu_label": "تعديل قواعد القفل",
+      "caption": true
+    },
+    {
+      "names": [
+        "rules"
+      ],
+      "action": "rules",
+      "menu": "owner",
+      "menu_label": "عرض قواعد القفل"
+    },
+    {
+      "names": [
+        "snip"
+      ],
+      "action": "snip",
+      "menu": "owner",
+      "menu_label": "حفظ اختصار",
+      "caption": true
+    },
+    {
+      "names": [
+        "snippets"
+      ],
+      "action": "snippets",
+      "menu": "owner",
+      "menu_label": "الاختصارات"
+    },
+    {
+      "names": [
+        "delsnip"
+      ],
+      "action": "delsnip"
     },
     {
       "names": [

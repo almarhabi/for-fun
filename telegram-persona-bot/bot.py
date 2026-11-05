@@ -68,6 +68,8 @@ MAX_HISTORY = int(os.getenv("MAX_HISTORY", "20"))  # 10 رسائل لكل طرف
 
 DATA_DIR = Path(__file__).parent / "data"
 PERSONA_FILE = DATA_DIR / "persona.json"
+RULES_FILE = DATA_DIR / "rules.json"       # تعديل قواعد القفل من تليجرام
+SNIPPETS_FILE = DATA_DIR / "snippets.json"  # اختصارات المالك (جمل/ملفات محفوظة)
 HISTORY_FILE = DATA_DIR / "history.json"
 SETTINGS_FILE = DATA_DIR / "settings.json"
 SCREEN_FILE = DATA_DIR / "screen.json"
@@ -156,9 +158,28 @@ def save_persona(text: str) -> None:
     _write_json(PERSONA_FILE, {"persona": text})
 
 
+def load_lock() -> str:
+    """قواعد القفل الحالية — المعدّلة من تليجرام إن وُجدت، وإلا من config.json."""
+    data = _read_json(RULES_FILE, {})
+    return data["lock"] if isinstance(data, dict) and "lock" in data else config.LOCK_RULES
+
+
+def save_lock(text: str) -> None:
+    _write_json(RULES_FILE, {"lock": text})
+
+
+def load_snippets() -> dict:
+    data = _read_json(SNIPPETS_FILE, {})
+    return data if isinstance(data, dict) else {}
+
+
+def save_snippets(data: dict) -> None:
+    _write_json(SNIPPETS_FILE, data)
+
+
 def system_prompt(github: bool = False) -> str:
     extra = GITHUB_NOTE if github else ""
-    return f"{LOCK_RULES}\n{STYLE_RULES}{extra}\n<identity>\n{load_persona()}\n</identity>"
+    return f"{load_lock()}\n{STYLE_RULES}{extra}\n<identity>\n{load_persona()}\n</identity>"
 
 
 # ================= الإعدادات =================
@@ -989,6 +1010,8 @@ async def on_user_message(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         return
     if username := context.bot.username:
         item.text = re.sub(rf"@{re.escape(username)}\b", "", item.text, flags=re.I).strip()
+    if is_owner(update):  # نوسّع اختصارات المالك (!اسم) قبل الإرسال للموديل
+        item.text = expand_snippets(item.text)
 
     # ألبوم صور أو رسالة طويلة انقسمت: ننتظر شوي ونجمعها في رسالة وحدة
     entry = pending.get(chat_id)
@@ -1078,8 +1101,9 @@ def welcome_html(owner: bool) -> str:
               "• 🐙 GitHub غير مربوط — أضف السر GH_PAT لأقدر أكتب وأعدّل على مستودعاتك")
         text += "\n\n" + lines_html(
             "👑 <b>أوامر المالك</b>",
-            "• /setpersona — تحديد الهوية",
-            "• /persona — عرض الهوية الحالية + نسخة ملف",
+            "• /setpersona — تحديد الهوية · /persona — عرضها",
+            "• /setrules — تعديل قواعد القفل · /rules — عرضها",
+            "• /snip <code>اسم نص</code> — حفظ اختصار، وبعدها اكتب <code>!اسم</code> بأي رسالة · /snippets",
             "• /settings — لوحة التحكم",
             "• /set <code>إعداد قيمة</code> — مثل <code>/set temperature 0.7</code>",
             "• /resetall — مسح ذاكرة كل المحادثات",
@@ -1152,30 +1176,46 @@ async def read_persona_file(doc, bot) -> str:
     return text
 
 
-async def store_persona(bot, chat_id: int, text: str) -> None:
-    save_persona(text)
-    histories.clear()  # عشان ما تتأثر الهوية الجديدة بكلام قديم
-    save_histories()
-    last_turn.clear()
+# "الهدف" للتعديل: الهوية (persona) أو قواعد القفل (rules) — نفس آلية الإدخال لهما
+TARGET_LABEL = {"persona": "الهوية", "rules": "قواعد القفل"}
+TARGET_VIEW = {"persona": "/persona", "rules": "/rules"}
+
+
+def _save_target(target: str, text: str) -> None:
+    (save_persona if target == "persona" else save_lock)(text)
+
+
+def load_target(target: str) -> str:
+    return load_persona() if target == "persona" else load_lock()
+
+
+async def store_control(bot, chat_id: int, text: str, target: str) -> None:
+    _save_target(target, text)
+    if target == "persona":  # الهوية الجديدة ما تتأثر بكلام قديم
+        histories.clear()
+        save_histories()
+        last_turn.clear()
+    label = TARGET_LABEL[target]
     lines = text.count("\n") + 1
     await send_html(bot, chat_id, lines_html(
-        "✅ <b>انحفظت الهوية حرف بحرف</b>",
+        f"✅ <b>انحفظت {label} حرف بحرف</b>",
         f"📏 {len(text):,} حرف · {lines:,} سطر",
-        "تقدر تتأكد منها بـ /persona (ترسل لك نسخة ملف طبق الأصل).",
+        f"تقدر تتأكد منها بـ {TARGET_VIEW[target]} (ترسل لك نسخة ملف طبق الأصل).",
     ))
 
 
-async def start_capture(bot, chat_id: int, parts: list[str], note: str = "") -> None:
-    prompt = await send_html(bot, chat_id, capture_text(parts, note), PERSONA_KB)
-    capture[chat_id] = {"parts": parts, "prompt": prompt}
+async def start_capture(bot, chat_id: int, parts: list[str], target: str, note: str = "") -> None:
+    prompt = await send_html(bot, chat_id, capture_text(parts, target, note), PERSONA_KB)
+    capture[chat_id] = {"parts": parts, "prompt": prompt, "target": target}
 
 
-def capture_text(parts: list[str], note: str = "") -> str:
+def capture_text(parts: list[str], target: str, note: str = "") -> str:
+    label = TARGET_LABEL[target]
     chars = sum(len(p) for p in parts)
     lines = [
-        "📝 <b>وضع إدخال الهوية</b>",
-        note or "أرسل الهوية الحين: رسالة وحدة، أو عدة رسائل، أو ملف <code>.txt</code>.",
-        "كل حرف ينحفظ مثل ما هو بالضبط. للهويات الطويلة جداً الأفضل ملف <code>.txt</code>.",
+        f"📝 <b>وضع إدخال {label}</b>",
+        note or f"أرسل {label} الحين: رسالة وحدة، أو عدة رسائل، أو ملف <code>.txt</code>.",
+        "كل حرف ينحفظ مثل ما هو بالضبط. للنصوص الطويلة جداً الأفضل ملف <code>.txt</code>.",
         "",
         f"📥 استلمت: <b>{len(parts)}</b> جزء · <b>{chars:,}</b> حرف",
         "لما تخلص اضغط ✅ حفظ (أو اكتب /done).",
@@ -1183,7 +1223,7 @@ def capture_text(parts: list[str], note: str = "") -> str:
     return lines_html(*lines)
 
 
-async def cmd_setpersona(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def set_control(update: Update, context: ContextTypes.DEFAULT_TYPE, target: str) -> None:
     if not await owner_only(update, context):
         return
     msg, bot, chat_id = update.message, context.bot, update.effective_chat.id
@@ -1192,35 +1232,46 @@ async def cmd_setpersona(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     rest = after_command(raw)
     replied = msg.reply_to_message
     doc = msg.document or (replied.document if replied else None)
+    label = TARGET_LABEL[target]
     try:
         if doc:
-            await store_persona(bot, chat_id, await read_persona_file(doc, bot))
+            await store_control(bot, chat_id, await read_persona_file(doc, bot), target)
         elif rest.strip():
             if len(raw) >= 3900:  # تليجرام قسم الرسالة — ننتظر بقية الأجزاء
-                await start_capture(bot, chat_id, [rest], "الهوية طويلة وتليجرام قسمها. أرسل بقية الأجزاء لو فيه.")
+                await start_capture(bot, chat_id, [rest], target, f"{label} طويلة وتليجرام قسمها. أرسل بقية الأجزاء لو فيه.")
             else:
-                await store_persona(bot, chat_id, rest)
+                await store_control(bot, chat_id, rest, target)
         elif replied and (replied.text or replied.caption):
-            await store_persona(bot, chat_id, replied.text or replied.caption)
+            await store_control(bot, chat_id, replied.text or replied.caption, target)
         else:
-            await start_capture(bot, chat_id, [])
+            await start_capture(bot, chat_id, [], target)
     except ValueError as e:
         await send_html(bot, chat_id, RLM + "⚠️ " + esc(str(e)))
+
+
+async def cmd_setpersona(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await set_control(update, context, "persona")
+
+
+async def cmd_setrules(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await set_control(update, context, "rules")
 
 
 async def finish_capture(bot, chat_id: int, save: bool) -> None:
     state = capture.pop(chat_id, None)
     if not state:
         return
+    target = state.get("target", "persona")
+    label = TARGET_LABEL[target]
     if state.get("prompt"):
         with contextlib.suppress(TelegramError):
             await state["prompt"].edit_reply_markup(None)
     if not save:
-        await send_html(bot, chat_id, RLM + "✖️ تم إلغاء تغيير الهوية.")
+        await send_html(bot, chat_id, RLM + f"✖️ تم إلغاء تغيير {label}.")
     elif not state["parts"]:
-        await send_html(bot, chat_id, RLM + "⚠️ ما وصلني أي نص، الهوية ما تغيرت.")
+        await send_html(bot, chat_id, RLM + f"⚠️ ما وصلني أي نص، {label} ما تغيّرت.")
     else:
-        await store_persona(bot, chat_id, "\n".join(state["parts"]))
+        await store_control(bot, chat_id, "\n".join(state["parts"]), target)
 
 
 async def capture_messages(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1236,7 +1287,7 @@ async def capture_messages(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     if text == "/cancel":
         await finish_capture(context.bot, msg.chat_id, False)
         raise ApplicationHandlerStop
-    if text in (NEW_CHAT_BTN, SETTINGS_BTN) or (text or "").startswith("/setpersona"):
+    if text in (NEW_CHAT_BTN, SETTINGS_BTN) or (text or "").startswith(("/setpersona", "/setrules")):
         capture.pop(msg.chat_id, None)
         return
     state = capture[msg.chat_id]
@@ -1256,7 +1307,8 @@ async def capture_messages(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     state["parts"].append(part)
     if state.get("prompt"):
         with contextlib.suppress(TelegramError):
-            await state["prompt"].edit_text(capture_text(state["parts"]), parse_mode=ParseMode.HTML,
+            await state["prompt"].edit_text(capture_text(state["parts"], state.get("target", "persona")),
+                                            parse_mode=ParseMode.HTML,
                                             reply_markup=PERSONA_KB)
     raise ApplicationHandlerStop
 
@@ -1270,23 +1322,135 @@ async def on_persona_button(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     await finish_capture(context.bot, q.message.chat_id, q.data == "persona:save")
 
 
-async def cmd_persona(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def view_control(update: Update, context: ContextTypes.DEFAULT_TYPE, target: str) -> None:
     if not await owner_only(update, context):
         return
     chat_id, bot = update.effective_chat.id, context.bot
     track(chat_id, update.message.message_id)
-    p = load_persona()
+    label = TARGET_LABEL[target]
+    p = load_target(target)
     await send_html(bot, chat_id, lines_html(
-        "📜 <b>الهوية الحالية</b>",
+        f"📜 <b>{label} الحالية</b>",
         f"📏 {len(p):,} حرف · {p.count(chr(10)) + 1:,} سطر",
     ))
     for i in range(0, len(p), 4000):  # النص نفسه بدون أي تنسيق
         with contextlib.suppress(TelegramError):
-            m = await bot.send_message(chat_id, p[i : i + 4000], link_preview_options=NO_PREVIEW)
+            m = await bot.send_message(chat_id, p[i : i + 4000] or "—", link_preview_options=NO_PREVIEW)
             track(chat_id, m.message_id)
-    m = await bot.send_document(chat_id, InputFile(io.BytesIO(p.encode("utf-8")), filename="persona.txt"),
-                                caption="📄 نسخة طبق الأصل من الهوية")
+    fname = "persona.txt" if target == "persona" else "rules.txt"
+    m = await bot.send_document(chat_id, InputFile(io.BytesIO(p.encode("utf-8")), filename=fname),
+                                caption=f"📄 نسخة طبق الأصل من {label}")
     track(chat_id, m.message_id)
+
+
+async def cmd_persona(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await view_control(update, context, "persona")
+
+
+async def cmd_rules(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await view_control(update, context, "rules")
+
+
+# ----- الاختصارات (جمل/ملفات محفوظة) -----
+
+SNIP_NAME = re.compile(r"[\w؀-ۿ][\w؀-ۿ-]{0,39}")
+MAX_SNIPPET = 100_000
+
+
+def expand_snippets(text: str) -> str:
+    """يستبدل !الاسم بالنص/الملف المحفوظ. يستبدل المعروف فقط، والباقي يبقى مثل ما هو."""
+    snips = load_snippets()
+    if not snips or "!" not in text:
+        return text
+
+    def repl(m):
+        s = snips.get(m.group(1))
+        if not s:
+            return m.group(0)
+        if s.get("type") == "file":
+            return f"\n[ملف محفوظ: {s.get('filename') or m.group(1)}]\n{s.get('content', '')}\n"
+        return s.get("content", "")
+
+    return re.sub(r"!(" + SNIP_NAME.pattern + r")", repl, text)
+
+
+async def cmd_snip(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """حفظ اختصار: /snip اسم نص... — أو رد على رسالة/ملف بـ /snip اسم."""
+    if not await owner_only(update, context):
+        return
+    msg, bot, chat_id = update.message, context.bot, update.effective_chat.id
+    track(chat_id, msg.message_id)
+    rest = after_command(msg.text or msg.caption or "")
+    parts = rest.split(maxsplit=1)
+    if not parts or not SNIP_NAME.fullmatch(parts[0]):
+        await send_html(bot, chat_id, lines_html(
+            "الاستخدام: <code>/snip اسم النص</code>",
+            "أو رد على رسالة أو ملف بـ <code>/snip اسم</code>.",
+            "بعدها اكتب <code>!اسم</code> داخل أي رسالة وأنا أفهم إنك تقصده.",
+        ))
+        return
+    name = parts[0]
+    body = parts[1] if len(parts) > 1 else ""
+    replied = msg.reply_to_message
+    doc = msg.document or (replied.document if replied else None)
+    try:
+        if doc:
+            content, typ, fname = await read_persona_file(doc, bot), "file", (doc.file_name or name)
+        elif body.strip():
+            content, typ, fname = body, "text", None
+        elif replied and (replied.text or replied.caption):
+            content, typ, fname = (replied.text or replied.caption), "text", None
+        else:
+            await send_html(bot, chat_id, RLM + "⚠️ اكتب النص بعد الاسم، أو رد على رسالة/ملف.")
+            return
+    except ValueError as e:
+        await send_html(bot, chat_id, RLM + "⚠️ " + esc(str(e)))
+        return
+    snips = load_snippets()
+    snips[name] = {"type": typ, "content": content[:MAX_SNIPPET], "filename": fname}
+    save_snippets(snips)
+    kind = "ملف" if typ == "file" else "نص"
+    await send_html(bot, chat_id, lines_html(
+        f"✅ انحفظ الاختصار <code>!{esc(name)}</code> ({kind})",
+        f"📏 {len(content):,} حرف",
+        f"استخدمه بكتابة <code>!{esc(name)}</code> داخل أي رسالة.",
+    ))
+
+
+async def cmd_snippets(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await owner_only(update, context):
+        return
+    chat_id = update.effective_chat.id
+    track(chat_id, update.message.message_id)
+    snips = load_snippets()
+    if not snips:
+        await send_html(context.bot, chat_id, lines_html(
+            "ما فيه اختصارات بعد.",
+            "أضف واحد: <code>/snip اسم النص</code>، وبعدها اكتب <code>!اسم</code> في رسالتك.",
+        ))
+        return
+    rows = ["🔖 <b>الاختصارات</b>", ""]
+    for name, s in snips.items():
+        kind = "📎" if s.get("type") == "file" else "📝"
+        preview = " ".join((s.get("content") or "").split())[:40]
+        rows.append(f"{kind} <code>!{esc(name)}</code> — {esc(preview)}")
+    rows += ["", "للحذف: <code>/delsnip اسم</code>"]
+    await send_html(context.bot, chat_id, lines_html(*rows))
+
+
+async def cmd_delsnip(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await owner_only(update, context):
+        return
+    chat_id = update.effective_chat.id
+    track(chat_id, update.message.message_id)
+    name = (context.args or [""])[0]
+    snips = load_snippets()
+    if name in snips:
+        del snips[name]
+        save_snippets(snips)
+        await send_html(context.bot, chat_id, RLM + f"🗑 انحذف الاختصار <code>!{esc(name)}</code>")
+    else:
+        await send_html(context.bot, chat_id, RLM + "⚠️ ما فيه اختصار بهذا الاسم. شوف /snippets")
 
 
 # ----- الإعدادات -----
@@ -1392,6 +1556,11 @@ def _actions() -> dict:
         "settings": cmd_settings,
         "setpersona": cmd_setpersona,
         "persona": cmd_persona,
+        "setrules": cmd_setrules,
+        "rules": cmd_rules,
+        "snip": cmd_snip,
+        "snippets": cmd_snippets,
+        "delsnip": cmd_delsnip,
         "resetall": cmd_resetall,
         "set": cmd_set,
         "effort": shortcut("effort", lambda c: (c.args or ["default"])[0]),

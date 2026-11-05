@@ -22,6 +22,7 @@ DATA = pathlib.Path(tempfile.mkdtemp())
 bot.DATA_DIR = DATA
 bot.PERSONA_FILE, bot.HISTORY_FILE = DATA / "persona.json", DATA / "history.json"
 bot.SETTINGS_FILE, bot.SCREEN_FILE = DATA / "settings.json", DATA / "screen.json"
+bot.RULES_FILE, bot.SNIPPETS_FILE = DATA / "rules.json", DATA / "snippets.json"
 bot.TELEGRAPH_FILE = DATA / "telegraph.json"
 bot.tph = telegraph.Telegraph(bot.TELEGRAPH_FILE, short_name="TestBot")
 bot.EDIT_INTERVAL = 0.15
@@ -752,6 +753,55 @@ async def scenario():
     # 19) حتى لو انطلبت أداة GitHub من غير مالك، التنفيذ يرفضها
     r = await bot.dispatch_tool("gh_put_file", json.dumps({"repo": "app", "path": "x", "content": "y", "message": "m"}), False)
     check("github: dispatch refuses non-owner", "صاحب البوت" in r[0] and GH["repos"]["owner/app"]["files"].get("x") is None, r[0])
+
+    # 20) تعديل قواعد القفل من تليجرام (مثل الهوية)
+    user_msg("/setrules قاعدة قفل اختبارية جديدة")
+    await wait_idle()
+    check("rules: saved from telegram", bot.load_lock() == "قاعدة قفل اختبارية جديدة", bot.load_lock())
+    check("rules: reflected in system prompt", "قاعدة قفل اختبارية جديدة" in bot.system_prompt(False))
+    user_msg("/rules")
+    await wait_idle()
+    docs = [c for c in S["calls"] if c[0] == "sendDocument"]
+    check("rules: /rules sends exact file", docs and docs[-1][1].get("document") == "قاعدة قفل اختبارية جديدة".encode(),
+          docs[-1][1].get("document") if docs else None)
+    check("rules: persona untouched", "قاعدة قفل" not in bot.load_persona())
+
+    # 21) الاختصارات: حفظ جملة، والتوسيع بـ !اسم
+    user_msg("/snip تحية اهلا وسهلا فيك")
+    await wait_idle()
+    check("snip: text saved", bot.load_snippets().get("تحية", {}).get("content") == "اهلا وسهلا فيك")
+    SCRIPT["rounds"] = [text_deltas("رد")]
+    user_msg("قل !تحية للجميع")
+    await wait_idle()
+    sent = str(MODEL_CALLS[-1]["messages"][-1]["content"])
+    check("snip: expanded in owner message", "اهلا وسهلا فيك" in sent and "!تحية" not in sent, sent[:120])
+
+    # اختصار من ملف (كابشن /snip اسم على ملف)
+    FILES["sf"] = "محتوى الدليل السري".encode()
+    user_msg(None, document={"file_id": "sf", "file_unique_id": "sf", "file_name": "guide.txt", "mime_type": "text/plain"},
+             caption="/snip دليل")
+    await wait_idle()
+    snip = bot.load_snippets().get("دليل", {})
+    check("snip: file saved", snip.get("type") == "file" and "محتوى الدليل السري" in snip.get("content", ""), snip)
+    SCRIPT["rounds"] = [text_deltas("تم")]
+    user_msg("لخص !دليل من فضلك")
+    await wait_idle()
+    check("snip: file expanded", "محتوى الدليل السري" in str(MODEL_CALLS[-1]["messages"][-1]["content"]))
+
+    user_msg("/snippets")
+    await wait_idle()
+    check("snip: listed", "تحية" in strip(last_bot()["text"]) and "دليل" in strip(last_bot()["text"]))
+    user_msg("/delsnip تحية")
+    await wait_idle()
+    check("snip: deleted", "تحية" not in bot.load_snippets())
+
+    # غير المالك: الاختصارات ما تتوسّع له
+    bot.save_snippets({"x": {"type": "text", "content": "محتوى_خاص_بالمالك", "filename": None}})
+    SCRIPT["rounds"] = [text_deltas("ok")]
+    user_msg("say !x", user=OTHER, chat={"id": 222, "type": "private"})
+    await wait_idle()
+    non = str(MODEL_CALLS[-1]["messages"][-1]["content"])
+    check("snip: non-owner not expanded", "محتوى_خاص_بالمالك" not in non and "!x" in non, non[:80])
 
     check("no invalid/raw html sent", not PROBLEMS, PROBLEMS[:5])
 
