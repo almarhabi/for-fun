@@ -292,26 +292,57 @@ def _open_fence(text: str) -> tuple[str, str] | None:
     return state
 
 
+SPLIT_MARK = "<<<split>>>"  # الموديل يحطها بين أجزاء الرد الطويل
+_SPLIT_RE = re.compile(r"[ \t]*<<<split>>>[ \t]*")
+
+
+def _best_cut(window: str, limit: int) -> int:
+    """أفضل مكان للقطع داخل النافذة: قبل عنوان، ثم نهاية فقرة، ثم سطر، ثم نهاية جملة، ثم مسافة."""
+    heads = [m.start() for m in re.finditer(r"\n(?=[ \t]{0,3}#{1,6}\s)", window)]
+    if heads and heads[-1] >= limit * 0.4:
+        return heads[-1]
+    cut = window.rfind("\n\n")
+    if cut >= limit * 0.5:
+        return cut
+    cut = window.rfind("\n")
+    if cut >= limit * 0.4:
+        return cut
+    ends = [m.end() for m in re.finditer(r"[.!?؟…؛:](?=\s)", window)]
+    if ends and ends[-1] >= limit * 0.3:
+        return ends[-1]
+    cut = window.rfind(" ")
+    return cut if cut > 0 else limit
+
+
 def split_md(text: str, limit: int = PAGE_LIMIT) -> list[str]:
-    """يقسم الرد الطويل لعدة رسائل عند نهاية فقرة. التقسيم ثابت: الأجزاء المرسلة ما تتغير لما يكمل الرد."""
-    chunks, rest = [], text
-    while len(rest) > limit:
-        window = rest[:limit]
-        cut = window.rfind("\n\n")
-        if cut < limit * 0.5:
-            cut = window.rfind("\n")
-        if cut < limit * 0.3:
-            cut = window.rfind(" ")
-        if cut <= 0:
-            cut = limit
-        piece, rest = rest[:cut], rest[cut:].lstrip("\n")
-        fence = _open_fence(piece)
-        if fence:  # نقفل بلوك الكود هنا ونفتحه من جديد في الرسالة اللي بعدها
-            piece += "\n" + fence[0]
-            rest = fence[0] + fence[1] + "\n" + rest
-        chunks.append(piece)
-    chunks.append(rest)
-    return chunks
+    """يقسم الرد لعدة رسائل: أولاً عند علامات الموديل <<<split>>>، وبعدها لو جزء طال عن الحد
+    يقطع عند أقرب نقطة طبيعية. التقسيم ثابت: الأجزاء المرسلة ما تتغير لما يكمل الرد."""
+    for k in range(len(SPLIT_MARK) - 1, 2, -1):  # علامة لسا ما اكتملت وهو يكتب
+        if text.endswith(SPLIT_MARK[:k]):
+            text = text[:-k]
+            break
+    segments = _SPLIT_RE.split(text)
+    chunks: list[str] = []
+    carry = ""
+    for n, seg in enumerate(segments):
+        rest = carry + seg.strip("\n")
+        carry = ""
+        while len(rest) > limit:
+            cut = _best_cut(rest[:limit], limit)
+            piece, rest = rest[:cut], rest[cut:].lstrip("\n")
+            fence = _open_fence(piece)
+            if fence:  # نقفل بلوك الكود هنا ونفتحه من جديد في الرسالة اللي بعدها
+                piece += "\n" + fence[0]
+                rest = fence[0] + fence[1] + "\n" + rest
+            if piece.strip():
+                chunks.append(piece)
+        fence = _open_fence(rest)
+        if fence and n < len(segments) - 1:
+            rest += "\n" + fence[0]
+            carry = fence[0] + fence[1] + "\n"
+        if rest.strip():
+            chunks.append(rest)
+    return chunks or [""]
 
 
 def page_html(md: str, partial: bool) -> str:

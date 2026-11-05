@@ -167,6 +167,8 @@ def check_html(p):
             PROBLEMS.append(("too long", len(t)))
         if "**" in t:
             PROBLEMS.append(("raw ** visible", t[:200]))
+    if "split>>>" in p.get("text", "") or "&lt;&lt;&lt;" in p.get("text", ""):
+        PROBLEMS.append(("split marker visible", p.get("text", "")[:200]))
     if not p.get("text", "x").strip():
         PROBLEMS.append(("empty text", p))
 
@@ -411,6 +413,13 @@ async def scenario():
     check("long: split into pages", len(pages) >= 4, len(pages))
     check("long: nothing lost", "قسم 0" in joined and "قسم 11" in joined and "النهاية" in joined)
     check("long: regen only on last page", all("reply_markup" not in S["msgs"][i] for i in pages[:-1]))
+
+    # 6b) الموديل يقسم الرد بنفسه
+    SCRIPT["rounds"] = [text_deltas("## الجزء الأول\nكلام الجزء الأول.\n\n<<<split>>>\n\n## الجزء الثاني\nكلام الجزء الثاني.", 4)]
+    user_msg("رد مقسوم")
+    await wait_idle()
+    pages = [S["msgs"][i]["text"] for i in bot.last_turn[OWNER].response_ids if i in S["msgs"] and "💭" not in S["msgs"][i]["text"]]
+    check("model split: two messages at marker", len(pages) == 2 and "الجزء الأول" in pages[0] and "الجزء الثاني" in pages[1], pages)
 
     # 7) صورة
     FILES["ph1"] = b"\xff\xd8fakejpeg"
