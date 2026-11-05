@@ -68,6 +68,17 @@ jobs:
 
       - run: pip install -r requirements.txt
 
+      # اختياري: تشغيل Tor داخل الرنر عشان البوت يبحث/يقرأ عبره.
+      # فعّله بإضافة متغيّر (Variables) اسمه USE_TOR بقيمة true.
+      - name: Start Tor (optional)
+        if: vars.USE_TOR == 'true'
+        run: |
+          sudo apt-get update && sudo apt-get install -y tor
+          sudo service tor start || (tor &)
+          echo "TOR_PROXY=socks5h://127.0.0.1:9050" >> "$GITHUB_ENV"
+          for i in $(seq 1 60); do (echo > /dev/tcp/127.0.0.1/9050) >/dev/null 2>&1 && break; sleep 1; done
+          echo "Tor SOCKS جاهز على 9050"
+
       # استرجاع الهوية وذاكرة المحادثات من التشغيل السابق
       - uses: actions/cache/restore@v4
         with:
@@ -84,6 +95,7 @@ jobs:
           OPENROUTER_MODEL: ${{ vars.OPENROUTER_MODEL }}
           OPENROUTER_PROVIDER: ${{ vars.OPENROUTER_PROVIDER }}
           GH_PAT: ${{ secrets.GH_PAT }}   # اختياري: عشان البوت يكتب/يعدّل على GitHub (للمالك فقط)
+          TOR_PROXY: ${{ env.TOR_PROXY }}   # يتعبّى تلقائياً لو USE_TOR=true
         run: |
           mkdir -p data
           start=$(date +%s)

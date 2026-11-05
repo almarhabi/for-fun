@@ -1,6 +1,7 @@
 {
   "_note": "ملف التحكم في البوت — عدّل هنا بدون ما تلمس الكود. الأوامر، الأزرار، الإعدادات، وقواعد الهوية/الشكل.",
   "default_model": "moonshotai/kimi-k3.1-pro",
+  "web_proxy": "",
   "providers": [
     "relace/fp4",
     "inference-net/mxfp4/us"

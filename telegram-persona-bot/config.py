@@ -20,6 +20,7 @@ TYPE_MAP = {"str": str, "float": float, "int": int, "bool": bool}
 # حد أدنى آمن — يُستخدم فقط لو config.json مفقود/معطوب (البوت يشتغل بوضع مبسّط)
 _FALLBACK = {
     "default_model": "moonshotai/kimi-k3.1-pro",
+    "web_proxy": "",
     "providers": ["relace/fp4", "inference-net/mxfp4/us"],
     "efforts": ["default", "low", "medium", "high", "max"],
     "effort_api": {"max": "xhigh"},
@@ -86,6 +87,10 @@ COMMANDS: list = list(_data["commands"])
 
 DEFAULT_MODEL: str = os.getenv("OPENROUTER_MODEL", "").strip() or _data["default_model"]
 DEFAULT_PROVIDER: str = os.getenv("OPENROUTER_PROVIDER", "").strip() or ",".join(PROVIDERS)
+# وكيل اختياري لكل طلبات الويب (بحث + فتح صفحات). Tor مثلاً: socks5h://127.0.0.1:9050
+# متغيّر البيئة TOR_PROXY أو WEB_PROXY يتجاوز قيمة config.json
+WEB_PROXY: str = (os.getenv("TOR_PROXY", "") or os.getenv("WEB_PROXY", "")
+                  or _data.get("web_proxy", "")).strip()
 
 PARAMS: dict = {k: (TYPE_MAP.get(v.get("type", "str"), str), v.get("label", k))
                 for k, v in _data["params"].items()}

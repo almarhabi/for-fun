@@ -13,7 +13,14 @@ import httpx
 from bs4 import BeautifulSoup
 from ddgs import DDGS
 
+import config
+
 log = logging.getLogger("persona-bot.tools")
+
+# وكيل اختياري لكل طلبات الويب (Tor مثلاً). فاضي = اتصال مباشر.
+WEB_PROXY = config.WEB_PROXY or None
+if WEB_PROXY:
+    log.info("طلبات الويب عبر وكيل: %s", WEB_PROXY)
 
 UA = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
                      "(KHTML, like Gecko) Chrome/124.0 Safari/537.36",
@@ -54,7 +61,8 @@ def _search(query: str, max_results: int, recency: str | None) -> list[dict]:
     kw = {"region": "wt-wt", "safesearch": "off", "max_results": max_results}
     if recency in RECENCY:
         kw["timelimit"] = RECENCY[recency]
-    results = DDGS().text(query, **kw)
+    ddgs = DDGS(proxy=WEB_PROXY) if WEB_PROXY else DDGS()  # نفس الوكيل للبحث
+    results = ddgs.text(query, **kw)
     return [{"title": (r.get("title") or "").strip(),
              "url": r.get("href") or r.get("url") or "",
              "snippet": (r.get("body") or "").strip()}
@@ -98,7 +106,10 @@ async def _fetch(url: str, client: httpx.AsyncClient, cap: int) -> dict:
 
 
 async def _fetch_many(urls: list[str], cap: int) -> dict[str, dict]:
-    async with httpx.AsyncClient(headers=UA, follow_redirects=True) as client:
+    kw = {"headers": UA, "follow_redirects": True}
+    if WEB_PROXY:  # فتح الصفحات عبر نفس الوكيل (يدعم socks5h للـ Tor و .onion)
+        kw["proxy"] = WEB_PROXY
+    async with httpx.AsyncClient(**kw) as client:
         results = await asyncio.gather(*(_fetch(u, client, cap) for u in urls))
     return {r["url"]: r for r in results}
 
