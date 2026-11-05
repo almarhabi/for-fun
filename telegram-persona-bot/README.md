@@ -1,4 +1,4 @@
-# بوت تليجرام بهوية ثابتة (Kimi K3.1 Pro)
+# بوت تليجرام بهوية ثابتة (Kimi K3.1 Pro عبر OpenRouter)
 
 بوت ذكاء اصطناعي تحدد له هويته (اسم، شخصية، أسلوب، آراء، أوامر...) ويلتزم فيها حرفياً.
 لو حس إنه بيخالف الهوية أو يعترض عليها، ما يناقش — يأجل الموضوع لوقت لاحق ويكمل بنفس الشخصية.
@@ -31,13 +31,19 @@
 |---|---|
 | `/new` أو زر 🆕 | محادثة جديدة |
 | `/settings` أو زر ⚙️ | لوحة التحكم (للمالك): مستوى التفكير، الموديل، إظهار التفكير، البحث، مسح الرسائل |
-| `/set <إعداد> <قيمة>` | `model` `effort` `temperature` `top_p` `max_tokens` `show_thinking` `web_search` `clear_screen` — و`off` يرجعه للافتراضي |
+| `/set <إعداد> <قيمة>` | `model` `provider` `effort` `temperature` `top_p` `max_tokens` `show_thinking` `web_search` `clear_screen` — و`off` يرجعه للافتراضي |
 | `/resetall` | مسح ذاكرة كل المحادثات (للمالك) |
 | `/help` | المساعدة |
 
 إعدادات لرسالة وحدة (للمالك): `effort=max web_search=off سؤالك`
 
-> Kimi K3.1 Pro يفكر دائماً وما يقبل إيقاف التفكير — تقدر تتحكم بمستواه (`effort`) وتخفي عرضه.
+## OpenRouter
+
+- كل طلب ينرسل بـ `reasoning: {enabled: true}` (أو `effort` لو اخترت مستوى)، و`provider: {only: ["relace/fp4"], allow_fallbacks: false}`.
+- `reasoning_details` يرجع للموديل مثل ما هو: بين جولات البحث، وفي آخر ردين من المحادثة، عشان يكمل تفكيره من حيث وقف.
+- مستويات التفكير: افتراضي · low · medium · high · max (`xhigh` في OpenRouter).
+- لو المزود وقف: ⚙️ الإعدادات ← «أي مزود» (أو `/set provider any`)، وترجع بـ `/set provider default`.
+- لو المزود ما يدعم أدوات البحث، البوت يكمل الرد بدون بحث بدل ما يفشل.
 
 ## التشغيل 24 ساعة على GitHub (مجاني)
 
@@ -45,8 +51,9 @@
 والرسائل اللي توصل خلال هالدقيقة يرد عليها أول ما يرجع. الهوية والذاكرة تنحفظ بين كل تشغيل.
 
 1. **Settings → Secrets and variables → Actions → Secrets** وأضف:
-   `TELEGRAM_BOT_TOKEN` · `MOONSHOT_API_KEY` · `OWNER_ID`
-2. (اختياري) في **Variables** أضف `KIMI_MODEL`.
+   `TELEGRAM_BOT_TOKEN` · `OPENROUTER_API_KEY` · `OWNER_ID`
+2. (اختياري) في **Variables**: `OPENROUTER_MODEL` (الافتراضي `moonshotai/kimi-k3.1-pro`)
+   و`OPENROUTER_PROVIDER` (الافتراضي `relace/fp4` بدون بديل؛ أكثر من مزود بفاصلة).
 3. **Actions → Telegram bot 24h → Run workflow**.
 
 > لا تشغّل البوت على جهازك وعلى GitHub بنفس الوقت — تليجرام يقبل نسخة وحدة بس.

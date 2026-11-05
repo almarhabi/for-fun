@@ -14,7 +14,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from dotenv import load_dotenv
-from openai import AsyncOpenAI
+from openai import APIError, AsyncOpenAI
 from telegram import (
     BotCommand,
     BotCommandScopeChat,
@@ -46,9 +46,11 @@ from tools import TOOLS, describe_call, run_tool
 load_dotenv()
 
 TELEGRAM_BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
-MOONSHOT_API_KEY = os.environ["MOONSHOT_API_KEY"]
-MOONSHOT_BASE_URL = os.getenv("MOONSHOT_BASE_URL", "https://api.moonshot.ai/v1")
-KIMI_MODEL = os.getenv("KIMI_MODEL", "kimi-k3.1-pro")
+OPENROUTER_API_KEY = os.environ["OPENROUTER_API_KEY"]
+OPENROUTER_BASE_URL = os.getenv("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1")
+DEFAULT_MODEL = os.getenv("OPENROUTER_MODEL", "").strip() or "moonshotai/kimi-k3.1-pro"
+# المزود داخل OpenRouter (أكثر من واحد بفاصلة). "any" = أي مزود مع بديل تلقائي
+DEFAULT_PROVIDER = os.getenv("OPENROUTER_PROVIDER", "").strip() or "relace/fp4"
 OWNER_ID = int(os.getenv("OWNER_ID", "").strip() or "0")
 MAX_HISTORY = int(os.getenv("MAX_HISTORY", "30"))
 
@@ -69,7 +71,8 @@ log = logging.getLogger("persona-bot")
 for noisy in ("httpx", "primp", "ddgs"):
     logging.getLogger(noisy).setLevel(logging.WARNING)
 
-client = AsyncOpenAI(api_key=MOONSHOT_API_KEY, base_url=MOONSHOT_BASE_URL)
+client = AsyncOpenAI(api_key=OPENROUTER_API_KEY, base_url=OPENROUTER_BASE_URL,
+                     default_headers={"X-Title": "Persona Telegram Bot"})
 NO_PREVIEW = LinkPreviewOptions(is_disabled=True)
 
 
@@ -165,11 +168,12 @@ def system_prompt() -> str:
 
 # ================= الإعدادات =================
 
-MODELS = ["kimi-k3.1-pro", "kimi-k3.1-pro-highspeed"]
-EFFORTS = ["default", "low", "high", "max"]
+EFFORTS = ["default", "low", "medium", "high", "max"]
+EFFORT_API = {"max": "xhigh"}  # أسماء OpenRouter
 BOOL_KEYS = ("show_thinking", "web_search", "clear_screen")
 PARAMS = {
     "model": (str, "الموديل"),
+    "provider": (str, "المزود"),
     "effort": (str, "مستوى التفكير"),
     "temperature": (float, "العشوائية (temperature)"),
     "top_p": (float, "top_p"),
@@ -178,12 +182,15 @@ PARAMS = {
     "web_search": (bool, "البحث في الإنترنت"),
     "clear_screen": (bool, "مسح الرسائل مع المحادثة الجديدة"),
 }
-DEFAULTS = {"model": KIMI_MODEL, "effort": "default", "temperature": None, "top_p": None,
+DEFAULTS = {"model": DEFAULT_MODEL, "provider": DEFAULT_PROVIDER, "effort": "default", "temperature": None, "top_p": None,
             "max_tokens": None, "show_thinking": True, "web_search": True, "clear_screen": True}
 
 
 def cfg(key: str):
-    return _read_json(SETTINGS_FILE, {}).get(key, DEFAULTS[key])
+    value = _read_json(SETTINGS_FILE, {}).get(key, DEFAULTS[key])
+    if key == "model" and "/" not in str(value):  # اسم قديم من Moonshot مباشرة
+        return DEFAULT_MODEL
+    return value
 
 
 def save_setting(key: str, value) -> None:
@@ -202,8 +209,10 @@ def parse_value(key: str, raw: str):
         if low in ("off", "false", "0", "no", "ايقاف", "إيقاف"):
             return False
         raise ValueError("اكتب on أو off")
+    if key == "provider" and low in ("any", "all", "أي"):
+        return "any"
     if low in ("off", "none", "default", "افتراضي"):
-        return "default" if key == "effort" else (KIMI_MODEL if key == "model" else None)
+        return "default" if key == "effort" else DEFAULTS[key] if key in ("model", "provider") else None
     if key == "effort":
         if low not in EFFORTS:
             raise ValueError("القيم: " + " / ".join(EFFORTS))
@@ -220,9 +229,12 @@ def request_kwargs(overrides: dict | None = None) -> dict:
     def get(k):
         return o.get(k, cfg(k))
 
-    kw = {"model": get("model")}
-    if get("effort") != "default":
-        kw["reasoning_effort"] = get("effort")
+    effort = get("effort")
+    extra = {"reasoning": {"enabled": True} if effort == "default" else {"effort": EFFORT_API.get(effort, effort)}}
+    provider = get("provider")
+    if provider and provider != "any":
+        extra["provider"] = {"only": [p.strip() for p in provider.split(",") if p.strip()], "allow_fallbacks": False}
+    kw = {"model": get("model"), "extra_body": extra}
     for k in ("temperature", "top_p", "max_tokens"):
         if get(k) is not None:
             kw[k] = get(k)
@@ -554,13 +566,52 @@ class Turn:
 
 
 last_turn: dict[int, Turn] = {}
+no_tools: set[str] = set()  # موديل/مزود ما يدعم الأدوات
+
+
+def tools_key(kw: dict) -> str:
+    return kw["model"] + "|" + json.dumps(kw.get("extra_body", {}).get("provider"), sort_keys=True)
+
+
+def keep_recent_reasoning(history: deque, keep: int = 2) -> None:
+    """نخلي reasoning_details في آخر ردين بس عشان ما تكبر التكلفة."""
+    seen = 0
+    for msg in reversed(history):
+        if msg.get("role") == "assistant" and "reasoning_details" in msg:
+            seen += 1
+            if seen > keep:
+                msg.pop("reasoning_details")
 active: dict[int, ResponseUI] = {}
 chat_locks: dict[int, asyncio.Lock] = defaultdict(asyncio.Lock)
 
 
-def reasoning_delta(delta) -> str:
+def reasoning_delta(delta) -> tuple[str, list]:
+    """OpenRouter يرسل التفكير كنص (reasoning) وكتفاصيل كاملة (reasoning_details)."""
     extra = getattr(delta, "model_extra", None) or {}
-    return getattr(delta, "reasoning_content", None) or extra.get("reasoning_content") or extra.get("reasoning") or ""
+    details = extra.get("reasoning_details")
+    details = details if isinstance(details, list) else []
+    text = extra.get("reasoning") or extra.get("reasoning_content") or getattr(delta, "reasoning_content", None)
+    if not text and details:
+        text = "".join((d.get("text") or d.get("summary") or "") for d in details if isinstance(d, dict))
+    return (text if isinstance(text, str) else ""), details
+
+
+def merge_reasoning_details(acc: list, new: list) -> None:
+    """يجمع أجزاء reasoning_details من البث عشان نرجعها للموديل مثل ما هي."""
+    for d in new:
+        if not isinstance(d, dict):
+            continue
+        idx = d.get("index")
+        target = next((x for x in acc if idx is not None and x.get("index") == idx
+                       and x.get("type") == d.get("type")), None)
+        if target is None:
+            acc.append(dict(d))
+            continue
+        for k, v in d.items():
+            if k in ("text", "summary", "data") and isinstance(v, str):
+                target[k] = (target.get(k) or "") + v
+            elif v is not None:
+                target[k] = v
 
 
 def split_think_tags(raw: str) -> tuple[str, str]:
@@ -575,15 +626,17 @@ def split_think_tags(raw: str) -> tuple[str, str]:
 
 
 async def stream_round(ui: ResponseUI, messages: list, kw: dict, tool_kwargs: dict):
-    """جولة وحدة مع الموديل. يرجع (نص الرد، التفكير، طلبات الأدوات)."""
+    """جولة وحدة مع الموديل. يرجع (نص الرد، التفكير، تفاصيل التفكير، طلبات الأدوات)."""
     stream = await client.chat.completions.create(messages=messages, stream=True, **kw, **tool_kwargs)
-    raw, reasoning, calls = "", "", {}
+    raw, reasoning, details, calls = "", "", [], {}
     try:
         async for chunk in stream:
             if not chunk.choices:
                 continue
             delta = chunk.choices[0].delta
-            reasoning += reasoning_delta(delta)
+            r_text, r_details = reasoning_delta(delta)
+            reasoning += r_text
+            merge_reasoning_details(details, r_details)
             raw += delta.content or ""
             for tc in delta.tool_calls or []:
                 acc = calls.setdefault(tc.index, {"id": "", "name": "", "args": ""})
@@ -598,11 +651,27 @@ async def stream_round(ui: ResponseUI, messages: list, kw: dict, tool_kwargs: di
         with contextlib.suppress(Exception):
             await stream.close()
     _, answer = split_think_tags(raw)
-    return answer, reasoning, [calls[i] for i in sorted(calls)]
+    return answer, reasoning, details, [calls[i] for i in sorted(calls)]
+
+
+def error_hint(e: Exception) -> str:
+    code = getattr(e, "status_code", None)
+    msg = str(e).lower()
+    if code == 401:
+        return "مفتاح OpenRouter غلط أو منتهي."
+    if code == 402 or "credit" in msg:
+        return "الرصيد في OpenRouter ما يكفي."
+    if code == 429:
+        return "فيه ضغط على المزود، جرّب بعد شوي."
+    if code == 404 or "no endpoints" in msg or "provider" in msg:
+        return "المزود المحدد مو متاح حالياً — جرّب من ⚙️ الإعدادات: «أي مزود»."
+    return ""
 
 
 def error_html(e: Exception, owner: bool) -> str:
     text = RLM + "⚠️ <b>صار خطأ وما قدرت أكمل الرد.</b>\n" + RLM + "اضغط 🔄 عشان تحاول مرة ثانية."
+    if owner and (hint := error_hint(e)):
+        text += "\n" + RLM + "💡 " + esc(hint)
     if owner:
         text += f"\n<blockquote expandable>{esc(type(e).__name__)}: {esc(str(e)[:700])}</blockquote>"
     return text
@@ -620,8 +689,9 @@ async def _generate(bot, chat_id: int, turn: Turn) -> None:
     """يولد رد كامل (لازم يكون قفل الشات ماسك)."""
     overrides = turn.overrides
     show_thinking = overrides.get("show_thinking", cfg("show_thinking"))
-    use_search = overrides.get("web_search", cfg("web_search"))
     kw = request_kwargs(overrides)
+    use_search = overrides.get("web_search", cfg("web_search")) and tools_key(kw) not in no_tools
+    rounds, final_details = 0, []
     await drop_old_buttons(bot, chat_id)
 
     history = histories[chat_id]
@@ -640,16 +710,30 @@ async def _generate(bot, chat_id: int, turn: Turn) -> None:
             else:  # خلصت الجولات — لازم يجاوب بدون بحث إضافي
                 tool_kwargs = {"tools": TOOLS, "tool_choice": "none"}
             ui.begin_round()
-            content, reasoning, calls = await stream_round(ui, messages, kw, tool_kwargs)
+            try:
+                content, reasoning, details, calls = await stream_round(ui, messages, kw, tool_kwargs)
+            except APIError as e:
+                # بعض المزودين ما يدعمون الأدوات: نكمل بدون بحث بدل ما يفشل الرد
+                if not tool_kwargs or "tool" not in str(e).lower():
+                    raise
+                no_tools.add(tools_key(kw))
+                use_search, tool_kwargs = False, {}
+                ui.add_step("⚠️ البحث غير مدعوم مع هذا المزود — كمّلت بدونه")
+                ui.begin_round()
+                content, reasoning, details, calls = await stream_round(ui, messages, kw, tool_kwargs)
+            rounds += 1
+            final_details = details
             if not calls:
                 break
-            messages.append({
+            assistant = {
                 "role": "assistant",
                 "content": content,
-                "reasoning_content": reasoning,
                 "tool_calls": [{"id": c["id"], "type": "function",
                                 "function": {"name": c["name"], "arguments": c["args"]}} for c in calls],
-            })
+            }
+            if details:
+                assistant["reasoning_details"] = details  # نرجعها مثل ما هي عشان يكمل تفكيره
+            messages.append(assistant)
             for c in calls:
                 ui.add_step(describe_call(c["name"], c["args"]))
                 result, sources = await run_tool(c["name"], c["args"])
@@ -660,7 +744,7 @@ async def _generate(bot, chat_id: int, turn: Turn) -> None:
             raise
         asyncio.current_task().uncancel()  # المستخدم ضغط ⏹ — نكمل ونثبت اللي انكتب
     except Exception as e:
-        log.exception("Kimi API error")
+        log.exception("model API error")
         ui.error = error_html(e, is_owner_id(turn.user_id))
     finally:
         ui.finishing = True
@@ -674,7 +758,11 @@ async def _generate(bot, chat_id: int, turn: Turn) -> None:
     reply = ui.reply_md.strip()
     if reply and not ui.error:
         history.append({"role": "user", "content": turn.history_text})
-        history.append({"role": "assistant", "content": reply})
+        entry = {"role": "assistant", "content": reply}
+        if final_details and rounds == 1 and not ui.stopped:
+            entry["reasoning_details"] = final_details  # يكمل تفكيره من حيث وقف في الرسالة الجاية
+        history.append(entry)
+        keep_recent_reasoning(history)
         save_histories()
 
 
@@ -1161,6 +1249,8 @@ def settings_html() -> str:
             return "<i>افتراضي</i>"
         if isinstance(v, bool):
             return "✅" if v else "❌"
+        if k == "provider" and v == "any":
+            return "<i>أي مزود (مع بديل تلقائي)</i>"
         return f"<code>{esc(str(v))}</code>"
 
     rows = ["⚙️ <b>الإعدادات</b>", ""]
@@ -1177,11 +1267,12 @@ def settings_keyboard() -> InlineKeyboardMarkup:
         on = cfg(key)
         return InlineKeyboardButton(f"{'✅' if on else '❌'} {label}", callback_data=f"set:{key}:{'off' if on else 'on'}")
 
-    e, m = cfg("effort"), cfg("model")
+    e, prov = cfg("effort"), cfg("provider")
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("🧠 مستوى التفكير:", callback_data="noop")],
         [btn({"default": "افتراضي"}.get(x, x), "effort", x, e) for x in EFFORTS],
-        [btn(x.replace("kimi-k3.1-", ""), "model", x, m) for x in MODELS],
+        [InlineKeyboardButton("🔌 المزود:", callback_data="noop")],
+        [btn(DEFAULT_PROVIDER, "provider", DEFAULT_PROVIDER, prov), btn("أي مزود", "provider", "any", prov)],
         [toggle("التفكير", "show_thinking"), toggle("البحث", "web_search")],
         [toggle("مسح الرسائل مع المحادثة الجديدة", "clear_screen")],
     ])
@@ -1296,7 +1387,7 @@ def main() -> None:
     if OWNER_ID == 0:
         log.warning("OWNER_ID غير محدد — أوامر المالك لن تعمل لأحد.")
     load_state()
-    log.info("البوت شغال بموديل %s", cfg("model"))
+    log.info("البوت شغال عبر OpenRouter بموديل %s والمزود %s", cfg("model"), cfg("provider"))
     build_app().run_polling(allowed_updates=Update.ALL_TYPES)
 
 

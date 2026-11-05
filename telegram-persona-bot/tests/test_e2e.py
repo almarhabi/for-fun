@@ -10,7 +10,7 @@ from urllib.parse import parse_qs, urlparse
 
 PORT = 18555
 OWNER = 111
-os.environ.update(TELEGRAM_BOT_TOKEN="123:TEST", MOONSHOT_API_KEY="x", OWNER_ID=str(OWNER),
+os.environ.update(TELEGRAM_BOT_TOKEN="123:TEST", OPENROUTER_API_KEY="x", OWNER_ID=str(OWNER),
                   TELEGRAM_API_BASE=f"http://127.0.0.1:{PORT}")
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 import bot, render
@@ -239,13 +239,16 @@ class FakeStream:
         self.closed = True
 
 
-SCRIPT = {"rounds": [], "delay": 0.01, "error": None}
+SCRIPT = {"rounds": [], "delay": 0.01, "error": None, "no_tools": False}
 
 
 async def fake_create(**kw):
     MODEL_CALLS.append(kw)
     if SCRIPT["error"]:
         raise RuntimeError(SCRIPT["error"])
+    if SCRIPT["no_tools"] and kw.get("tools"):
+        import httpx, openai
+        raise openai.APIError("No endpoints found that support tool use.", httpx.Request("POST", "https://x"), body=None)
     deltas = SCRIPT["rounds"].pop(0) if SCRIPT["rounds"] else [{"content": "تمام"}]
     return FakeStream(deltas, SCRIPT["delay"])
 
@@ -295,7 +298,8 @@ async def scenario():
 
     # 2) بحث في النص: الكلام قبل البحث ما ينحذف
     SCRIPT["rounds"] = [
-        [{"reasoning_content": "المستخدم يسأل عن كيمي، "}, {"reasoning_content": "لازم أبحث."},
+        [{"reasoning": "المستخدم يسأل عن كيمي، ", "reasoning_details": [{"type": "reasoning.text", "text": "المستخدم يسأل عن كيمي، ", "index": 0, "format": "unknown"}]},
+         {"reasoning": "لازم أبحث.", "reasoning_details": [{"type": "reasoning.text", "text": "لازم أبحث.", "index": 0}]},
          *text_deltas("خلني أدور لك على آخر الأخبار."),
          {"tool_calls": [{"index": 0, "id": "c1", "type": "function",
                           "function": {"name": "web_search", "arguments": '{"query":'}}]},
@@ -321,7 +325,12 @@ async def scenario():
     check("think: one message only", sum(1 for m in msgs if "💭" in (m.get("text") or "")) == 1)
     hist = list(bot.histories[OWNER])
     check("history: full reply saved", hist and "خلني أدور لك" in hist[-1]["content"] and "النتيجة" in hist[-1]["content"], hist[-1:])
-    check("model: assistant tool msg has reasoning", MODEL_CALLS[-1]["messages"][-2].get("reasoning_content") == "المستخدم يسأل عن كيمي، لازم أبحث.")
+    check("openrouter: reasoning_details passed back in tool round",
+          MODEL_CALLS[-1]["messages"][-2].get("reasoning_details") == [{"type": "reasoning.text", "text": "المستخدم يسأل عن كيمي، لازم أبحث.", "index": 0, "format": "unknown"}],
+          MODEL_CALLS[-1]["messages"][-2])
+    check("openrouter: provider + reasoning sent", MODEL_CALLS[0]["model"] == "moonshotai/kimi-k3.1-pro" and
+          MODEL_CALLS[0]["extra_body"] == {"reasoning": {"enabled": True}, "provider": {"only": ["relace/fp4"], "allow_fallbacks": False}},
+          MODEL_CALLS[0].get("extra_body"))
 
     # 3) إيقاف الرد
     SCRIPT["delay"] = 0.05
@@ -355,6 +364,37 @@ async def scenario():
     await wait_idle()
     check("edit: model got edited text", MODEL_CALLS[-1]["messages"][-1]["content"] == "سؤال معدّل", MODEL_CALLS[-1]["messages"][-1])
     check("edit: new reply", "رد على الرسالة المعدلة" in strip(last_bot()["text"]))
+
+    # 5b) reasoning_details ينحفظ ويرجع في الرسالة الجاية
+    SCRIPT["rounds"] = [[{"reasoning": "تفكير أ", "reasoning_details": [{"type": "reasoning.encrypted", "data": "ENC1", "index": 0}]}]
+                        + text_deltas("جواب أ"), text_deltas("جواب ب")]
+    user_msg("سؤال أ")
+    await wait_idle()
+    check("openrouter: reasoning_details saved in history", bot.histories[OWNER][-1].get("reasoning_details") == [{"type": "reasoning.encrypted", "data": "ENC1", "index": 0}], bot.histories[OWNER][-1])
+    user_msg("سؤال ب")
+    await wait_idle()
+    prev = MODEL_CALLS[-1]["messages"][-2]
+    check("openrouter: reasoning_details sent back next turn", prev.get("content") == "جواب أ" and prev.get("reasoning_details", [{}])[0].get("data") == "ENC1", prev)
+
+    # 5c) المزود ما يدعم الأدوات: يكمل بدون بحث
+    SCRIPT["no_tools"] = True
+    SCRIPT["rounds"] = [text_deltas("رد بدون بحث")]
+    user_msg("ابحث عن شي")
+    await wait_idle()
+    check("no tools: reply still delivered", "رد بدون بحث" in strip(last_bot()["text"]), strip(last_bot()["text"]))
+    check("no tools: next call skips tools", "tools" not in MODEL_CALLS[-1])
+    SCRIPT["no_tools"] = False
+    bot.no_tools.clear()
+
+    # 5d) مستوى التفكير والمزود من الإعدادات
+    bot.save_setting("effort", "max")
+    bot.save_setting("provider", "any")
+    SCRIPT["rounds"] = [text_deltas("تمام")]
+    user_msg("اختبار الإعدادات")
+    await wait_idle()
+    check("settings: effort max -> xhigh, provider any", MODEL_CALLS[-1]["extra_body"] == {"reasoning": {"effort": "xhigh"}}, MODEL_CALLS[-1]["extra_body"])
+    bot.save_setting("effort", "default")
+    bot.save_setting("provider", bot.DEFAULT_PROVIDER)
 
     # 6) رد طويل جداً ينقسم
     long_md = "\n\n".join(f"## قسم {i}\n**نقطة مهمة** رقم {i}: " + "نص عربي طويل " * 40 for i in range(12))

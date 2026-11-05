@@ -41,11 +41,11 @@ jobs:
       - name: Check secrets
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          MOONSHOT_API_KEY: ${{ secrets.MOONSHOT_API_KEY }}
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
           OWNER_ID: ${{ secrets.OWNER_ID }}
         run: |
           missing=0
-          for n in TELEGRAM_BOT_TOKEN MOONSHOT_API_KEY OWNER_ID; do
+          for n in TELEGRAM_BOT_TOKEN OPENROUTER_API_KEY OWNER_ID; do
             if [ -z "${!n}" ]; then echo "::error::Secret $n is missing — add it in Settings > Secrets and variables > Actions > Secrets"; missing=1;
             else echo "$n: OK"; fi
           done
@@ -64,9 +64,10 @@ jobs:
         id: bot
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          MOONSHOT_API_KEY: ${{ secrets.MOONSHOT_API_KEY }}
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
           OWNER_ID: ${{ secrets.OWNER_ID }}
-          KIMI_MODEL: ${{ vars.KIMI_MODEL || 'kimi-k3.1-pro' }}
+          OPENROUTER_MODEL: ${{ vars.OPENROUTER_MODEL }}
+          OPENROUTER_PROVIDER: ${{ vars.OPENROUTER_PROVIDER }}
         run: |
           mkdir -p data
           start=$(date +%s)
