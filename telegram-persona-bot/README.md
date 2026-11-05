@@ -50,7 +50,7 @@
 
 البوت يقدر يكتب برامج ويعدّل وينشئ على مستودعاتك مباشرة لما تعطيه أمر، بدون أي موافقة لكل خطوة.
 
-- أضف السر `GITHUB_PAT` (توكن من github.com/settings/tokens بصلاحية `repo`).
+- أضف السر `GH_PAT` (توكن من github.com/settings/tokens بصلاحية `repo`). ملاحظة: الاسم `GH_PAT` وليس `GITHUB_PAT` لأن GitHub يمنع الأسماء اللي تبدأ بـ `GITHUB_`.
 - **للمالك فقط:** أدوات GitHub ما تنعطى للموديل إلا لما يكون الطالب هو `OWNER_ID`، وفيه فحص ثانٍ وقت التنفيذ. أي شخص ثاني يكلم البوت ما يقدر يلمس GitHub أبداً.
 - يقدر: يعرض المستودعات، يقرأ/يكتب/يحذف ملفات، ينشئ مستودعات وفروع، ويفتح Pull Request.
 - **ما يقدر يحذف مستودعات** (إجراء غير قابل للتراجع) — تسويها بنفسك لو احتجت.
@@ -70,7 +70,7 @@
 والرسائل اللي توصل خلال هالدقيقة يرد عليها أول ما يرجع. الهوية والذاكرة تنحفظ بين كل تشغيل.
 
 1. **Settings → Secrets and variables → Actions → Secrets** وأضف:
-   `TELEGRAM_BOT_TOKEN` · `OPENROUTER_API_KEY` · `OWNER_ID` · (اختياري) `GITHUB_PAT`
+   `TELEGRAM_BOT_TOKEN` · `OPENROUTER_API_KEY` · `OWNER_ID` · (اختياري) `GH_PAT`
 2. (اختياري) في **Variables**: `OPENROUTER_MODEL` (الافتراضي `moonshotai/kimi-k3.1-pro`)
    و`OPENROUTER_PROVIDER` (الافتراضي `relace/fp4,inference-net/mxfp4/us` بدون أي مزود ثالث).
 3. **Actions → Telegram bot 24h → Run workflow**.

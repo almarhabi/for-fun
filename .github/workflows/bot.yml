@@ -83,7 +83,7 @@ jobs:
           OWNER_ID: ${{ secrets.OWNER_ID }}
           OPENROUTER_MODEL: ${{ vars.OPENROUTER_MODEL }}
           OPENROUTER_PROVIDER: ${{ vars.OPENROUTER_PROVIDER }}
-          GITHUB_PAT: ${{ secrets.GITHUB_PAT }}   # اختياري: عشان البوت يكتب/يعدّل على GitHub (للمالك فقط)
+          GH_PAT: ${{ secrets.GH_PAT }}   # اختياري: عشان البوت يكتب/يعدّل على GitHub (للمالك فقط)
         run: |
           mkdir -p data
           start=$(date +%s)

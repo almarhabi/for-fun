@@ -1110,7 +1110,7 @@ def welcome_html(owner: bool) -> str:
     if owner:
         gh = ("• 🐙 متصل بـ GitHub — أعطني أمر وأكتب/أعدّل/أنشئ مباشرة (مستودعات، ملفات، فروع، PR)"
               if github_tools.enabled() else
-              "• 🐙 GitHub غير مربوط — أضف السر GITHUB_PAT لأقدر أكتب وأعدّل على مستودعاتك")
+              "• 🐙 GitHub غير مربوط — أضف السر GH_PAT لأقدر أكتب وأعدّل على مستودعاتك")
         text += "\n\n" + lines_html(
             "👑 <b>أوامر المالك</b>",
             "• /setpersona — تحديد الهوية",
@@ -1339,7 +1339,7 @@ def settings_html() -> str:
 
     rows = ["⚙️ <b>الإعدادات</b>", ""]
     rows += [f"• <b>{desc}:</b> {show(k)}" for k, (_, desc) in PARAMS.items()]
-    rows += [f"• <b>GitHub:</b> {'✅ متصل' if github_tools.enabled() else '❌ غير مربوط (أضف GITHUB_PAT)'}"]
+    rows += [f"• <b>GitHub:</b> {'✅ متصل' if github_tools.enabled() else '❌ غير مربوط (أضف GH_PAT)'}"]
     rows += ["", "<i>للأرقام:</i> <code>/set temperature 0.7</code> · <code>/set max_tokens 2000</code> · <code>/set top_p off</code>"]
     return lines_html(*rows)
 

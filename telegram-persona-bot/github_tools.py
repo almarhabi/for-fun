@@ -1,6 +1,6 @@
 """أدوات GitHub للبوت — للمالك فقط. يقرأ ويكتب وينشئ على مستودعات المالك مباشرة.
 
-التوكن من السر GITHUB_PAT (أو GH_PAT). ما فيه حذف مستودعات (إجراء خطير وغير قابل للتراجع).
+التوكن من السر GH_PAT. ما فيه حذف مستودعات (إجراء خطير وغير قابل للتراجع).
 البوت يتأكد إن الطالب هو المالك قبل ما يشغّل أي أداة هنا (الفحص في bot.py).
 """
 
@@ -85,7 +85,7 @@ def is_github_tool(name: str) -> bool:
 
 
 def token() -> str:
-    return (os.getenv("GITHUB_PAT", "") or os.getenv("GH_PAT", "")).strip().strip('"\'').strip()
+    return (os.getenv("GH_PAT", "") or os.getenv("GITHUB_PAT", "")).strip().strip('"\'').strip()
 
 
 def enabled() -> bool:
@@ -230,7 +230,7 @@ _DISPATCH = {
 
 async def run_github(name: str, raw_args: str) -> str:
     if not enabled():
-        return "GitHub غير مربوط: أضف السر GITHUB_PAT عشان أقدر أكتب وأعدّل على GitHub."
+        return "GitHub غير مربوط: أضف السر GH_PAT عشان أقدر أكتب وأعدّل على GitHub."
     try:
         args = json.loads(raw_args or "{}")
     except json.JSONDecodeError:
