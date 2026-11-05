@@ -81,6 +81,21 @@ jobs:
           path: telegram-persona-bot/data
           key: bot-data-${{ github.run_id }}-${{ github.run_attempt }}
 
+      # حذف النسخ القديمة من البيانات عشان المحادثات الممسوحة تنحذف نهائياً
+      - name: Delete old data
+        if: always()
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          KEEP: bot-data-${{ github.run_id }}-${{ github.run_attempt }}
+        run: |
+          keys=$(gh cache list --key bot-data- --limit 100 --json key --jq '.[].key')
+          # لو ما انحفظت نسخة جديدة لا تحذف شي (عشان ما تضيع الهوية)
+          echo "$keys" | grep -qx "$KEEP" || { echo "no new save, skipping"; exit 0; }
+          echo "$keys" | while read -r k; do
+            [ "$k" != "$KEEP" ] && gh cache delete "$k" || true
+          done
+
       - name: Restart
         if: steps.bot.outputs.restart == 'true'
         env:

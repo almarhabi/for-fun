@@ -9,7 +9,7 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 from openai import AsyncOpenAI
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram import BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ChatAction, ParseMode
 from telegram.ext import (
     Application,
@@ -130,13 +130,13 @@ async def owner_only(update: Update) -> bool:
 # ---------- الأوامر ----------
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    text = "هلا! أرسل لي أي رسالة ونسولف."
+    text = "هلا! أرسل لي أي رسالة ونسولف.\n/new — بدء شات جديد ومسح القديم"
     if is_owner(update):
         text += (
             "\n\nأوامر المالك:\n"
             "/setpersona <النص> — تحديد الهوية (أو رد على رسالة فيها الهوية)\n"
             "/persona — عرض الهوية الحالية\n"
-            "/reset — مسح ذاكرة هذه المحادثة\n"
+            "/new — شات جديد (يمسح المحادثة الحالية نهائياً)\n"
             "/settings — لوحة التحكم (effort، الموديل، التفكير، البحث)\n"
             "/set <إعداد> <قيمة> — مثل /set temperature 0.7\n"
             "/effort low|high|max|default\n"
@@ -174,10 +174,11 @@ async def cmd_persona(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     await send_long(update, "الهوية الحالية:\n\n" + load_persona())
 
 
-async def cmd_reset(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def cmd_new(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    # يمسح المحادثة من الذاكرة ومن الملف — البوت ما يعرف أي شيء صار قبل
     histories.pop(update.effective_chat.id, None)
     save_histories()
-    await update.message.reply_text("تم مسح ذاكرة المحادثة.")
+    await update.message.reply_text("🆕 بدأنا شات جديد. المحادثة السابقة انحذفت نهائياً.")
 
 
 async def cmd_resetall(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -419,15 +420,25 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     await send_long(update, reply)
 
 
+async def set_menu(app: Application) -> None:
+    # قائمة الأوامر اللي تطلع عند زر "/" في تليجرام
+    await app.bot.set_my_commands([
+        BotCommand("new", "شات جديد ومسح القديم"),
+        BotCommand("settings", "لوحة التحكم (للمالك)"),
+        BotCommand("persona", "عرض الهوية (للمالك)"),
+        BotCommand("start", "المساعدة"),
+    ])
+
+
 def main() -> None:
     if OWNER_ID == 0:
         log.warning("OWNER_ID غير محدد — أوامر تغيير الهوية لن تعمل لأحد.")
     load_histories()
-    app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
+    app = Application.builder().token(TELEGRAM_BOT_TOKEN).post_init(set_menu).build()
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("setpersona", cmd_setpersona))
     app.add_handler(CommandHandler("persona", cmd_persona))
-    app.add_handler(CommandHandler("reset", cmd_reset))
+    app.add_handler(CommandHandler(["new", "reset"], cmd_new))
     app.add_handler(CommandHandler("resetall", cmd_resetall))
     app.add_handler(CommandHandler("thinking", cmd_thinking))
     app.add_handler(CommandHandler("search", cmd_search))
