@@ -38,6 +38,19 @@ jobs:
           cache: pip
           cache-dependency-path: telegram-persona-bot/requirements.txt
 
+      - name: Check secrets
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          MOONSHOT_API_KEY: ${{ secrets.MOONSHOT_API_KEY }}
+          OWNER_ID: ${{ secrets.OWNER_ID }}
+        run: |
+          missing=0
+          for n in TELEGRAM_BOT_TOKEN MOONSHOT_API_KEY OWNER_ID; do
+            if [ -z "${!n}" ]; then echo "::error::Secret $n is missing — add it in Settings > Secrets and variables > Actions > Secrets"; missing=1;
+            else echo "$n: OK"; fi
+          done
+          exit $missing
+
       - run: pip install -r requirements.txt
 
       # استرجاع الهوية وذاكرة المحادثات من التشغيل السابق

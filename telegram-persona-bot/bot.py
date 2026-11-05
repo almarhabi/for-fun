@@ -24,7 +24,7 @@ TELEGRAM_BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 MOONSHOT_API_KEY = os.environ["MOONSHOT_API_KEY"]
 MOONSHOT_BASE_URL = os.getenv("MOONSHOT_BASE_URL", "https://api.moonshot.ai/v1")
 KIMI_MODEL = os.getenv("KIMI_MODEL", "kimi-k3.1-pro")
-OWNER_ID = int(os.getenv("OWNER_ID", "0"))
+OWNER_ID = int(os.getenv("OWNER_ID", "").strip() or "0")
 MAX_HISTORY = int(os.getenv("MAX_HISTORY", "30"))
 
 DATA_DIR = Path(__file__).parent / "data"
