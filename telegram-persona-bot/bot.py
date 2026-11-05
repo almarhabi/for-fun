@@ -146,6 +146,7 @@ def untrack(chat_id: int, message_ids: list[int]) -> None:
 LOCK_RULES = config.LOCK_RULES
 STYLE_RULES = config.STYLE_RULES
 GITHUB_NOTE = config.GITHUB_NOTE
+CONFIDENTIAL_NOTE = config.CONFIDENTIAL_NOTE
 DEFAULT_PERSONA = config.DEFAULT_PERSONA
 
 
@@ -177,9 +178,11 @@ def save_snippets(data: dict) -> None:
     _write_json(SNIPPETS_FILE, data)
 
 
-def system_prompt(github: bool = False) -> str:
+def system_prompt(github: bool = False, confidential: bool = False) -> str:
     extra = GITHUB_NOTE if github else ""
-    return f"{load_lock()}\n{STYLE_RULES}{extra}\n<identity>\n{load_persona()}\n</identity>"
+    # لغير المالك: نمنع كشف التعليمات/الهوية. المالك يشوفها عبر /persona و /rules
+    head = (CONFIDENTIAL_NOTE + "\n") if confidential and CONFIDENTIAL_NOTE else ""
+    return f"{head}{load_lock()}\n{STYLE_RULES}{extra}\n<identity>\n{load_persona()}\n</identity>"
 
 
 # ================= الإعدادات =================
@@ -762,7 +765,7 @@ async def _generate(bot, chat_id: int, turn: Turn) -> None:
     await drop_old_buttons(bot, chat_id)
 
     history = histories[chat_id]
-    messages = [{"role": "system", "content": system_prompt(github_on)}, *history,
+    messages = [{"role": "system", "content": system_prompt(github_on, confidential=not owner)}, *history,
                 {"role": "user", "content": turn.content}]
     ui = ResponseUI(bot, chat_id, show_thinking, long_pages)
     ui.task = asyncio.current_task()
