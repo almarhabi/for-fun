@@ -74,6 +74,18 @@
     },
     {
       "names": [
+        "settitle"
+      ],
+      "action": "settitle"
+    },
+    {
+      "names": [
+        "title"
+      ],
+      "action": "title"
+    },
+    {
+      "names": [
         "snip"
       ],
       "action": "snip",

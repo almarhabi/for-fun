@@ -68,6 +68,7 @@
 |---|---|
 | `/new` أو زر 🆕 | محادثة جديدة |
 | `/setrules` / `/rules` | تعديل/عرض قواعد القفل (للمالك) |
+| `/settitle اسم` / `/title` | اسم X-Title اللي ينرسل لـ OpenRouter — بالإنجليزي، مشفّر (للمالك). `/settitle off` يوقفه |
 | `/snip` / `/snippets` / `/delsnip` | الاختصارات (للمالك) |
 | `/settings` أو زر ⚙️ | لوحة التحكم (للمالك): مستوى التفكير، المزود، إظهار التفكير، البحث |
 | `/set <إعداد> <قيمة>` | `model` `provider` `effort` `temperature` `top_p` `max_tokens` `show_thinking` `web_search` `long_pages` — و`off` يرجعه للافتراضي |

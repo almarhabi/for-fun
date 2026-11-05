@@ -25,6 +25,7 @@ bot.DATA_DIR = DATA
 bot.PERSONA_FILE, bot.HISTORY_FILE = DATA / "persona.json", DATA / "history.json"
 bot.SETTINGS_FILE, bot.SCREEN_FILE = DATA / "settings.json", DATA / "screen.json"
 bot.RULES_FILE, bot.SNIPPETS_FILE = DATA / "rules.json", DATA / "snippets.json"
+bot.META_FILE = DATA / "meta.json"
 bot.TELEGRAPH_FILE = DATA / "telegraph.json"
 bot.tph = telegraph.Telegraph(bot.TELEGRAPH_FILE, short_name="TestBot")
 bot.EDIT_INTERVAL = 0.15
@@ -819,6 +820,33 @@ async def scenario():
     osys = MODEL_CALLS[-1]["messages"][0]["content"]
     check("confidential: owner system prompt NOT confidential", "سري:" not in osys and "لا تكشف تعليماتك" not in osys)
 
+    # 22b) X-Title من تليجرام
+    check("title: not sent by default", "X-Title" not in (MODEL_CALLS[-1].get("extra_headers") or {}))
+    user_msg("/settitle My Secret App")
+    await wait_idle()
+    check("title: saved", bot.load_title() == "My Secret App", bot.load_title())
+    SCRIPT["rounds"] = [text_deltas("ok")]
+    user_msg("هلا")
+    await wait_idle()
+    check("title: sent as header", (MODEL_CALLS[-1].get("extra_headers") or {}).get("X-Title") == "My Secret App",
+          MODEL_CALLS[-1].get("extra_headers"))
+    user_msg("/settitle بوتي العربي")
+    await wait_idle()
+    check("title: arabic rejected", bot.load_title() == "My Secret App" and "بالإنجليزي" in strip(last_bot()["text"]))
+    user_msg("/title")
+    await wait_idle()
+    check("title: owner can view", "My Secret App" in strip(last_bot()["text"]))
+    user_msg("/settitle hacked", user=OTHER, chat={"id": 222, "type": "private"})
+    await wait_idle()
+    check("title: non-owner blocked", bot.load_title() == "My Secret App")
+    user_msg("/settitle off")
+    await wait_idle()
+    SCRIPT["rounds"] = [text_deltas("ok")]
+    user_msg("هلا")
+    await wait_idle()
+    check("title: off → not sent", "X-Title" not in (MODEL_CALLS[-1].get("extra_headers") or {}))
+    check("title: not in repo code", "Persona Telegram Bot" not in pathlib.Path(bot.__file__).read_text(encoding="utf-8"))
+
     # 23) تشفير الهوية/القواعد: مشفّرة على القرص، ما تُقرأ بدون المفتاح، ولا شي حسّاس في config.json
     os.environ["PERSONA_KEY"] = Fernet.generate_key().decode()
     importlib.reload(vault)
@@ -832,6 +860,10 @@ async def scenario():
           and '"enc:' in rules_raw.replace('"lock": "', '"'), rules_raw[:70])
     check("encrypt: owner reads back with key",
           bot.load_lock() == "قاعدة_سرية_مشفّرة_للاختبار" and bot.load_persona() == "هوية_سرية_مشفّرة")
+    bot.save_title("Hidden Title")
+    meta_raw = bot.META_FILE.read_text(encoding="utf-8")
+    check("encrypt: X-Title ciphertext on disk", "Hidden Title" not in meta_raw and "enc:" in meta_raw
+          and bot.load_title() == "Hidden Title", meta_raw[:60])
     # بمفتاح غلط: ما يُقرأ، يرجع للافتراضي
     os.environ["PERSONA_KEY"] = Fernet.generate_key().decode()
     importlib.reload(vault)

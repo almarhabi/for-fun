@@ -70,6 +70,7 @@ MAX_HISTORY = int(os.getenv("MAX_HISTORY", "20"))  # 10 رسائل لكل طرف
 DATA_DIR = Path(__file__).parent / "data"
 PERSONA_FILE = DATA_DIR / "persona.json"
 RULES_FILE = DATA_DIR / "rules.json"       # تعديل قواعد القفل من تليجرام
+META_FILE = DATA_DIR / "meta.json"          # X-Title (مشفّر)
 SNIPPETS_FILE = DATA_DIR / "snippets.json"  # اختصارات المالك (جمل/ملفات محفوظة)
 HISTORY_FILE = DATA_DIR / "history.json"
 SETTINGS_FILE = DATA_DIR / "settings.json"
@@ -88,8 +89,8 @@ log = logging.getLogger("persona-bot")
 for noisy in ("httpx", "primp", "ddgs"):
     logging.getLogger(noisy).setLevel(logging.WARNING)
 
-client = AsyncOpenAI(api_key=OPENROUTER_API_KEY, base_url=OPENROUTER_BASE_URL,
-                     default_headers={"X-Title": "Persona Telegram Bot"})
+# X-Title ما ينكتب هنا: يتحدد من تليجرام (/settitle) وينحفظ مشفّر، وينرسل مع كل طلب
+client = AsyncOpenAI(api_key=OPENROUTER_API_KEY, base_url=OPENROUTER_BASE_URL)
 NO_PREVIEW = LinkPreviewOptions(is_disabled=True)
 PREVIEW = LinkPreviewOptions(is_disabled=False, prefer_large_media=False)
 tph = telegraph.Telegraph(TELEGRAPH_FILE, short_name="PersonaBot")
@@ -179,6 +180,15 @@ def load_lock() -> str:
 
 def save_lock(text: str) -> None:
     _write_json(RULES_FILE, {"lock": vault.encrypt(text)})
+
+
+def load_title() -> str:
+    """اسم X-Title اللي ينرسل لـ OpenRouter — فاضي = ما ينرسل."""
+    return _load_secret(META_FILE, "x_title", "")
+
+
+def save_title(text: str) -> None:
+    _write_json(META_FILE, {"x_title": vault.encrypt(text)})
 
 
 def load_snippets() -> dict:
@@ -678,7 +688,9 @@ def split_think_tags(raw: str) -> tuple[str, str]:
 
 async def stream_round(ui: ResponseUI, messages: list, kw: dict, tool_kwargs: dict):
     """جولة وحدة مع الموديل. يرجع (نص الرد، التفكير، تفاصيل التفكير، طلبات الأدوات)."""
-    stream = await client.chat.completions.create(messages=messages, stream=True, **kw, **tool_kwargs)
+    headers = {"X-Title": t} if (t := load_title()) else {}
+    stream = await client.chat.completions.create(messages=messages, stream=True, extra_headers=headers,
+                                                  **kw, **tool_kwargs)
     raw, reasoning, details, calls = "", "", [], {}
     try:
         async for chunk in stream:
@@ -1366,6 +1378,48 @@ async def cmd_rules(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await view_control(update, context, "rules")
 
 
+async def cmd_settitle(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """X-Title اللي ينرسل لـ OpenRouter. ينحفظ مشفّر — ما يظهر في المستودع."""
+    if not await owner_only(update, context):
+        return
+    chat_id = update.effective_chat.id
+    track(chat_id, update.message.message_id)
+    raw = after_command(update.message.text or "").strip()
+    if not raw:
+        await send_html(context.bot, chat_id, lines_html(
+            "الاستخدام: <code>/settitle اسم التطبيق</code> (بالإنجليزي)",
+            "ولإيقافه: <code>/settitle off</code>",
+        ))
+        return
+    if raw.lower() in ("off", "none", "remove", "حذف", "ايقاف", "إيقاف"):
+        save_title("")
+        await send_html(context.bot, chat_id, RLM + "🗑 انشال X-Title — ما عاد ينرسل.")
+        return
+    title = " ".join(raw.split())  # سطر واحد بدون فواصل أسطر
+    if not title.isascii():
+        await send_html(context.bot, chat_id, lines_html(
+            "⚠️ X-Title لازم يكون <b>بالإنجليزي</b> (حروف وأرقام ورموز).",
+            "ترويسات HTTP ما تقبل الحروف العربية، والطلب بيفشل لو انكتب بالعربي.",
+        ))
+        return
+    save_title(title[:100])
+    note = "🔒 محفوظ مشفّر" if vault.enabled() else "⚠️ غير مشفّر — أضف PERSONA_KEY عشان ينحفظ مشفّر"
+    await send_html(context.bot, chat_id, lines_html(
+        f"✅ انحفظ X-Title: <code>{esc(title[:100])}</code>",
+        note,
+    ))
+
+
+async def cmd_title(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await owner_only(update, context):
+        return
+    chat_id = update.effective_chat.id
+    track(chat_id, update.message.message_id)
+    t = load_title()
+    await send_html(context.bot, chat_id, RLM + (f"🏷 X-Title الحالي: <code>{esc(t)}</code>" if t
+                                                  else "🏷 ما فيه X-Title (ما ينرسل). حدّده بـ /settitle"))
+
+
 # ----- الاختصارات (جمل/ملفات محفوظة) -----
 
 SNIP_NAME = re.compile(r"[\w؀-ۿ][\w؀-ۿ-]{0,39}")
@@ -1573,6 +1627,8 @@ def _actions() -> dict:
         "persona": cmd_persona,
         "setrules": cmd_setrules,
         "rules": cmd_rules,
+        "settitle": cmd_settitle,
+        "title": cmd_title,
         "snip": cmd_snip,
         "snippets": cmd_snippets,
         "delsnip": cmd_delsnip,

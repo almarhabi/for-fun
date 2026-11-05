@@ -33,6 +33,8 @@ _FALLBACK = {
         {"names": ["persona"], "action": "persona", "menu": "owner", "menu_label": "عرض الهوية"},
         {"names": ["setrules"], "action": "setrules", "menu": "owner", "menu_label": "تعديل قواعد القفل", "caption": True},
         {"names": ["rules"], "action": "rules", "menu": "owner", "menu_label": "عرض قواعد القفل"},
+        {"names": ["settitle"], "action": "settitle"},
+        {"names": ["title"], "action": "title"},
         {"names": ["snip"], "action": "snip", "menu": "owner", "menu_label": "حفظ اختصار", "caption": True},
         {"names": ["snippets"], "action": "snippets", "menu": "owner", "menu_label": "الاختصارات"},
         {"names": ["delsnip"], "action": "delsnip"},
