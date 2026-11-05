@@ -1,0 +1,124 @@
+name: Telegram bot 2 (GLM) 24h
+
+# بوت ثانٍ مستقل تماماً: توكن وموديل ومزود وبيانات منفصلة. ما يشترك مع الأول إلا الكود والسيرفر.
+# أسراره بلاحقة _2، وبياناته في كاش منفصل (bot2-data-)، فهويته وقواعده وذاكرته مستقلة.
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "17,47 * * * *"
+  push:
+    branches: [telegram-persona-bot]
+    paths:
+      - "telegram-persona-bot/**"
+      - ".github/workflows/bot2.yml"
+
+concurrency:
+  group: telegram-bot-2
+  cancel-in-progress: ${{ github.event_name == 'push' }}
+
+permissions:
+  contents: read
+  actions: write
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 355
+    defaults:
+      run:
+        working-directory: telegram-persona-bot
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: telegram-persona-bot/requirements.txt
+
+      - name: Check secrets
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN_2 }}
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY_2 }}
+          OWNER_ID: ${{ secrets.OWNER_ID_2 }}
+        run: |
+          missing=0
+          for n in TELEGRAM_BOT_TOKEN OPENROUTER_API_KEY OWNER_ID; do
+            if [ -z "${!n}" ]; then echo "::error::Secret ${n}_2 is missing — add it in Settings > Secrets and variables > Actions > Secrets"; missing=1;
+            else echo "${n}_2: OK"; fi
+          done
+          [ "$missing" = 0 ] || exit 1
+          key=$(printf '%s' "$OPENROUTER_API_KEY" | tr -d '\r\n' | sed -E 's/^[[:space:]"'"'"']+//; s/[[:space:]"'"'"']+$//; s/^[Bb]earer[[:space:]]+//')
+          case "$key" in
+            sk-or-*) ;;
+            *) echo "::warning::OPENROUTER_API_KEY_2 ما يبدأ بـ sk-or- — غالباً منسوخ غلط" ;;
+          esac
+          code=$(curl -s -o /tmp/key.json -w '%{http_code}' -H "Authorization: Bearer $key" https://openrouter.ai/api/v1/key)
+          if [ "$code" = "404" ]; then
+            code=$(curl -s -o /tmp/key.json -w '%{http_code}' -H "Authorization: Bearer $key" https://openrouter.ai/api/v1/auth/key)
+          fi
+          if [ "$code" != "200" ]; then
+            echo "::error::OpenRouter رفض المفتاح (HTTP $code): $(head -c 300 /tmp/key.json) — حدّث السر OPENROUTER_API_KEY_2"
+            exit 1
+          fi
+          echo "OpenRouter key OK: $(jq -c '.data | {limit, limit_remaining, usage, is_free_tier}' /tmp/key.json)"
+
+      - run: pip install -r requirements.txt
+
+      - name: Start Tor (optional)
+        if: vars.USE_TOR_2 == 'true'
+        run: |
+          sudo apt-get update && sudo apt-get install -y tor
+          sudo service tor start || (tor &)
+          echo "TOR_PROXY=socks5h://127.0.0.1:9050" >> "$GITHUB_ENV"
+          for i in $(seq 1 60); do (echo > /dev/tcp/127.0.0.1/9050) >/dev/null 2>&1 && break; sleep 1; done
+          echo "Tor SOCKS جاهز على 9050"
+
+      - uses: actions/cache/restore@v4
+        with:
+          path: telegram-persona-bot/data
+          key: bot2-data-${{ github.run_id }}
+          restore-keys: bot2-data-
+
+      - name: Run bot
+        id: bot
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN_2 }}
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY_2 }}
+          OWNER_ID: ${{ secrets.OWNER_ID_2 }}
+          OPENROUTER_MODEL: ${{ vars.OPENROUTER_MODEL_2 || 'z-ai/glm-5.3' }}
+          OPENROUTER_PROVIDER: ${{ vars.OPENROUTER_PROVIDER_2 || 'baidu/fp8' }}
+          GH_PAT: ${{ secrets.GH_PAT_2 }}
+          TOR_PROXY: ${{ env.TOR_PROXY }}
+          PERSONA_KEY: ${{ secrets.PERSONA_KEY_2 }}
+        run: |
+          mkdir -p data
+          start=$(date +%s)
+          timeout --signal=SIGINT 340m python bot.py || true
+          if [ $(( $(date +%s) - start )) -gt 300 ]; then echo "restart=true" >> "$GITHUB_OUTPUT"; fi
+
+      - name: Save data
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: telegram-persona-bot/data
+          key: bot2-data-${{ github.run_id }}-${{ github.run_attempt }}
+
+      - name: Delete old data
+        if: always()
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          KEEP: bot2-data-${{ github.run_id }}-${{ github.run_attempt }}
+        run: |
+          keys=$(gh cache list --key bot2-data- --limit 100 --json key --jq '.[].key')
+          echo "$keys" | grep -qx "$KEEP" || { echo "no new save, skipping"; exit 0; }
+          echo "$keys" | while read -r k; do
+            [ "$k" != "$KEEP" ] && gh cache delete "$k" || true
+          done
+
+      - name: Restart
+        if: steps.bot.outputs.restart == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run bot2.yml --ref "${{ github.ref_name }}"
