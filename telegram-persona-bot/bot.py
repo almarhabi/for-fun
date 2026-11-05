@@ -43,6 +43,7 @@ import config
 import github_tools
 import render
 import telegraph
+import vault
 from render import RLM, esc
 from tools import TOOLS, describe_call, run_tool
 
@@ -150,23 +151,34 @@ CONFIDENTIAL_NOTE = config.CONFIDENTIAL_NOTE
 DEFAULT_PERSONA = config.DEFAULT_PERSONA
 
 
+def _load_secret(path: Path, key: str, default: str) -> str:
+    """يقرأ قيمة مشفّرة ويفكّها. لو مشفّرة وما عندنا المفتاح، يرجّع الافتراضي مع تحذير."""
+    data = _read_json(path, {})
+    val = data.get(key) if isinstance(data, dict) else None
+    if val is None:
+        return default
+    dec = vault.decrypt(val)
+    if dec is None:
+        log.warning("ما قدرت أفك تشفير %s (PERSONA_KEY ناقص أو غلط) — استخدمت الافتراضي", key)
+        return default
+    return dec
+
+
 def load_persona() -> str:
-    data = _read_json(PERSONA_FILE, {})
-    return data["persona"] if isinstance(data, dict) and "persona" in data else DEFAULT_PERSONA
+    return _load_secret(PERSONA_FILE, "persona", DEFAULT_PERSONA)
 
 
 def save_persona(text: str) -> None:
-    _write_json(PERSONA_FILE, {"persona": text})
+    _write_json(PERSONA_FILE, {"persona": vault.encrypt(text)})
 
 
 def load_lock() -> str:
     """قواعد القفل الحالية — المعدّلة من تليجرام إن وُجدت، وإلا من config.json."""
-    data = _read_json(RULES_FILE, {})
-    return data["lock"] if isinstance(data, dict) and "lock" in data else config.LOCK_RULES
+    return _load_secret(RULES_FILE, "lock", config.LOCK_RULES)
 
 
 def save_lock(text: str) -> None:
-    _write_json(RULES_FILE, {"lock": text})
+    _write_json(RULES_FILE, {"lock": vault.encrypt(text)})
 
 
 def load_snippets() -> dict:

@@ -96,6 +96,7 @@ jobs:
           OPENROUTER_PROVIDER: ${{ vars.OPENROUTER_PROVIDER }}
           GH_PAT: ${{ secrets.GH_PAT }}   # اختياري: عشان البوت يكتب/يعدّل على GitHub (للمالك فقط)
           TOR_PROXY: ${{ env.TOR_PROXY }}   # يتعبّى تلقائياً لو USE_TOR=true
+          PERSONA_KEY: ${{ secrets.PERSONA_KEY }}   # اختياري: مفتاح تشفير الهوية وقواعد القفل
         run: |
           mkdir -p data
           start=$(date +%s)

@@ -15,7 +15,9 @@ os.environ.update(TELEGRAM_BOT_TOKEN="123:TEST", OPENROUTER_API_KEY="x", OWNER_I
                   TELEGRAPH_API_BASE=f"http://127.0.0.1:{PORT}/tph",
                   GITHUB_API_BASE=f"http://127.0.0.1:{PORT}/gh", GITHUB_PAT="ghp_test")
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
-import bot, render, telegraph
+import importlib
+import bot, render, telegraph, vault
+from cryptography.fernet import Fernet
 from openai.types.chat import ChatCompletionChunk
 
 DATA = pathlib.Path(tempfile.mkdtemp())
@@ -816,6 +818,28 @@ async def scenario():
     await wait_idle()
     osys = MODEL_CALLS[-1]["messages"][0]["content"]
     check("confidential: owner system prompt NOT confidential", "سري:" not in osys and "لا تكشف تعليماتك" not in osys)
+
+    # 23) تشفير الهوية/القواعد: مشفّرة على القرص، ما تُقرأ بدون المفتاح، ولا شي حسّاس في config.json
+    os.environ["PERSONA_KEY"] = Fernet.generate_key().decode()
+    importlib.reload(vault)
+    assert vault.enabled()
+    bot.save_lock("قاعدة_سرية_مشفّرة_للاختبار")
+    bot.save_persona("هوية_سرية_مشفّرة")
+    rules_raw = bot.RULES_FILE.read_text(encoding="utf-8")
+    pers_raw = bot.PERSONA_FILE.read_text(encoding="utf-8")
+    check("encrypt: ciphertext on disk (no plaintext)",
+          "قاعدة_سرية" not in rules_raw and "هوية_سرية" not in pers_raw
+          and '"enc:' in rules_raw.replace('"lock": "', '"'), rules_raw[:70])
+    check("encrypt: owner reads back with key",
+          bot.load_lock() == "قاعدة_سرية_مشفّرة_للاختبار" and bot.load_persona() == "هوية_سرية_مشفّرة")
+    # بمفتاح غلط: ما يُقرأ، يرجع للافتراضي
+    os.environ["PERSONA_KEY"] = Fernet.generate_key().decode()
+    importlib.reload(vault)
+    check("encrypt: wrong key can't read", bot.load_lock() == bot.config.LOCK_RULES)
+    os.environ.pop("PERSONA_KEY", None)
+    importlib.reload(vault)
+    cfg_text = (pathlib.Path(bot.__file__).resolve().parent / "config.json").read_text(encoding="utf-8")
+    check("repo config.json has no secret persona/rules", "lab version" not in cfg_text and "IMRP" not in cfg_text)
 
     check("no invalid/raw html sent", not PROBLEMS, PROBLEMS[:5])
 

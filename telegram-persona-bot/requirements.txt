@@ -5,3 +5,4 @@ ddgs==9.16.1
 httpx[socks]>=0.27
 beautifulsoup4>=4.12
 pypdf==6.21.4
+cryptography>=42
