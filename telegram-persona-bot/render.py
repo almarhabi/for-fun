@@ -388,6 +388,10 @@ def thinking_html(parts: list[list[str]], final: bool, seconds: float, limit: in
     for kind, text in parts:
         if kind == "s":
             items.append(("s", text))
+        elif kind == "n":  # كلام القائد بين الخطوات (وضع الوكلاء)
+            lines_n = [ln.strip() for ln in text.strip().split("\n") if ln.strip()]
+            for i, line in enumerate(lines_n):
+                items.append(("n", ("💬 " if i == 0 else "") + re.sub(r"^#+\s*", "", line)))
         else:
             for line in text.strip().split("\n"):
                 line = re.sub(r"^\s*#+\s*", "", line).rstrip()
@@ -411,6 +415,8 @@ def thinking_html(parts: list[list[str]], final: bool, seconds: float, limit: in
     for kind, text in kept:
         if kind == "s":
             lines.append(mark(f"<b>{esc(text)}</b>", text, rtl))
+        elif kind == "n":
+            lines.append(mark(f"<i>{inline(text)}</i>", text, rtl))
         else:
             bullet = _UL.match(text)
             body = ("• " + inline(bullet.group(2))) if bullet else inline(text)

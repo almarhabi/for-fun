@@ -127,6 +127,31 @@ def gh_api(method, path, query, body):
         if sub == ["pulls"] and method == "POST":
             GH["prs"].append(body)
             return 201, {"number": len(GH["prs"]), "html_url": f"https://github.com/{full}/pull/{len(GH['prs'])}"}
+        if sub[:1] == ["commits"] and len(sub) == 2 and method == "GET":
+            return 200, {"sha": GH.setdefault("head_sha", {}).get(full, "0" * 40)}
+        if sub[:1] == ["actions"]:
+            return gh_actions_api(full, method, sub[1:], query)
+    return 404, {"message": "Not Found"}
+
+
+def gh_actions_api(full, method, sub, query):
+    runs = GH.setdefault("runs", {}).setdefault(full, [])
+    if sub == ["runs"] and method == "GET":
+        rs = [r for r in runs if (not query.get("branch") or r["head_branch"] == query["branch"])
+              and (not query.get("head_sha") or r["head_sha"] == query["head_sha"])]
+        return 200, {"workflow_runs": sorted(rs, key=lambda r: -r["id"])}
+    if len(sub) >= 2 and sub[0] == "runs":
+        rid = int(sub[1])
+        run = next((r for r in runs if r["id"] == rid), None)
+        if len(sub) == 2 and run:
+            return 200, run
+        if sub[2:] == ["jobs"]:
+            return 200, {"jobs": GH.setdefault("jobs", {}).get(rid, [])}
+        if len(sub) == 3 and method == "POST":
+            GH.setdefault("reruns", []).append((rid, sub[2]))
+            return 201, {}
+    if len(sub) == 3 and sub[0] == "jobs" and sub[2] == "logs":
+        return 200, GH.setdefault("logs", {}).get(int(sub[1]), "")  # نص خام (السجل)
     return 404, {"message": "Not Found"}
 
 
@@ -173,6 +198,14 @@ class H(BaseHTTPRequestHandler):
         body = self._body() if http_method in ("PUT", "POST", "DELETE") else {}
         with S["lock"]:
             code, obj = gh_api(http_method, path, self._q(), body)
+        if isinstance(obj, str):  # سجلات Actions نص مو JSON
+            raw = obj.encode()
+            self.send_response(code)
+            self.send_header("Content-Type", "text/plain")
+            self.send_header("Content-Length", str(len(raw)))
+            self.end_headers()
+            self.wfile.write(raw)
+            return
         self._reply(obj, code)
 
     def do_GET(self):
@@ -211,7 +244,8 @@ class H(BaseHTTPRequestHandler):
         ctype = self.headers.get("Content-Type", "")
         p = {}
         if "multipart" in ctype:
-            for part in raw.split(b"--"):
+            boundary = ctype.split("boundary=", 1)[1].strip('"').encode() if "boundary=" in ctype else b""
+            for part in raw.split(b"--" + boundary):
                 m = re.search(rb'name="([^"]+)"(?:; filename="([^"]+)")?\r\n(?:.*\r\n)*?\r\n(.*)\r\n$', part, re.S)
                 if m:
                     p[m.group(1).decode()] = (m.group(3) if m.group(2) else m.group(3).decode(errors="replace"))
@@ -379,10 +413,22 @@ class FakeStream:
 SCRIPT = {"rounds": [], "delay": 0.01, "error": None, "no_tools": False}
 
 
+WORKERS = {}  # معرّف المهمة → جولات الوكيل
+
+
 async def fake_create(**kw):
     MODEL_CALLS.append(kw)
     if SCRIPT["error"]:
         raise RuntimeError(SCRIPT["error"])
+    if kw.get("model") == bot.cfg("worker_model", "agent"):
+        first = next((m["content"] for m in kw["messages"] if m["role"] == "user"), "")
+        m = re.search(r"معرّف المهمة: (\S+)", first if isinstance(first, str) else "")
+        if not m:  # تلخيص (/compact) بموديل الوكلاء الأرخص
+            return FakeStream([{"content": "ملخص مضغوط للمحادثة"}], SCRIPT["delay"])
+        rnd = sum(1 for x in kw["messages"] if x["role"] == "assistant")
+        rounds = WORKERS.get(m.group(1), [])
+        deltas = rounds[rnd] if rnd < len(rounds) else [{"content": f"✅ تم — تقرير {m.group(1)}"}]
+        return FakeStream(deltas, SCRIPT["delay"])
     if SCRIPT["no_tools"] and kw.get("tools"):
         import httpx, openai
         raise openai.APIError("No endpoints found that support tool use.", httpx.Request("POST", "https://x"), body=None)
@@ -906,6 +952,392 @@ async def scenario():
     check("no invalid/raw html sent", not PROBLEMS, PROBLEMS[:5])
 
 
+# ================= 💻 نسخة البرمجة (الوكلاء) =================
+
+def tc(*calls):
+    """جولة فيها طلبات أدوات: tc(("write_file", {...}), ...)."""
+    return [{"tool_calls": [{"index": i, "id": f"call{random.randint(1, 10**9)}", "type": "function",
+                             "function": {"name": n, "arguments": json.dumps(a, ensure_ascii=False)}}]}
+            for i, (n, a) in enumerate(calls)]
+
+
+def callbacks(msg):
+    return [b.get("callback_data", "") for row in (msg.get("reply_markup") or {}).get("inline_keyboard", []) for b in row]
+
+
+def cb_of(msg, prefix):
+    return next((c for c in callbacks(msg) if c.startswith(prefix)), None)
+
+
+def tool_results(call):
+    return [m["content"] for m in call["messages"] if m.get("role") == "tool"]
+
+
+def docs_sent():
+    return [c[1] for c in S["calls"] if c[0] == "sendDocument"]
+
+
+async def agent_scenario(app):
+    import subprocess, zipfile, io
+    import workspace as W
+    import github_tools
+    print("\n— 💻 نسخة البرمجة —")
+    SCRIPT.update(error=None, no_tools=False, rounds=[])
+    LEAD = bot.cfg("model", "agent")
+    WORKER = bot.cfg("worker_model", "agent")
+
+    def tool_names(call):
+        return {t["function"]["name"] for t in call.get("tools", [])}
+
+    def lead_calls():
+        return [c for c in MODEL_CALLS if c.get("model") == LEAD]
+
+    def worker_calls(tid):
+        return [c for c in MODEL_CALLS if c.get("model") == WORKER
+                and re.search(rf"معرّف المهمة: {tid}\n", str(c["messages"][1]["content"]))]
+
+    def ws(name="main"):
+        return bot.Workspace(bot.ws_base(), name)
+
+    # A) التحويل لنسخة البرمجة: كيبورد وقائمة وإعدادات مختلفة
+    chat_effort = bot.cfg("effort")
+    user_msg("/code")
+    await wait_idle()
+    m = last_bot()
+    kb = json.dumps(S.get("reply_kb", {}).get(m["message_id"]), ensure_ascii=False)
+    check("code: mode on", bot.cfg("agent_mode") is True)
+    check("code: welcome", "وضع البرمجة" in strip(m["text"]) and "z-ai/glm-5.3" in m["text"], m["text"][:200])
+    check("code: own keyboard", bot.CODE_NEW_BTN in kb and bot.CHAT_BTN in kb and bot.AGENT_BTN not in kb, kb)
+    menus = [c[1] for c in S["calls"] if c[0] == "setMyCommands"]
+    names = {c["command"] for c in json.loads(menus[-1]["commands"]) if isinstance(menus[-1]["commands"], str)} \
+        if menus and isinstance(menus[-1].get("commands"), str) else {c["command"] for c in (menus[-1].get("commands") or [])}
+    check("code: own / menu", "chat" in names and "project" in names and "setpersona" not in names, names)
+    check("code: independent settings", bot.cfg("effort", "agent") == "high" and bot.cfg("effort") == chat_effort,
+          (bot.cfg("effort", "agent"), chat_effort))
+    user_msg("/set max_agents 3")
+    await wait_idle()
+    check("code: /set writes code settings only", bot.cfg("max_agents", "agent") == 3
+          and "max_agents" not in json.loads(bot.SETTINGS_FILE.read_text()) and "إعدادات وضع البرمجة" in last_bot()["text"])
+    user_msg("/set max_agents 4")
+    await wait_idle()
+
+    # B) فريق كامل: القائد يخطط ويكتب العقد ← 3 وكلاء (اثنين بالتوازي + واحد يعتمد عليهم) ← يتحقق
+    hist_before = [dict(x) for x in bot.histories.get(OWNER, [])]
+    WORKERS.clear()
+    WORKERS["api"] = [tc(("write_file", {"path": "api.py", "content": "def api():\n    return 'ok'\n"}),
+                         ("write_file", {"path": "db.py", "content": "hijack = 1\n"})),
+                      text_deltas("✅ تم: api.py فيه api()")]
+    WORKERS["db"] = [tc(("write_file", {"path": "db.py", "content": "def db():\n    return 1\n"})),
+                     text_deltas("✅ تم: db.py فيه db() — تقرير مفصّل عن الشغل اللي انعمل", 3)]
+    WORKERS["tests"] = [tc(("read_file", {"path": "api.py"})),
+                        tc(("write_file", {"path": "test_all.py",
+                                           "content": "import api, db\nassert api.api() == 'ok' and db.db() == 1\nprint('PASS')\n"})),
+                        tc(("run", {"command": "python3 test_all.py"})),
+                        text_deltas("✅ الاختبار نجح: PASS")]
+    SCRIPT["rounds"] = [
+        [{"reasoning": "أخطط للمشروع"}, *text_deltas("خلني أخطط وأجهز العقد."),
+         *tc(("todo_write", {"todos": [{"content": "العقد", "status": "completed"},
+                                       {"content": "التوزيع", "status": "in_progress"},
+                                       {"content": "التحقق", "status": "pending"}]}),
+             ("write_file", {"path": "contract.md", "content": "api() -> 'ok'\ndb() -> 1\n"}))],
+        tc(("dispatch_agents", {"tasks": [
+            {"id": "api", "title": "الواجهة", "instructions": "اكتب api.py فيه api() ترجع ok", "files": ["api.py"]},
+            {"id": "db", "title": "البيانات", "instructions": "اكتب db.py فيه db() ترجع 1", "files": ["db.py"]},
+            {"id": "tests", "title": "الاختبارات", "instructions": "اختبر api و db", "files": ["test_all.py"],
+             "depends_on": ["api", "db"]}]})),
+        tc(("run", {"command": "python3 test_all.py"})),
+        text_deltas("## تم\nبنيت المشروع ونجح الاختبار."),
+    ]
+    user_msg("ابني لي مشروع api و db مع اختبار")
+    await wait_idle(timeout=40)
+    W0 = ws()
+    check("team: lead wrote contract", (W0.root / "contract.md").read_text() == "api() -> 'ok'\ndb() -> 1\n")
+    check("team: workers wrote their files", (W0.root / "api.py").read_text().startswith("def api")
+          and (W0.root / "db.py").read_text().startswith("def db"), (W0.root / "db.py").read_text())
+    api_res = [r for c in worker_calls("api") for r in tool_results(c)]
+    check("team: scope blocks writing another agent's file", any("⛔" in r and "db.py" in r for r in api_res), api_res)
+    idx = {t: [i for i, c in enumerate(MODEL_CALLS) if c in worker_calls(t)] for t in ("api", "db", "tests")}
+    check("team: api+db ran in parallel", idx["api"] and idx["db"] and min(idx["db"]) < max(idx["api"])
+          and min(idx["api"]) < max(idx["db"]), idx)
+    check("team: depends_on waits", min(idx["tests"]) > max(idx["api"]) and min(idx["tests"]) > max(idx["db"]), idx)
+    brief = worker_calls("tests")[0]["messages"][1]["content"]
+    check("team: dependency reports passed", "نتيجة المهمة اللي تعتمد عليها: api" in brief and "api.py فيه api()" in brief)
+    check("team: worker ran real tests", any("PASS" in r and "exit 0" in r for c in worker_calls("tests") for r in tool_results(c)))
+    lc = lead_calls()[-1]
+    disp = next(json.loads(r) for r in tool_results(lc) if r.startswith('{"results"'))
+    check("team: dispatch results", [r["status"] for r in disp["results"]] == ["done"] * 3, disp)
+    check("team: lead verified", any("PASS" in r and "exit 0" in r for r in tool_results(lc)))
+    check("team: lead request (kimi, high effort, usage)", lc["extra_body"]["reasoning"] == {"effort": "high"}
+          and lc["extra_body"]["usage"] == {"include": True} and "dispatch_agents" in tool_names(lc), lc["extra_body"])
+    wc = worker_calls("api")[0]
+    check("team: worker = GLM via baidu", wc["model"] == "z-ai/glm-5.3"
+          and wc["extra_body"]["provider"] == {"only": ["baidu/fp8"], "allow_fallbacks": False}, wc["extra_body"])
+    check("team: worker can't dispatch", "dispatch_agents" not in tool_names(wc) and "write_file" in tool_names(wc))
+    msgs = bot_msgs()
+    reply = last_bot()
+    check("team: final reply = last round only", "بنيت المشروع" in strip(reply["text"])
+          and "خلني أخطط" not in strip(reply["text"]), reply["text"][:200])
+    work = next((x for x in reversed(msgs) if "خلص الشغل" in (x.get("text") or "")), None)
+    check("team: work panel summary", work and "الوكلاء" in work["text"] and "api.py" in work["text"]
+          and "📋" in work["text"], (work or {}).get("text", "")[:300])
+    think = next((x for x in reversed(msgs) if "فكّر لمدة" in (x.get("text") or "")), {})
+    check("team: narration moved to thinking", "💬" in think.get("text", "") and "خلني أخطط" in think.get("text", ""))
+    cbs = callbacks(reply)
+    check("team: buttons (undo/diff/zip/reports/regen)", {"zip", "regen"} <= set(cbs)
+          and all(cb_of(reply, p) for p in ("undo:", "diff:", "rep:")), cbs)
+    ah = bot.agent_histories[f"{OWNER}:main"]
+    check("team: code memory has work log", ah and ah[-1]["role"] == "assistant" and "<work_log>" in ah[-1]["content"])
+    check("team: chat memory untouched", [dict(x) for x in bot.histories.get(OWNER, [])] == hist_before)
+    check("team: journal entry", "ابني لي مشروع" in bot.journal_text("main"))
+    check("team: checkpoint saved", bot.checkpoints().count("main") == 1)
+
+    # C) أزرار الرد: الفرق، التقارير، المشروع zip
+    n = len(docs_sent())
+    press(cb_of(reply, "diff:"), reply["message_id"])
+    await wait_idle()
+    press(cb_of(reply, "rep:"), reply["message_id"])
+    await wait_idle()
+    press("zip", reply["message_id"])
+    await wait_idle()
+    d = docs_sent()[n:]
+    check("buttons: diff file", d and b"+def api():" in d[0].get("document", b""), d[:1])
+    check("buttons: agents reports", len(d) > 1 and "api.py فيه api()".encode() in d[1].get("document", b""))
+    check("buttons: project zip sent", len(d) > 2 and "main" in str(d[2].get("caption", "")))
+    zf = zipfile.ZipFile(io.BytesIO(W0.zip_bytes()))
+    check("zip: has project files", "main/api.py" in zf.namelist() and "main/test_all.py" in zf.namelist(), zf.namelist())
+
+    # D) تراجع: الملفات ترجع والذاكرة تنسى الطلب
+    press(cb_of(reply, "undo:"), reply["message_id"])
+    await wait_idle()
+    check("undo: files reverted", not any((W0.root / f).exists() for f in ("api.py", "db.py", "test_all.py", "contract.md")),
+          [p.name for p in W0.root.iterdir()])
+    check("undo: checkpoint popped", bot.checkpoints().count("main") == 0)
+    check("undo: memory forgot request", not any("ابني لي مشروع" in str(x.get("content")) for x in bot.agent_histories[f"{OWNER}:main"]))
+
+    # E) 🔄 في البرمجة يرجّع الملفات قبل ما يعيد
+    SCRIPT["rounds"] = [tc(("write_file", {"path": "x.txt", "content": "v1"})), text_deltas("كتبت v1")]
+    user_msg("اكتب x")
+    await wait_idle()
+    SCRIPT["rounds"] = [tc(("write_file", {"path": "x.txt", "content": "v2"})), text_deltas("كتبت v2")]
+    press("regen", last_bot()["message_id"])
+    await wait_idle()
+    check("regen: restored then redone", (W0.root / "x.txt").read_text() == "v2" and bot.checkpoints().count("main") == 1,
+          (W0.root / "x.txt").read_text())
+
+    # F) توجيه أثناء التنفيذ يوصل للقائد بدون ما يوقف
+    SCRIPT["rounds"] = [tc(("run", {"command": "sleep 1.5"})), text_deltas("تمام سويته أحمر")]
+    user_msg("سو صفحة")
+    await asyncio.sleep(0.8)
+    user_msg("خلها بالأحمر")
+    await wait_idle()
+    check("steer: ack", any("وصلت" in (x.get("text") or "") for x in bot_msgs()))
+    lc = lead_calls()[-1]
+    check("steer: injected mid-run", any("[رسالة من المالك أثناء التنفيذ]\nخلها بالأحمر" in str(x.get("content"))
+                                         for x in lc["messages"]))
+
+    # G) سؤال بأزرار
+    SCRIPT["rounds"] = [tc(("ask_user", {"question": "أي لغة تفضّل؟", "options": ["Python", "Go"]}))]
+    user_msg("سو أداة")
+    await wait_idle()
+    reply = last_bot()
+    check("ask: question + option buttons", "أي لغة" in strip(reply["text"]) and cb_of(reply, "ask:"), callbacks(reply))
+    SCRIPT["rounds"] = [text_deltas("تمام بايثون")]
+    press(cb_of(reply, "ask:"), reply["message_id"])
+    await wait_idle()
+    check("ask: answer becomes next turn", lead_calls()[-1]["messages"][-1]["content"] == "Python")
+
+    # H) وضع التخطيط: قراءة فقط ← خطة ← موافقة ← تنفيذ
+    user_msg("/plan")
+    await wait_idle()
+    check("plan: on (code settings)", bot.cfg("plan_mode", "agent") is True)
+    SCRIPT["rounds"] = [tc(("present_plan", {"plan": "## الخطة\n1. أكتب main.py"}))]
+    user_msg("سو برنامج")
+    await wait_idle()
+    lc = lead_calls()[-1]
+    check("plan: read-only tools", "write_file" not in tool_names(lc) and "dispatch_agents" not in tool_names(lc)
+          and "present_plan" in tool_names(lc) and "وضع التخطيط مفعّل" in lc["messages"][0]["content"])
+    reply = last_bot()
+    check("plan: shown with approve button", "الخطة" in strip(reply["text"]) and cb_of(reply, "plan:go"))
+    SCRIPT["rounds"] = [tc(("write_file", {"path": "main.py", "content": "print(1)\n"})), text_deltas("نفذت الخطة")]
+    press(cb_of(reply, "plan:go"), reply["message_id"])
+    await wait_idle()
+    lc = lead_calls()[-1]
+    check("plan: approval runs with full tools", "write_file" in tool_names(lc)
+          and "وضع التخطيط مفعّل" not in lc["messages"][0]["content"] and (W0.root / "main.py").exists())
+    user_msg("/plan")
+    await wait_idle()
+
+    # I) الأمان: ما يطلع برا المشروع، الأسرار مخفية عن الأوامر، أوامر التخريب مرفوضة، git ما يلمس مستودع البوت
+    os.environ["SUPER_SECRET_TOKEN"] = "zz-secret-zz"
+    SCRIPT["rounds"] = [tc(("read_file", {"path": "../../../etc/passwd"}), ("run", {"command": "env; echo done"}),
+                           ("run", {"command": "rm -rf / --no-preserve-root"})), text_deltas("خلص")]
+    user_msg("افحص البيئة")
+    await wait_idle()
+    res = tool_results(lead_calls()[-1])
+    check("security: path escape blocked", "برا مجلد المشروع" in res[0], res[0][:100])
+    check("security: secrets hidden from commands", "zz-secret-zz" not in res[1] and "ghp_test" not in res[1]
+          and "done" in res[1])
+    check("security: destructive command refused", "خطير" in res[2], res[2][:100])
+    subprocess.run(["git", "init", "-q", str(DATA)], check=True)
+    user_msg("/sh git rev-parse --show-toplevel")
+    await wait_idle()
+    check("security: git can't see bot repo", "not a git repository" in last_bot()["text"], last_bot()["text"][-200:])
+
+    # J) رفع على GitHub (مستودع محلي يمثّل GitHub) واستنساخ كمشروع جديد
+    remotes = pathlib.Path(tempfile.mkdtemp())
+    subprocess.run(["git", "init", "--bare", "-q", "-b", "main", str(remotes / "owner" / "site.git")], check=True)
+    W.GIT_BASE = f"file://{remotes}"
+    SCRIPT["rounds"] = [tc(("git_push", {"repo": "owner/site", "branch": "main", "message": "first push"})),
+                        text_deltas("رفعته")]
+    user_msg("ارفعه على owner/site")
+    await wait_idle()
+    res = tool_results(lead_calls()[-1])[0]
+    log = subprocess.run(["git", "--git-dir", str(remotes / "owner" / "site.git"), "log", "--oneline", "main"],
+                         capture_output=True, text=True).stdout
+    check("git: push ok", '"ok": true' in res and "first push" in log, (res[:200], log))
+    user_msg("/clone owner/site")
+    await wait_idle()
+    check("git: clone → new project", bot.current_project() == "site" and (ws("site").root / "main.py").exists(),
+          (bot.current_project(), last_bot()["text"][:200]))
+
+    # K) أوامر المشروع
+    user_msg("/project main")
+    await wait_idle()
+    check("project: switched", bot.current_project() == "main")
+    user_msg("/project")
+    await wait_idle()
+    check("project: list with buttons", "site" in last_bot()["text"] and cb_of(last_bot(), "proj:"))
+    user_msg("/files")
+    await wait_idle()
+    check("files: tree", "main.py" in last_bot()["text"])
+    n = len(docs_sent())
+    user_msg("/get main.py")
+    await wait_idle()
+    check("get: file sent", len(docs_sent()) > n and docs_sent()[-1].get("document") == b"print(1)\n")
+    user_msg("/sh echo hi-from-shell")
+    await wait_idle()
+    check("sh: runs in project", "hi-from-shell" in last_bot()["text"] and "✅" in last_bot()["text"])
+    user_msg("/memory استخدم pytest للاختبارات")
+    await wait_idle()
+    check("memory: AGENTS.md", "استخدم pytest" in (W0.root / "AGENTS.md").read_text())
+    SCRIPT["rounds"] = [text_deltas("تمام")]
+    user_msg("وش أعراف المشروع؟")
+    await wait_idle()
+    sysmsg = lead_calls()[-1]["messages"][0]["content"]
+    check("memory+journal in lead prompt", "<project_memory" in sysmsg and "استخدم pytest" in sysmsg
+          and "<project_journal>" in sysmsg and "اكتب x" in sysmsg)
+    user_msg("/cost")
+    await wait_idle()
+    check("cost: per model", "z-ai/glm-5.3" in last_bot()["text"] and LEAD in last_bot()["text"])
+    user_msg("/compact")
+    await wait_idle()
+    h = bot.agent_histories[f"{OWNER}:main"]
+    check("compact: history → summary", len(h) == 2 and h[1]["content"] == "ملخص مضغوط للمحادثة", list(h)[:2])
+
+    # L) رفع zip للمشروع + @ملف + ultrathink
+    user_msg("/project uptest")
+    await wait_idle()
+    zb = io.BytesIO()
+    with zipfile.ZipFile(zb, "w") as z:
+        z.writestr("proj/app.py", "def hello():\n    return 'hi'\n")
+        z.writestr("proj/README.md", "# up")
+    FILES["zip1"] = zb.getvalue()
+    SCRIPT["rounds"] = [text_deltas("شفت المشروع")]
+    user_msg(None, document={"file_id": "zip1", "file_unique_id": "zip1", "file_name": "proj.zip",
+                             "mime_type": "application/zip", "file_size": len(FILES["zip1"])}, caption="شوف المشروع")
+    await wait_idle()
+    check("upload: zip extracted to project root", (ws("uptest").root / "app.py").exists())
+    check("upload: lead told", "رفع للمشروع" in str(lead_calls()[-1]["messages"][-1]["content"]))
+    SCRIPT["rounds"] = [text_deltas("شرحته")]
+    user_msg("ultrathink اشرح @app.py")
+    await wait_idle()
+    lc = lead_calls()[-1]
+    check("mention: file attached", "[محتوى @app.py]" in lc["messages"][-1]["content"] and "def hello" in lc["messages"][-1]["content"])
+    check("ultrathink: max effort", lc["extra_body"]["reasoning"] == {"effort": "xhigh"}, lc["extra_body"])
+    check("mention: not stored in memory", "def hello" not in str(bot.agent_histories[f"{OWNER}:uptest"][-2]["content"]))
+
+    # M) متابعة CI: تنبيه فشل بسجل الخطأ ← إعادة تشغيل ← رجع أخضر ← القائد يتابع ← إصلاح
+    github_tools.WATCH_POLL = 0.05
+
+    def run_(rid, concl, sha):
+        return {"id": rid, "name": "CI", "head_branch": "main", "head_sha": sha, "event": "push", "status": "completed",
+                "conclusion": concl, "created_at": "2026-11-06T00:00:00Z",
+                "html_url": f"https://github.com/owner/site/actions/runs/{rid}"}
+    GH.setdefault("runs", {})["owner/site"] = [run_(1, "success", "a" * 40)]
+    user_msg("/watch owner/site")
+    await wait_idle()
+    check("watch: added", "أتابع CI" in last_bot()["text"] and "owner/site" in json.loads(bot.dpath("watches.json").read_text()))
+    GH["runs"]["owner/site"].append(run_(2, "failure", "b" * 40))
+    GH.setdefault("jobs", {})[2] = [{"id": 20, "name": "test", "status": "completed", "conclusion": "failure",
+                                     "steps": [{"name": "Run pytest", "conclusion": "failure"}]}]
+    GH.setdefault("logs", {})[20] = ("2026-11-06T00:00:01.0000000Z collecting tests\n"
+                                     "2026-11-06T00:00:02.0000000Z ##[error]AssertionError: expected 2 got 3\n"
+                                     "2026-11-06T00:00:02.1000000Z Process completed with exit code 1.\n")
+    await bot.watch_tick(app.bot)
+    await wait_idle()
+    alert = last_bot()
+    check("watch: failure alert with log", "فشل CI" in strip(alert["text"]) and "AssertionError" in alert["text"]
+          and cb_of(alert, "wfix:"), alert["text"][:300])
+    press(cb_of(alert, "wre:"), alert["message_id"])
+    await wait_idle()
+    check("watch: rerun failed jobs", (2, "rerun-failed-jobs") in GH.get("reruns", []), GH.get("reruns"))
+    GH["runs"]["owner/site"].append(run_(3, "success", "c" * 40))
+    await bot.watch_tick(app.bot)
+    await wait_idle()
+    check("watch: recovered notice", "رجع CI أخضر" in last_bot()["text"])
+    GH["runs"]["owner/site"].append(run_(4, "failure", "d" * 40))
+    GH["jobs"][4] = GH["jobs"][2]
+    GH.setdefault("head_sha", {})["owner/site"] = "d" * 40
+    SCRIPT["rounds"] = [tc(("gh_actions", {"action": "watch", "repo": "owner/site", "branch": "main"})),
+                        text_deltas("شفت سبب الفشل")]
+    user_msg("تابع CI حق owner/site")
+    await wait_idle()
+    res = tool_results(lead_calls()[-1])[0]
+    check("watch tool: live CI result with log", '"all_green": false' in res and "AssertionError" in res, res[:300])
+    SCRIPT["rounds"] = [text_deltas("صلّحته ورفعته")]
+    press(cb_of(alert, "wfix:"), alert["message_id"])
+    await wait_idle()
+    lc = lead_calls()[-1]
+    check("watch: fix button starts agent fix", "فشل CI في المستودع owner/site" in str(lc["messages"][-1]["content"])
+          and bot.current_project() == "site")
+    user_msg("/watch off owner/site")
+    await wait_idle()
+
+    # N) إيقاف أمر طويل
+    SCRIPT["rounds"] = [tc(("run", {"command": "sleep 30"})), text_deltas("ما المفروض يوصل")]
+    t0 = time.time()
+    user_msg("شغّل شي طويل")
+    await asyncio.sleep(1.2)
+    stop_msg = next((x for x in reversed(bot_msgs()) if "stop" in callbacks(x)), None)
+    if stop_msg:
+        press("stop", stop_msg["message_id"])
+    await wait_idle()
+    SCRIPT["rounds"].clear()
+    check("stop: agent stops fast", stop_msg and time.time() - t0 < 10, time.time() - t0)
+    check("stop: notice", "تم إيقاف" in strip(last_bot()["text"]))
+
+    # O) غير المالك وقت البرمجة: محادثة عادية بدون أدوات المشروع
+    SCRIPT["rounds"] = [text_deltas("هلا")]
+    user_msg("هلا", user=OTHER, chat={"id": 222, "type": "private"})
+    await wait_idle()
+    c = MODEL_CALLS[-1]
+    check("code: non-owner stays in chat", "القائد التقني" not in c["messages"][0]["content"]
+          and "write_file" not in tool_names(c) and "سري" in c["messages"][0]["content"])
+
+    # P) الرجوع لنسخة المحادثة
+    user_msg("/chat")
+    await wait_idle()
+    kb = json.dumps(S.get("reply_kb", {}).get(last_bot()["message_id"]), ensure_ascii=False)
+    check("chat: back", bot.cfg("agent_mode") is False and bot.AGENT_BTN in kb)
+    SCRIPT["rounds"] = [text_deltas("رجعت عادي")]
+    user_msg("كيفك")
+    await wait_idle()
+    c = MODEL_CALLS[-1]
+    check("chat: normal again", "<identity>" in c["messages"][0]["content"] and "القائد التقني" not in c["messages"][0]["content"]
+          and "write_file" not in tool_names(c))
+    check("no invalid/raw html (code)", not PROBLEMS, PROBLEMS[:5])
+
+
 async def main():
     srv = ThreadingHTTPServer(("127.0.0.1", PORT), H)
     threading.Thread(target=srv.serve_forever, daemon=True).start()
@@ -917,6 +1349,7 @@ async def main():
         await app.updater.start_polling(poll_interval=0.02, timeout=1)
         try:
             await asyncio.wait_for(scenario(), 240)
+            await asyncio.wait_for(agent_scenario(app), 300)
         finally:
             await app.updater.stop()
             await app.stop()
