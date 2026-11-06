@@ -1,166 +1,221 @@
-# بوت تليجرام بهوية ثابتة (Kimi K3.1 Pro عبر OpenRouter)
+# Persona Telegram bot — Chat + Coding (Kimi K3.1 Pro via OpenRouter)
 
-بوت ذكاء اصطناعي تحدد له هويته (اسم، شخصية، أسلوب، آراء، أوامر...) ويلتزم فيها حرفياً.
-ولا أحد يقدر يغيّر هويته من المحادثة غيرك أنت (المالك).
+One bot, **two versions**:
 
-## يتصرف مثل تطبيقات الذكاء الاصطناعي
+- **💬 Chat** — an AI assistant with an owner-defined persona that it follows exactly.
+- **💻 Coding** — a Claude Code–style coding agent: **Kimi K3.1 Pro** leads, plans and reviews, while
+  **GLM-5.3 agents** write and test code **in parallel** inside a real project folder, with full GitHub
+  control and live CI monitoring.
 
-- 💭 **التفكير مباشر**: أول رسالة تتحدث وهو يفكر (وتبين خطوات البحث)، وبعدها تنطوي: «فكّر لمدة 12 ثانية».
-- ✍️ **الرد ينكتب قدامك** أول بأول، والكلام اللي انكتب ما ينحذف أبداً (حتى لو وقف يبحث وكمّل).
-- 📄 **الردود الطويلة ما تتقسّم**: البوت يكتب باللي طوله يبيه بلا أي حد، والرد القصير يجي رسالة وحدة مرتبة، والرد الطويل ينفتح كصفحة Telegra.ph داخل تليجرام (Instant View) كاملاً بلا نقص.
-- 🎨 **تنسيق مرتب**: خط عريض وعناوين وقوائم حقيقية، أكواد بزر نسخ، واتجاه النص العربي من اليمين دائماً.
-- ⏹ **إيقاف** الرد في أي لحظة، و🔄 **إعادة التوليد** لآخر رد.
-- ✏️ **عدّل رسالتك** الأخيرة والبوت يرد عليها من جديد.
-- 🔎 **بحث قوي في الإنترنت**: ما يكتفي بالعناوين — يفتح أفضل النتائج ويستخرج نصها الحقيقي ويعطيه للموديل، مع فلترة بالحداثة (آخر يوم/أسبوع/شهر/سنة) وقراءة أي رابط بعمق، و🔗 **المصادر** تحت الرد.
-- 🖼 **صور** (ولو ألبوم) و📎 **ملفات** PDF ونصوص وأكواد.
-- ↩️ **رد على أي رسالة** عشان تسأله عنها بالتحديد.
-- 🆕 **محادثة جديدة** بزر تحت: ينسى كل شي صار قبل، والرسائل القديمة تبقى في الشات.
+Everything is shared between the two versions (persona, snippets, GitHub, keys, usage), but each has its
+own **settings**, **keyboard**, **"/" command menu**, **settings panel** and **welcome screen**.
+Switch with **💻 Coding mode** / **💬 Chat mode** on the keyboard, or `/code` and `/chat`.
 
-## الهوية وقواعد القفل (حرف بحرف، من تليجرام)
+All model-facing text (instructions, tool descriptions, tool results, logs) is English, to keep tokens light.
 
-الهوية **وقواعد القفل** (LOCK RULES) تتعدّل بنفس الطريقة من تليجرام — رسالة، عدة رسائل، أو ملف `.txt`.
+## 💬 Chat version
 
-| الطريقة | |
+- 💭 **Live thinking** that collapses when done: "Thought for 12 seconds".
+- ✍️ **The reply is written live**; text written before a web search is never lost.
+- 📄 **Long replies are never split**: short replies come as one tidy message, long ones open as a Telegra.ph
+  page inside Telegram (Instant View), complete.
+- 🎨 **Clean formatting**: real bold, headings and lists, code blocks with a copy button. Right-to-left text
+  (e.g. Arabic) still lays out correctly — this is display only and never reaches the model.
+- ⏹ **Stop** a reply any time, 🔄 **regenerate** the latest one, ✏️ **edit** your message to get a new answer.
+- 🔎 **Strong web search**: opens the best results and extracts their real text, filters by recency, reads any
+  link in depth, and lists 🔗 **sources** under the reply.
+- 🖼 **Images** (even albums) and 📎 **files** (PDF, text, code). ↩️ Reply to any message to ask about it.
+- 🆕 **New chat**: forgets the conversation; the old messages stay in the chat.
+
+## 💻 Coding version (like Claude Code)
+
+### How it works
+
+1. **The lead (Kimi K3.1 Pro)** understands the request, explores the project, writes a live plan
+   (📋 todo list), and decides what to do itself and what to delegate.
+2. It locks the shared **contracts** (structure, interfaces, signatures) first, then **delegates** with
+   `dispatch_agents`: independent tasks run **in parallel**, dependent ones wait (`depends_on`) and receive the
+   reports of what they depend on.
+3. **The agents (GLM-5.3)** each get a precise brief, read before writing, implement fully, **run the tests
+   themselves**, and report back.
+4. The lead **reviews, integrates and verifies** (runs the build/tests), fixes what's broken, and replies with a
+   short summary.
+
+### Smart and safe parallel work
+
+- Each agent owns a **file scope**; the system blocks writing into another running agent's scope.
+- An agent can't overwrite a file it hasn't read, or one that changed since it read it.
+- **Agent types**: `coder` (default), `explorer` (read-only research), `reviewer` (read-only bug hunt),
+  `tester` — plus **custom agents** from `.agents/NAME.md` or `.claude/agents/NAME.md` (optional front matter:
+  `description`, `readonly: true`, `model: …`). `/agents` lists them.
+
+### The live screen
+
+- 💭 the lead's thinking and every step (reads, edits, commands, delegation),
+- 🛠 a **work panel**: the plan with live status, and every agent with what it's doing right now
+  ("✍️ writing api/routes.py (~3k chars)"), collapsing at the end into a summary (time, agents, files ±lines,
+  commands, cost),
+- the final reply, with buttons: **↩️ Undo · 📄 Diff · 📦 Project (zip) · 🤖 Agent reports · 🔄 Regenerate**.
+
+### Claude Code features
+
+| Feature | How |
 |---|---|
-| `/setpersona النص` / `/setrules النص` | ينحفظ بالضبط مثل ما كتبته |
-| `/setpersona` أو `/setrules` لحالها | يفتح وضع إدخال: أرسل على رسالة أو عدة رسائل، ثم ✅ حفظ |
-| ملف `.txt` مع كابشن `/setpersona` أو `/setrules` | الأدق للنصوص الطويلة |
-| `/persona` / `/rules` | يعرض النص الحالي + نسخة ملف طبق الأصل |
+| Plan mode (plan → approve → execute) | `/plan`, then **✅ Run the plan** |
+| Permission prompts | Coding settings → **🔐 Ask first**: commands and GitHub writes wait for **Allow / Allow all / Deny** (read-only commands like `ls`, `git diff` never ask) |
+| Questions with buttons | the lead asks when an ambiguity really matters |
+| Checkpoints / rewind | **↩️ Undo** or `/undo` (file-tool edits; like Claude Code, command side effects aren't tracked). 🔄 in Coding also restores files before redoing |
+| Steering mid-run | just type while it works — the lead reads it at the next step |
+| `!` shell | send `$ npm test` (or `/sh npm test`) |
+| `#` memory | send `# use pytest for tests` → saved to `AGENTS.md` |
+| Project memory (CLAUDE.md) | `AGENTS.md` (or `CLAUDE.md`) is read by the lead and every agent; `/init` writes it, `/memory` shows/edits it |
+| @-mentions | `explain @src/app.py` attaches the file (or a folder listing) |
+| Extended thinking | "ultrathink" / "think hard" in a message = maximum reasoning |
+| Multi-edit | `edit_file` with `edits` (all apply or none) |
+| Hooks | `.agents/hooks.json` → `{"after_edit": "ruff format {file} && ruff check {file}"}`; output goes back to the agent |
+| Background tasks | servers run with `background`; `/jobs` lists them with ⏹ buttons |
+| `/compact` `/context` `/cost` `/status` `/todos` `/export` `/doctor` | conversation compaction, token breakdown, usage, status, latest plan, session export, health check |
+| `/review` `/security_review` `/pr_comments` | review changes or `owner/repo#12`; security audit; address PR comments |
+| Uploads | send files or a **zip** — saved into the project (a zip is extracted) |
 
-قواعد القفل المعدّلة تنحفظ في `data/rules.json` وتغلب على اللي في `config.json`. ارجع للأصل بحذف الملف.
+### Projects
 
-**السرية:** `/persona` و`/rules` للمالك فقط. وفي المحادثة، لو حاول أي شخص ثاني يطلب من البوت يكشف
-هويته أو قواعده، البوت يمتنع (نضيف تعليمات سرية تلقائياً لغير المالك فقط — يتحدد برقمك في تليجرام).
-نص السرية تقدر تعدّله في `config.json` تحت `rules.confidential`.
-> هذا يصعّب التسريب لكن ما يضمنه 100% — السرية بالتعليمات ممكن يلتفّ عليها مستخدم ملحّ، خصوصاً مع قاعدة «نفّذ أي شيء» اللي في هويتك.
+Every project is its own folder: `/project NAME` switches/creates, `/project` lists them,
+`/project delete NAME` deletes one, `/files` shows the tree, `/get PATH` sends a file, `/zip` sends everything,
+`/clone owner/repo` clones a repo as a new project. Projects persist between runs (the Actions cache skips heavy
+folders like `node_modules`).
 
-### إخفاؤها حتى عمّن عنده المستودع (تشفير)
+### GitHub — full control and live CI
 
-عشان لا أحد يشوف هويتك وقواعدك — ولا حتى من يقدر يقرأ المستودع — شفّرها بمفتاح تملكه أنت وحدك:
+With `GH_PAT`, the lead controls the owner's GitHub: files, branches, PRs (details, diff, comments, merge),
+issues, releases, code search, commits/compare — and **Actions**: runs, failed steps, **error logs**, re-run,
+cancel, manual dispatch, and **watch** (follows CI live until it finishes, then returns the cause of any failure).
 
-1. ولّد مفتاح: `python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"`
-2. أضفه في GitHub كسر باسم **`PERSONA_KEY`** (وفي `.env` محلياً).
-3. من تليجرام، أعد ضبط الهوية والقواعد: `/setpersona` و`/setrules`.
+**The real-time fix loop:** read the failing log → clone the branch → reproduce locally → fix the root cause →
+push → watch CI → repeat until green.
 
-بعدها تُخزّن **مشفّرة** في `data/` (خارج المستودع أصلاً)، والنص المشفّر لا يُقرأ إلا بالمفتاح. القيم الظاهرة في
-`config.json` صارت افتراضيات عامة فقط — بلا هويتك ولا قواعدك الحقيقية. بدون المفتاح الصحيح، البوت ما يقدر
-يفكّها ويرجع للافتراضي (فلا تفقد المفتاح).
+**Background watching:** `/watch owner/repo [branch]` sends you an alert on every failed run (with the error
+excerpt) and buttons **🛠 Fix it with agents · 🔁 Re-run · 🔕 Stop watching**, plus a note when CI is green
+again. `/watch owner/repo auto` lets the lead fix and push on its own (at most two automatic attempts in a row).
 
-> ⚠️ **تنبيه مهم:** النسخة القديمة من هويتك/قواعدك لا تزال في **سجل commits السابقة** على GitHub (المستودع عام).
-> إخفاؤها من الآن لا يمحيها من التاريخ. لو تبي محوها نهائياً، نحتاج نعيد كتابة تاريخ الـ git (force-push) — قل لي وأساعدك،
-> أو اجعل المستودع خاصاً، أو أنشئ مستودعاً جديداً.
+Token scopes: classic `repo` + `workflow`, or fine-grained Contents / Pull requests / Issues / Actions read & write.
 
-## الاختصارات (جمل/ملفات محفوظة)
+### Token economy (without lowering quality)
 
-تحفظ جملة أو ملف تحت اسم مختصر، وبعدها تكتب `!الاسم` داخل أي رسالة فيفهم البوت إنك تقصده ويوسّعه.
+- Old code versions are never resent: the lead gets the current file tree, `AGENTS.md`, and a short **project
+  journal** (two lines per past request); the conversation memory keeps only the latest exchanges.
+- A file that hasn't changed isn't sent twice in a session.
+- Old tool results are trimmed in large, rare steps (keeps the prompt prefix stable for provider caching).
+- Heavy code volume goes to the cheaper GLM agents; Kimi spends its reasoning on design, contracts and review.
+- `/context` shows where the tokens go; `/compact` shrinks the conversation; **🎭 Persona voice** can be turned
+  off in Coding settings.
 
-| الأمر | الوظيفة |
+### Safety
+
+- Coding mode, shell commands and GitHub tools are **owner-only**; non-owners always get the normal Chat version.
+- File tools can't leave the project folder; commands run with **secrets stripped from the environment**
+  (tokens and keys never reach them); obviously destructive commands are refused; git inside a project can't
+  touch the bot's own repository; the GitHub token is passed per command and never stored in a project.
+- Commands still run on the runner machine — use **🔐 Ask first** if you want to approve each one.
+
+## Persona and lock rules (exact, from Telegram)
+
+| Method | |
 |---|---|
-| `/snip اسم النص` | حفظ جملة. أو رد على رسالة/ملف بـ `/snip اسم`، أو ملف مع كابشن `/snip اسم` |
-| `/snippets` | عرض كل الاختصارات |
-| `/delsnip اسم` | حذف اختصار |
+| `/setpersona TEXT` / `/setrules TEXT` | saved exactly as written |
+| `/setpersona` or `/setrules` alone | input mode: send one or several messages, then ✅ Save |
+| a `.txt` file with the caption `/setpersona` or `/setrules` | best for long texts |
+| `/persona` / `/rules` | shows the current text + an exact file copy |
 
-مثال: `/snip توقيعي مع تحيات أبو فهد` ثم ترسل `اكتب رد وبالآخر !توقيعي`. (للمالك فقط.)
+Edited lock rules are stored in `data/rules.json` and override `config.json`.
 
-## الأوامر
+**Confidentiality:** non-owners get extra instructions not to reveal the persona or rules. This makes leaks
+harder but can't guarantee it against a determined user.
 
-| الأمر | الوظيفة |
+**Encryption:** set the `PERSONA_KEY` secret
+(`python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"`) and re-set the
+persona and rules — they're then stored encrypted. Without the right key the bot falls back to the defaults,
+so don't lose it.
+
+> ⚠️ The previous persona/rules are still in this public repository's **git history**. Hiding them now doesn't
+> erase history: rewrite history, make the repository private, or start a fresh repository.
+
+## Snippets
+
+`/snip NAME TEXT` saves text (or reply to a message/file with `/snip NAME`); write `!NAME` in any message to
+expand it. `/snippets` lists them, `/delsnip NAME` deletes one. Owner only.
+
+## Commands
+
+| Command | |
 |---|---|
-| `/new` أو زر 🆕 | محادثة جديدة |
-| `/setrules` / `/rules` | تعديل/عرض قواعد القفل (للمالك) |
-| `/settitle اسم` / `/title` | اسم X-Title اللي ينرسل لـ OpenRouter — بالإنجليزي، مشفّر (للمالك). `/settitle off` يوقفه |
-| ⚙️ «ملف txt بعد كل رد» | بعد كل رد يرسل لك `رد.txt` فيه: هويته، رسالتك، تفكيره كامل، ورده. مقفل افتراضياً، وللمالك فقط |
-| `/snip` / `/snippets` / `/delsnip` | الاختصارات (للمالك) |
-| `/settings` أو زر ⚙️ | لوحة التحكم (للمالك): مستوى التفكير، المزود، إظهار التفكير، البحث |
-| `/set <إعداد> <قيمة>` | `model` `provider` `effort` `temperature` `top_p` `max_tokens` `show_thinking` `web_search` `long_pages` — و`off` يرجعه للافتراضي |
-| `/resetall` | مسح ذاكرة كل المحادثات (للمالك) |
-| `/help` | المساعدة |
+| `/new` | new chat (Chat) or new session (Coding — the project files and journal stay) |
+| `/code` · `/chat` | switch versions |
+| `/settings` | the current version's settings panel |
+| `/set SETTING VALUE` | e.g. `/set temperature 0.7`, `/set max_agents 6`, `/set permissions ask` (`off` = default) |
+| `/settitle NAME` · `/title` | the X-Title sent to OpenRouter (Latin characters only), stored encrypted |
+| `/effort` `/thinking` `/search` | quick toggles |
+| `/resetall` | wipe every conversation memory |
+| Coding | `/project` `/files` `/get` `/zip` `/sh` `/undo` `/diff` `/plan` `/memory` `/init` `/review` `/security_review` `/pr_comments` `/compact` `/context` `/status` `/jobs` `/todos` `/export` `/agents` `/doctor` `/cost` `/clone` `/push` `/watch` |
 
-إعدادات لرسالة وحدة (للمالك): `effort=max web_search=off سؤالك`
+One-message settings (owner): `effort=max web_search=off your question`.
 
-## الردود الطويلة (بلا حد وبلا تقسيم)
+## Settings
 
-- الموديل يكتب باللي طوله يبيه؛ ما فيه أي تعليمات تجبره يختصر.
-- رد قصير → رسالة تليجرام وحدة مرتبة.
-- رد طويل (أطول من حد الرسالة الوحدة) → صفحة Telegra.ph مرتبة، تنفتح **داخل تليجرام** بـ Instant View، كاملة بلا نقص وبلا تقسيم لأجزاء.
-- لو Telegra.ph وقف لأي سبب، البوت يرجع للتقسيم التلقائي بدل ما يضيع شي.
-- تقفل الميزة من ⚙️ الإعدادات أو `/set long_pages off`.
-- **ملاحظة خصوصية:** صفحة Telegra.ph رابط عام (مو مفهرس لكن أي أحد معه الرابط يفتحه). لو تبي كل شي يبقى داخل الشات، اقفل `long_pages`.
+**Chat:** model, provider, reasoning effort, temperature, top_p, max_tokens, show thinking, web search, long
+replies as a page, txt file after each reply.
 
-## GitHub (للمالك فقط)
-
-البوت يقدر يكتب برامج ويعدّل وينشئ على مستودعاتك مباشرة لما تعطيه أمر، بدون أي موافقة لكل خطوة.
-
-- أضف السر `GH_PAT` (توكن من github.com/settings/tokens بصلاحية `repo`). ملاحظة: الاسم `GH_PAT` وليس `GITHUB_PAT` لأن GitHub يمنع الأسماء اللي تبدأ بـ `GITHUB_`.
-- **للمالك فقط:** أدوات GitHub ما تنعطى للموديل إلا لما يكون الطالب هو `OWNER_ID`، وفيه فحص ثانٍ وقت التنفيذ. أي شخص ثاني يكلم البوت ما يقدر يلمس GitHub أبداً.
-- يقدر: يعرض المستودعات، يقرأ/يكتب/يحذف ملفات، ينشئ مستودعات وفروع، ويفتح Pull Request.
-- **ما يقدر يحذف مستودعات** (إجراء غير قابل للتراجع) — تسويها بنفسك لو احتجت.
+**Coding (independent):** lead model, lead provider, lead reasoning (default **high**), agent model
+(`z-ai/glm-5.3`), agent provider (`baidu/fp8`), max parallel agents (default 4), plan first, permissions
+(auto / ask), persona voice, show thinking, web search, long replies as a page, txt file.
 
 ## OpenRouter
 
-- كل طلب ينرسل بـ `reasoning: {enabled: true}` (أو `effort` لو اخترت مستوى)، و`provider: {only: ["relace/fp4", "inference-net/mxfp4/us"], allow_fallbacks: false}`.
-- `reasoning_details` يرجع للموديل مثل ما هو: بين جولات البحث، وفي آخر 10 ردود من المحادثة، عشان يكمل تفكيره من حيث وقف.
-- مستويات التفكير: افتراضي · low · medium · high · max (`xhigh` في OpenRouter).
-- من ⚙️ الإعدادات تختار: relace بس، inference-net بس، الاثنين، أو «أي مزود» (أو `/set provider any`)، وترجع بـ `/set provider default`.
-- قبل كل تشغيل يتأكد إن OpenRouter يقبل المفتاح، ولو رفضه يطلع السبب في صفحة Actions.
-- لو المزود ما يدعم أدوات البحث، البوت يكمل الرد بدون بحث بدل ما يفشل.
+- Requests send `reasoning: {enabled: true}` (or `effort` when set) and
+  `provider: {only: [...], allow_fallbacks: false}`; Coding also asks for `usage` to track cost.
+- `reasoning_details` is passed back unchanged between tool rounds and across the last 10 chat replies.
+- Effort levels: default · low · medium · high · max (`xhigh` on OpenRouter).
+- If a provider doesn't support tools: Chat continues without search; Coding needs tools — pick
+  **Any provider** in the settings.
 
-## البحث عبر Tor / وكيل (اختياري)
+## Web via Tor / a proxy (optional)
 
-تقدر تخلي كل طلبات الويب (البحث + فتح الصفحات) تمر عبر Tor أو أي وكيل SOCKS — يخفي الـ IP،
-يوصل للمواقع المحجوبة، ويفتح روابط `.onion` (استخدم `socks5h://` عشان الـ DNS يمر عبر Tor).
+All web requests (search + opening pages) can go through Tor or any SOCKS proxy: set the variable
+`USE_TOR=true` on GitHub (installs and starts Tor on the runner), or set `TOR_PROXY`/`WEB_PROXY`
+(e.g. `socks5h://127.0.0.1:9050`) or `web_proxy` in `config.json`.
 
-- **على GitHub:** أضف متغيّر (Variables) اسمه `USE_TOR` بقيمة `true` — يركّب Tor ويشغّله في الرنر تلقائياً.
-- **أو** حدّد الوكيل بنفسك: سر/متغيّر `TOR_PROXY` (أو `WEB_PROXY`)، أو الحقل `web_proxy` في `config.json`.
-  - مع tor daemon: `socks5h://127.0.0.1:9050`
-  - مع Tor Browser وهو مفتوح: `socks5h://127.0.0.1:9150`
-- **على جهازك:** شغّل Tor (أو Tor Browser) وحط `TOR_PROXY=socks5h://127.0.0.1:9050`.
+## Running 24/7 on GitHub Actions
 
-> ملاحظات: Tor أبطأ، وبعض المواقع تحجب مخارجه، وهو يخفي الهوية فقط ولا يبيح أي شيء مخالف — استخدمه ضمن القانون.
-> لو الوكيل غير شغّال، الطلب يفشل بهدوء ويخبرك الموديل، وما يتوقف البوت.
+The bot runs on GitHub Actions; every ~6 hours it restarts itself (about a minute), and its data (persona,
+memory, projects) is kept between runs.
 
-## التشغيل 24 ساعة على GitHub (مجاني)
+1. **Settings → Secrets and variables → Actions → Secrets:** `TELEGRAM_BOT_TOKEN` · `OPENROUTER_API_KEY` ·
+   `OWNER_ID` · optional `GH_PAT` · optional `PERSONA_KEY`.
+2. Optional **Variables:** `OPENROUTER_MODEL`, `OPENROUTER_PROVIDER`, `AGENT_MODEL`, `AGENT_PROVIDER`, `USE_TOR`.
+3. **Actions → Telegram bot 24h → Run workflow.**
 
-البوت يشتغل تلقائياً على GitHub Actions. كل ~6 ساعات يعيد تشغيل نفسه (دقيقة تقريباً)،
-والرسائل اللي توصل خلال هالدقيقة يرد عليها أول ما يرجع. الهوية والذاكرة تنحفظ بين كل تشغيل.
+> ⚠️ Running a permanent service on GitHub Actions goes against GitHub's terms; a real server is recommended.
+> Don't run the bot locally and on GitHub at the same time — Telegram accepts one copy only.
 
-1. **Settings → Secrets and variables → Actions → Secrets** وأضف:
-   `TELEGRAM_BOT_TOKEN` · `OPENROUTER_API_KEY` · `OWNER_ID` · (اختياري) `GH_PAT` · (اختياري) `PERSONA_KEY`
-2. (اختياري) في **Variables**: `OPENROUTER_MODEL` (الافتراضي `moonshotai/kimi-k3.1-pro`)
-   و`OPENROUTER_PROVIDER` (الافتراضي `relace/fp4,inference-net/mxfp4/us` بدون أي مزود ثالث).
-3. **Actions → Telegram bot 24h → Run workflow**.
-
-> لا تشغّل البوت على جهازك وعلى GitHub بنفس الوقت — تليجرام يقبل نسخة وحدة بس.
-
-## بوت ثانٍ مستقل (موديل ثاني)
-
-ملف `.github/workflows/bot2.yml` يشغّل بوتاً ثانياً بنفس الكود لكن **مستقل تماماً**: توكن وموديل ومزود
-وبيانات (هوية/قواعد/ذاكرة) منفصلة في كاش خاص (`bot2-data-`). ما يشترك مع الأول إلا الكود والسيرفر.
-
-يكفي تضيف **توكن البوت الثاني فقط** — المفتاح ورقمك يرجعان لنفس الأول تلقائياً:
-- `TELEGRAM_BOT_TOKEN_2` (مطلوب)
-- (اختياري) `OPENROUTER_API_KEY_2` و`OWNER_ID_2` لو تبيهما مختلفين؛ بدونهما يستخدم `OPENROUTER_API_KEY` و`OWNER_ID` الأصليين
-- (اختياري) `GH_PAT_2` · `PERSONA_KEY_2`
-- الموديل الافتراضي `z-ai/glm-5.3` والمزود `baidu/fp8` — تغيّرهما من **Variables**: `OPENROUTER_MODEL_2` و`OPENROUTER_PROVIDER_2`. و`USE_TOR_2=true` لتور.
-
-ثم **Actions → Telegram bot 2 (GLM) 24h → Run workflow**.
-
-> فصل أكمل (سيرفر منفصل) = مستودع ثانٍ مستقل. قل لي لو تبي أجهّزه.
-
-## التشغيل على جهازك (للتجربة)
+## Running locally
 
 ```bash
 pip install -r requirements.txt
-cp .env.example .env   # وعبّي القيم
+cp .env.example .env   # fill in the values
 python bot.py
 ```
 
-## الملفات
+## Files
 
-- `bot.py` — البوت: الأوامر، الرد المباشر، الأزرار، الهوية.
-- `render.py` — تحويل رد الموديل لرسالة تليجرام مرتبة وصفحة Telegra.ph واتجاه النص.
-- `telegraph.py` — نشر الردود الطويلة كصفحة تنفتح داخل تليجرام.
-- `github_tools.py` — أدوات GitHub (للمالك فقط).
-- `tools.py` — بحث قوي: يبحث، يفتح أفضل النتائج ويستخرج نصها، ويقرأ الروابط بعمق.
-- `config.py` / `config.json` — كل أوامر البوت وأزراره وإعداداته وقواعده (عدّل `config.json` بدون ما تلمس الكود).
-- `tests/test_e2e.py` — اختبار شامل بخوادم تليجرام/OpenRouter/Telegra.ph/GitHub وهمية.
+- `bot.py` — the bot: commands, live replies, buttons, persona, both versions.
+- `agent.py` — Coding mode: tools, the GLM agent loop, parallel scheduling, the work panel.
+- `workspace.py` — project folders: files, commands, background jobs, checkpoints, file claims, git.
+- `llm.py` — streaming from OpenRouter (shared by chat, the lead and the agents).
+- `prompts/orchestrator.md` · `prompts/worker.md` — the lead's and the agents' instructions (editable).
+- `github_tools.py` — GitHub tools (owner only), including Actions and live CI watching.
+- `tools.py` — web search and page reading.
+- `render.py` · `telegraph.py` — Telegram formatting and Telegra.ph pages.
+- `config.py` / `config.json` — commands, buttons, settings and rules (edit `config.json`, no code needed).
+- `vault.py` — encryption of the persona, rules and X-Title.
+- `tests/test_e2e.py` — end-to-end tests with fake Telegram/OpenRouter/Telegra.ph/GitHub servers:
+  `python tests/test_e2e.py`.

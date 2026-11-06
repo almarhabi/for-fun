@@ -1,7 +1,7 @@
-"""البث من OpenRouter — مشترك بين المحادثة العادية، القائد (Kimi)، والوكلاء (GLM).
+"""Streaming from OpenRouter — shared by normal chat, the lead (Kimi) and the agents (GLM).
 
-يجمع من البث: نص الرد، التفكير (reasoning)، تفاصيل التفكير (reasoning_details) عشان ترجع للموديل
-مثل ما هي، طلبات الأدوات، والاستهلاك (usage) لو أرسله OpenRouter.
+From the stream it collects: the reply text, the reasoning, the reasoning_details (so they can be
+sent back to the model unchanged), tool calls, and usage (when OpenRouter sends it).
 """
 
 import contextlib
@@ -11,7 +11,7 @@ from dataclasses import dataclass, field
 
 
 def reasoning_delta(delta) -> tuple[str, list]:
-    """OpenRouter يرسل التفكير كنص (reasoning) وكتفاصيل كاملة (reasoning_details)."""
+    """OpenRouter sends reasoning both as text (reasoning) and as full details (reasoning_details)."""
     extra = getattr(delta, "model_extra", None) or {}
     details = extra.get("reasoning_details")
     details = details if isinstance(details, list) else []
@@ -22,7 +22,7 @@ def reasoning_delta(delta) -> tuple[str, list]:
 
 
 def merge_reasoning_details(acc: list, new: list) -> None:
-    """يجمع أجزاء reasoning_details من البث عشان نرجعها للموديل مثل ما هي."""
+    """Merges streamed reasoning_details chunks so they can be sent back to the model exactly."""
     for d in new:
         if not isinstance(d, dict):
             continue
@@ -40,7 +40,7 @@ def merge_reasoning_details(acc: list, new: list) -> None:
 
 
 def split_think_tags(raw: str) -> tuple[str, str]:
-    """بعض الموديلات تكتب التفكير داخل <think>...</think> في نفس الرد."""
+    """Some models write their reasoning inside <think>...</think> in the reply itself."""
     s = raw.lstrip()
     if not s.startswith("<think>"):
         return "", raw
@@ -51,7 +51,7 @@ def split_think_tags(raw: str) -> tuple[str, str]:
 
 
 def usage_dict(usage) -> dict | None:
-    """يحوّل usage من OpenRouter لقاموس بسيط (التوكنات والتكلفة بالدولار)."""
+    """Turns OpenRouter's usage into a simple dict (tokens and cost in USD)."""
     if usage is None:
         return None
     get = (lambda k: usage.get(k)) if isinstance(usage, dict) else \
@@ -76,7 +76,7 @@ class Completion:
 
 async def stream_chat(client, messages: list, kw: dict, tool_kwargs: dict | None = None,
                       headers: dict | None = None, on_delta=None) -> Completion:
-    """جولة وحدة مع الموديل بالبث. on_delta(raw, reasoning, calls) ينادى مع كل جزء."""
+    """One streamed round with the model. on_delta(raw, reasoning, calls) is called for every chunk."""
     stream = await client.chat.completions.create(messages=messages, stream=True, extra_headers=headers or {},
                                                   **kw, **(tool_kwargs or {}))
     raw, reasoning, details, calls = "", "", [], {}
@@ -107,13 +107,13 @@ async def stream_chat(client, messages: list, kw: dict, tool_kwargs: dict | None
             await stream.close()
     _, answer = split_think_tags(raw)
     out = [calls[i] for i in sorted(calls)]
-    for c in out:  # بعض المزودين ما يرسلون id — نولّد واحد عشان تتطابق نتيجة الأداة
+    for c in out:  # some providers send no id — generate one so the tool result can be matched
         c["id"] = c["id"] or "call_" + uuid.uuid4().hex[:12]
     return Completion(answer, reasoning, details, out, usage_dict(usage), finish)
 
 
 def parse_args(raw: str) -> dict | None:
-    """وسائط الأداة كقاموس، أو None لو JSON مقطوع/غلط."""
+    """Tool arguments as a dict, or None if the JSON is truncated or invalid."""
     try:
         val = json.loads(raw or "{}")
     except json.JSONDecodeError:
@@ -122,7 +122,7 @@ def parse_args(raw: str) -> dict | None:
 
 
 def assistant_message(content: str, calls: list, details: list | None = None) -> dict:
-    """رسالة القائد/الوكيل اللي فيها طلبات أدوات. الوسائط المقطوعة تتحول {} عشان المزود ما يرفض المحادثة."""
+    """An assistant message carrying tool calls. Broken arguments become {} so providers don't reject the chat."""
     msg = {"role": "assistant", "content": content,
            "tool_calls": [{"id": c["id"], "type": "function",
                            "function": {"name": c["name"],

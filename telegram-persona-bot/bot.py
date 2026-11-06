@@ -1,4 +1,4 @@
-"""بوت تليجرام بهوية ثابتة يحددها المالك، يعمل بـ Kimi K3.1 Pro، ويتصرف مثل تطبيقات الذكاء الاصطناعي."""
+"""A Telegram bot with a fixed, owner-defined persona, running on Kimi K3.1 Pro, that behaves like modern AI apps — plus a Coding version with a lead model and parallel agents (like Claude Code)."""
 
 import asyncio
 import base64
@@ -8,11 +8,14 @@ import json
 import logging
 import os
 import re
+import secrets
+import shutil
 import time
 from collections import OrderedDict, defaultdict, deque
 from dataclasses import dataclass, field
 from pathlib import Path
 
+import httpx
 from dotenv import load_dotenv
 from openai import APIError, AsyncOpenAI
 from telegram import (
@@ -47,7 +50,7 @@ import render
 import telegraph
 import vault
 from llm import split_think_tags
-from render import RLM, esc
+from render import esc
 from tools import TOOLS, describe_call, run_tool
 from workspace import Changes, Checkpoints, Workspace, WorkspaceError, human, kill_all_jobs, valid_name
 
@@ -55,7 +58,7 @@ load_dotenv()
 
 TELEGRAM_BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 def clean_key(key: str) -> str:
-    """ينظف المفتاح من الأخطاء الشائعة وقت النسخ: مسافات، علامات تنصيص، كلمة Bearer."""
+    """Cleans common copy-paste mistakes from the key: spaces, quotes, the word Bearer."""
     key = key.strip().strip("\"'").strip()
     if key.lower().startswith("bearer "):
         key = key[7:].strip()
@@ -64,23 +67,23 @@ def clean_key(key: str) -> str:
 
 OPENROUTER_API_KEY = clean_key(os.environ["OPENROUTER_API_KEY"])
 OPENROUTER_BASE_URL = os.getenv("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1")
-# الموديل والمزودين من config.json (مع إمكانية تجاوزهم بمتغيرات البيئة)
+# Model and providers from config.json (environment variables can override them)
 DEFAULT_MODEL = config.DEFAULT_MODEL
 PROVIDERS = config.PROVIDERS
 DEFAULT_PROVIDER = config.DEFAULT_PROVIDER
 OWNER_ID = int(os.getenv("OWNER_ID", "").strip() or "0")
-MAX_HISTORY = int(os.getenv("MAX_HISTORY", "20"))  # 10 رسائل لكل طرف
+MAX_HISTORY = int(os.getenv("MAX_HISTORY", "20"))  # 10 messages per side
 
 DATA_DIR = Path(__file__).parent / "data"
 PERSONA_FILE = DATA_DIR / "persona.json"
-RULES_FILE = DATA_DIR / "rules.json"       # تعديل قواعد القفل من تليجرام
-META_FILE = DATA_DIR / "meta.json"          # X-Title (مشفّر)
-SNIPPETS_FILE = DATA_DIR / "snippets.json"  # اختصارات المالك (جمل/ملفات محفوظة)
+RULES_FILE = DATA_DIR / "rules.json"       # lock rules edited from Telegram
+META_FILE = DATA_DIR / "meta.json"          # X-Title (encrypted)
+SNIPPETS_FILE = DATA_DIR / "snippets.json"  # the owner's snippets (saved text/files)
 HISTORY_FILE = DATA_DIR / "history.json"
 SETTINGS_FILE = DATA_DIR / "settings.json"
 SCREEN_FILE = DATA_DIR / "screen.json"
 TELEGRAPH_FILE = DATA_DIR / "telegraph.json"
-# ملفات وضع الوكلاء — تنحسب وقت الاستخدام (DATA_DIR ممكن يتغيّر في الاختبارات)
+# Coding-mode files — resolved at use time (tests may change DATA_DIR)
 
 
 def dpath(name: str) -> Path:
@@ -94,26 +97,26 @@ def ws_base() -> Path:
 def checkpoints() -> Checkpoints:
     return Checkpoints(dpath("checkpoints.json"))
 
-MAX_TOOL_ROUNDS = 10     # يكفي لمهام GitHub (قراءة، تعديل، عدة ملفات، PR)
-EDIT_INTERVAL = 1.0      # تليجرام يسمح بتعديل الرسالة تقريباً مرة بالثانية
-GROUP_WAIT = 1.2         # انتظار بقية الأجزاء (ألبوم صور أو رسالة طويلة انقسمت)
+MAX_TOOL_ROUNDS = 10     # enough for GitHub tasks (read, edit, several files, PR)
+EDIT_INTERVAL = 1.0      # Telegram allows editing a message roughly once per second
+GROUP_WAIT = 1.2         # wait for the remaining parts (a photo album or a long message Telegram split)
 MAX_FILE_BYTES = 10 * 1024 * 1024
 MAX_FILE_CHARS = 60_000
-SINGLE_MAX = 3900        # لو الرد أطول من كذا (حروف HTML) ننشره كصفحة Telegra.ph مرتبة
+SINGLE_MAX = 3900        # replies longer than this (HTML chars) are published as a tidy Telegra.ph page
 
 logging.basicConfig(format="%(asctime)s %(levelname)s %(name)s: %(message)s", level=logging.INFO)
 log = logging.getLogger("persona-bot")
 for noisy in ("httpx", "primp", "ddgs"):
     logging.getLogger(noisy).setLevel(logging.WARNING)
 
-# X-Title ما ينكتب هنا: يتحدد من تليجرام (/settitle) وينحفظ مشفّر، وينرسل مع كل طلب
+# X-Title isn't written here: it's set from Telegram (/settitle), stored encrypted, and sent with every request
 client = AsyncOpenAI(api_key=OPENROUTER_API_KEY, base_url=OPENROUTER_BASE_URL)
 NO_PREVIEW = LinkPreviewOptions(is_disabled=True)
 PREVIEW = LinkPreviewOptions(is_disabled=False, prefer_large_media=False)
 tph = telegraph.Telegraph(TELEGRAPH_FILE, short_name="PersonaBot")
 
 
-# ================= التخزين =================
+# ================= Storage =================
 
 def _read_json(path: Path, default):
     try:
@@ -129,13 +132,13 @@ def _write_json(path: Path, data) -> None:
     tmp.replace(path)
 
 
-# ذاكرة المحادثة لكل شات
+# Conversation memory per chat
 histories: dict[int, deque] = defaultdict(lambda: deque(maxlen=MAX_HISTORY))
-# ذاكرة وضع الوكلاء: منفصلة لكل (شات، مشروع)، وقصيرة — السياق الأقدم في «سجل المشروع» المختصر
+# Coding memory: separate per (chat, project) and short — older context lives in the compact project journal
 AGENT_CFG = config.AGENT
 AGENT_HISTORY = int(AGENT_CFG.get("history_messages", 8))
 agent_histories: dict[str, deque] = defaultdict(lambda: deque(maxlen=AGENT_HISTORY))
-# أرقام الرسائل الظاهرة في كل شات (عشان "محادثة جديدة" تمسح الشاشة)
+# Ids of the messages shown in each chat (so a new chat can clear the screen)
 screen: dict[int, list[int]] = defaultdict(list)
 
 
@@ -173,9 +176,9 @@ def untrack(chat_id: int, message_ids: list[int]) -> None:
     _write_json(SCREEN_FILE, {str(k): v for k, v in screen.items() if v})
 
 
-# ================= الهوية والقواعد =================
+# ================= Persona and rules =================
 
-# قواعد الهوية والشكل وملاحظة GitHub — كلها في config.json (عدّلها هناك)
+# Persona/style rules and the GitHub note — all in config.json (edit them there)
 LOCK_RULES = config.LOCK_RULES
 STYLE_RULES = config.STYLE_RULES
 GITHUB_NOTE = config.GITHUB_NOTE
@@ -184,14 +187,14 @@ DEFAULT_PERSONA = config.DEFAULT_PERSONA
 
 
 def _load_secret(path: Path, key: str, default: str) -> str:
-    """يقرأ قيمة مشفّرة ويفكّها. لو مشفّرة وما عندنا المفتاح، يرجّع الافتراضي مع تحذير."""
+    """Reads an encrypted value and decrypts it. If it's encrypted and we lack the key, returns the default with a warning."""
     data = _read_json(path, {})
     val = data.get(key) if isinstance(data, dict) else None
     if val is None:
         return default
     dec = vault.decrypt(val)
     if dec is None:
-        log.warning("ما قدرت أفك تشفير %s (PERSONA_KEY ناقص أو غلط) — استخدمت الافتراضي", key)
+        log.warning("Could not decrypt %s (PERSONA_KEY missing or wrong) — using the default", key)
         return default
     return dec
 
@@ -205,7 +208,7 @@ def save_persona(text: str) -> None:
 
 
 def load_lock() -> str:
-    """قواعد القفل الحالية — المعدّلة من تليجرام إن وُجدت، وإلا من config.json."""
+    """The current lock rules — the ones edited from Telegram if any, otherwise from config.json."""
     return _load_secret(RULES_FILE, "lock", config.LOCK_RULES)
 
 
@@ -214,7 +217,7 @@ def save_lock(text: str) -> None:
 
 
 def load_title() -> str:
-    """اسم X-Title اللي ينرسل لـ OpenRouter — فاضي = ما ينرسل."""
+    """The X-Title sent to OpenRouter — empty = not sent."""
     return _load_secret(META_FILE, "x_title", "")
 
 
@@ -233,14 +236,14 @@ def save_snippets(data: dict) -> None:
 
 def system_prompt(github: bool = False, confidential: bool = False) -> str:
     extra = GITHUB_NOTE if github else ""
-    # لغير المالك: نمنع كشف التعليمات/الهوية. المالك يشوفها عبر /persona و /rules
+    # For non-owners: block revealing the instructions/persona. The owner sees them via /persona and /rules
     head = (CONFIDENTIAL_NOTE + "\n") if confidential and CONFIDENTIAL_NOTE else ""
     return f"{head}{load_lock()}\n{STYLE_RULES}{extra}\n<identity>\n{load_persona()}\n</identity>"
 
 
-# ================= الإعدادات =================
+# ================= Settings =================
 
-# مستويات التفكير والإعدادات وقيمها الافتراضية — كلها في config.json
+# Reasoning levels, settings and their defaults — all in config.json
 EFFORTS = config.EFFORTS
 EFFORT_API = config.EFFORT_API
 PARAMS = config.PARAMS
@@ -253,14 +256,14 @@ GLOBAL_KEYS = config.GLOBAL_KEYS
 
 
 def cfg(key: str, mode: str = "chat"):
-    """قيمة إعداد. البوت نسختين: mode="chat" (💬) أو "agent" (💻 البرمجة) — لكل وحدة إعداداتها المستقلة."""
+    """A setting value. The bot has two versions: mode="chat" (💬) or "agent" (💻 Coding) — each has its own settings."""
     data = _read_json(SETTINGS_FILE, {})
     if mode == "agent" and key not in GLOBAL_KEYS:
         code = data.get("code") if isinstance(data.get("code"), dict) else {}
         value = code.get(key, CODE_DEFAULTS.get(key))
     else:
         value = data.get(key, DEFAULTS.get(key))
-    if key == "model" and "/" not in str(value):  # اسم قديم من Moonshot مباشرة
+    if key == "model" and "/" not in str(value):  # an old direct-Moonshot model name
         return DEFAULT_MODEL
     return value
 
@@ -275,7 +278,7 @@ def save_setting(key: str, value, mode: str = "chat") -> None:
 
 
 def owner_mode() -> str:
-    """النسخة اللي فاتحها المالك الحين."""
+    """The version the owner currently has open."""
     return "agent" if cfg("agent_mode") else "chat"
 
 
@@ -284,25 +287,29 @@ def parse_value(key: str, raw: str):
     raw = raw.strip()
     low = raw.lower()
     if typ is bool:
-        if low in ("on", "true", "1", "yes", "تشغيل"):
+        if low in ("on", "true", "1", "yes"):
             return True
-        if low in ("off", "false", "0", "no", "ايقاف", "إيقاف"):
+        if low in ("off", "false", "0", "no"):
             return False
-        raise ValueError("اكتب on أو off")
-    if key in ("provider", "worker_provider") and low in ("any", "all", "أي"):
+        raise ValueError("use on or off")
+    if key in ("provider", "worker_provider") and low in ("any", "all"):
         return "any"
-    if low in ("off", "none", "default", "افتراضي"):
+    if low in ("off", "none", "default"):
         if key == "effort":
             return "default"
         return DEFAULTS[key] if key in ("model", "provider", "worker_model", "worker_provider", "max_agents") else None
+    if key == "permissions":
+        if low not in ("auto", "ask"):
+            raise ValueError("values: auto / ask")
+        return low
     if key == "effort":
         if low not in EFFORTS:
-            raise ValueError("القيم: " + " / ".join(EFFORTS))
+            raise ValueError("values: " + " / ".join(EFFORTS))
         return low
     try:
         return typ(raw)
     except ValueError:
-        raise ValueError(f"لازم تكون رقم ({typ.__name__})") from None
+        raise ValueError(f"must be a number ({typ.__name__})") from None
 
 
 def request_kwargs(overrides: dict | None = None, mode: str = "chat") -> dict:
@@ -324,7 +331,7 @@ def request_kwargs(overrides: dict | None = None, mode: str = "chat") -> dict:
 
 
 def split_overrides(text: str) -> tuple[dict, str]:
-    """إعدادات لرسالة وحدة في بدايتها، مثل: effort=low temperature=0.3 السؤال"""
+    """Settings for a single message, at its start, e.g.: effort=low temperature=0.3 your question"""
     overrides, words = {}, text.split(" ")
     while words and "=" in words[0]:
         k, _, v = words[0].partition("=")
@@ -335,7 +342,7 @@ def split_overrides(text: str) -> tuple[dict, str]:
     return overrides, " ".join(words).strip()
 
 
-# ================= أدوات مساعدة لتليجرام =================
+# ================= Telegram helpers =================
 
 NEW_CHAT_BTN = config.NEW_CHAT_BTN
 SETTINGS_BTN = config.SETTINGS_BTN
@@ -344,8 +351,8 @@ CHAT_BTN = config.CHAT_BTN
 PROJECT_BTN = config.PROJECT_BTN
 CODE_NEW_BTN = config.CODE_NEW_BTN
 CODE_SETTINGS_BTN = config.CODE_SETTINGS_BTN
-STOP_KB = InlineKeyboardMarkup([[InlineKeyboardButton("⏹ إيقاف", callback_data="stop")]])
-REGEN_KB = InlineKeyboardMarkup([[InlineKeyboardButton("🔄 إعادة التوليد", callback_data="regen")]])
+STOP_KB = InlineKeyboardMarkup([[InlineKeyboardButton("⏹ Stop", callback_data="stop")]])
+REGEN_KB = InlineKeyboardMarkup([[InlineKeyboardButton("🔄 Regenerate", callback_data="regen")]])
 
 
 def is_owner_id(user_id: int | None) -> bool:
@@ -359,22 +366,22 @@ def is_owner(update: Update) -> bool:
 def main_keyboard(owner: bool) -> ReplyKeyboardMarkup:
     if not owner:
         return ReplyKeyboardMarkup([[NEW_CHAT_BTN]], resize_keyboard=True, is_persistent=True,
-                                   input_field_placeholder="اكتب رسالتك…")
-    if cfg("agent_mode"):  # 💻 نسخة البرمجة: شكل مختلف
+                                   input_field_placeholder="Type your message…")
+    if cfg("agent_mode"):  # 💻 the Coding version: a different look
         return ReplyKeyboardMarkup([[CODE_NEW_BTN, PROJECT_BTN], [CODE_SETTINGS_BTN, CHAT_BTN]],
                                    resize_keyboard=True, is_persistent=True,
-                                   input_field_placeholder="💻 اطلب مشروع أو مهمة برمجية…")
+                                   input_field_placeholder="💻 Ask for a project or a coding task…")
     return ReplyKeyboardMarkup([[NEW_CHAT_BTN, SETTINGS_BTN], [AGENT_BTN]], resize_keyboard=True,
-                               is_persistent=True, input_field_placeholder="اكتب رسالتك…")
+                               is_persistent=True, input_field_placeholder="Type your message…")
 
 
 def lines_html(*lines: str) -> str:
-    """يرتب أسطر رسائل البوت (القوائم والتنبيهات) من اليمين لليسار."""
-    return "\n".join(RLM + ln if ln.strip() else ln for ln in lines)
+    """Joins the bot's message lines (lists and notices)."""
+    return "\n".join(lines)
 
 
 async def send_html(bot, chat_id: int, text: str, markup=None, keep: bool = True) -> Message | None:
-    """يرسل رسالة HTML، ولو فشل التنسيق يرسلها نص عادي. keep=True يسجلها عشان تنمسح مع المحادثة الجديدة."""
+    """Sends an HTML message; if the formatting fails, sends plain text. keep=True tracks it so a new chat clears it."""
     try:
         try:
             msg = await bot.send_message(chat_id, text, parse_mode=ParseMode.HTML, reply_markup=markup,
@@ -399,13 +406,13 @@ async def delete_many(bot, chat_id: int, ids: list[int]) -> None:
         try:
             await bot.delete_messages(chat_id, batch)
         except TelegramError:
-            for mid in batch[-30:]:  # لو الدفعة فشلت نحاول آخر الرسائل وحدة وحدة
+            for mid in batch[-30:]:  # if the batch failed, try the latest messages one by one
                 with contextlib.suppress(TelegramError):
                     await bot.delete_message(chat_id, mid)
 
 
 def should_respond(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
-    """في الخاص يرد على كل شي، وفي القروبات بس لو أحد منشنه أو رد عليه."""
+    """In private chats it answers everything; in groups only when mentioned or replied to."""
     msg = update.message
     if not msg or update.effective_chat.type == ChatType.PRIVATE:
         return True
@@ -416,10 +423,10 @@ def should_respond(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
     return bool(replied or (username and f"@{username}" in text))
 
 
-# ================= عرض الرد المباشر =================
+# ================= Live reply display =================
 
 class Panel:
-    """مجموعة رسائل تليجرام تتحدث (رسالة التفكير، أو رسائل الرد)."""
+    """A group of Telegram messages that get updated (the thinking message, or the reply messages)."""
 
     def __init__(self, bot, chat_id: int):
         self.bot, self.chat_id = bot, chat_id
@@ -439,7 +446,7 @@ class Panel:
                 if "not modified" in err:
                     return True
                 if "parse" in err and kwargs.get("parse_mode"):
-                    # لو تليجرام رفض التنسيق نرسلها نص عادي بدل ما يضيع الرد
+                    # if Telegram rejects the formatting, send plain text instead of losing the reply
                     kwargs["parse_mode"] = None
                     kwargs["text"] = render.to_plain(kwargs["text"])
                     continue
@@ -480,7 +487,7 @@ class Panel:
         return [m.message_id for m in self.msgs]
 
 
-think_store: "OrderedDict[str, str]" = OrderedDict()  # التفكير الكامل لزر "📄 التفكير كامل"
+think_store: "OrderedDict[str, str]" = OrderedDict()  # the full thinking, for the "📄 Full thinking" button
 
 
 def remember_thinking(text: str) -> str:
@@ -492,20 +499,21 @@ def remember_thinking(text: str) -> str:
 
 
 class ResponseUI:
-    """يعرض رد واحد: رسالة تفكير تتحدث أولاً، ثم رسالة الرد تنكتب قدام المستخدم."""
+    """Shows one reply: a thinking message that updates first, then the reply written live in front of the user."""
 
     def __init__(self, bot, chat_id: int, show_thinking: bool, long_pages: bool = True,
                  board: "agent.Board | None" = None):
         self.bot, self.chat_id, self.show_thinking = bot, chat_id, show_thinking
         self.long_pages = long_pages
-        self.board = board                     # وضع الوكلاء: لوحة العمل (الخطة + الوكلاء)
+        self.board = board                     # coding mode: the work panel (plan + agents)
         self.think = Panel(bot, chat_id)
-        self.work = Panel(bot, chat_id)        # بين التفكير والرد، ترتيبها ثابت
+        self.work = Panel(bot, chat_id)        # between the thinking and the reply, in a fixed order
         self.reply = Panel(bot, chat_id)
-        self.extra_rows: list[list[InlineKeyboardButton]] = []  # أزرار فوق 🔄 في الرد النهائي
-        self.inbox: list[str] = []             # رسائل المالك أثناء التنفيذ (توجيه)
+        self.extra_rows: list[list[InlineKeyboardButton]] = []  # buttons above 🔄 on the final reply
+        self.inbox: list[str] = []             # the owner's messages during a run (steering)
         self.final_files: list[dict] = []
-        self.parts: list[list[str]] = []      # [["r", تفكير] أو ["s", خطوة بحث]]
+        self.allow_all = False                 # permission mode "ask": owner tapped "Allow all"
+        self.parts: list[list[str]] = []      # [["r", reasoning], ["s", a step] or ["n", narration]]
         self._round_part: list[str] | None = None
         self.reply_md = ""
         self._reply_base = ""
@@ -520,15 +528,15 @@ class ResponseUI:
         self._cooldown = 0.0
         self._think_key: str | None = None
 
-    # ----- تحديث الحالة (بدون انتظار) -----
+    # ----- State updates (non-blocking) -----
     def begin_round(self) -> None:
         self._round_part = None
-        if self.board is not None:  # وضع الوكلاء: الرد = كلام آخر جولة بس (اللي قبله ينتقل للسجل)
+        if self.board is not None:  # coding mode: the reply = the last round's text only (earlier text moves to the log)
             self.reply_md = ""
         self._reply_base = self.reply_md
 
     def demote(self, text: str) -> None:
-        """كلام القائد قبل استدعاء أدوات: ينتقل من مكان الرد لسجل الخطوات."""
+        """The lead's text before calling tools: moves from the reply area to the steps log."""
         if text.strip():
             self.parts.append(["n", text.strip()])
             self._round_part = None
@@ -544,7 +552,7 @@ class ResponseUI:
         self.last_think = time.monotonic()
 
     def set_round_answer(self, answer: str) -> None:
-        # الرد يتجمع عبر الجولات: النص اللي انكتب قبل البحث يبقى، والجديد ينضاف بعده
+        # the reply accumulates across rounds: text written before a search stays, new text is appended
         base = self._reply_base
         sep = "\n\n" if base.strip() and answer and not base.endswith("\n") else ""
         self.reply_md = base + sep + answer
@@ -571,7 +579,7 @@ class ResponseUI:
         self.task.cancel()
         return True
 
-    # ----- الرسم -----
+    # ----- Rendering -----
     def _reply_active(self) -> bool:
         return bool(self.reply_md.strip()) or not self.show_thinking
 
@@ -585,7 +593,7 @@ class ResponseUI:
         elif final and truncated:
             if not self._think_key:
                 self._think_key = remember_thinking(self._full_thinking())
-            markup = InlineKeyboardMarkup([[InlineKeyboardButton("📄 التفكير كامل", callback_data=f"think:{self._think_key}")]])
+            markup = InlineKeyboardMarkup([[InlineKeyboardButton("📄 Full thinking", callback_data=f"think:{self._think_key}")]])
         return [(text, markup)]
 
     def _full_thinking(self) -> str:
@@ -599,56 +607,56 @@ class ResponseUI:
         return [(html, None)] if html else []
 
     def final_kb(self) -> InlineKeyboardMarkup:
-        return InlineKeyboardMarkup(self.extra_rows + [[InlineKeyboardButton("🔄 إعادة التوليد", callback_data="regen")]])
+        return InlineKeyboardMarkup(self.extra_rows + [[InlineKeyboardButton("🔄 Regenerate", callback_data="regen")]])
 
     def _final_extras(self) -> list[str]:
         extras = []
         if self.stopped:
-            extras.append(RLM + "<i>⏹ تم إيقاف الرد</i>")
+            extras.append("<i>⏹ Reply stopped</i>")
         if self.error:
             extras.append(self.error)
         return extras
 
     def live_pages(self) -> list:
-        """معاينة حيّة: رسالة وحدة تتحدث وهو يكتب. ما نقسّم ولا ننشر صفحة إلا عند النهاية."""
+        """Live preview: one message updated while writing. No splitting or page publishing until the end."""
         if not self._reply_active():
             return []
         h = render.live_tail_html(self.reply_md) if self.reply_md.strip() else ""
         if not h and self.status:
-            h = RLM + f"<i>{esc(self.status)}</i>"
+            h = f"<i>{esc(self.status)}</i>"
         h = f"{h} {render.CURSOR}" if h else render.CURSOR
         return [(h, STOP_KB, False)]
 
     async def final_reply_pages(self) -> list:
-        """تسليم الرد النهائي: رسالة وحدة لو قصير، صفحة Telegra.ph لو طويل، وتقسيم احتياطي."""
+        """Delivers the final reply: one message if short, a Telegra.ph page if long, and splitting as a fallback."""
         md = self.reply_md.strip("\n")
         extras = self._final_extras()
         src_html = render.sources_html(self.sources) if self.sources else ""
         if not md:
-            body = "\n\n".join(extras) if extras else RLM + "<i>…</i>"
+            body = "\n\n".join(extras) if extras else "<i>…</i>"
             return [(body, self.final_kb(), False)]
-        full = render.render(md, partial=False)  # كامل بلا قص؛ القرار على الطول الحقيقي
+        full = render.render(md, partial=False)  # full, uncut; the decision uses the real length
         tail = ("\n\n" + "\n\n".join(extras)) if extras else ""
-        if len(full) + len(src_html) + len(tail) <= SINGLE_MAX:  # يكفي رسالة وحدة
+        if len(full) + len(src_html) + len(tail) <= SINGLE_MAX:  # one message is enough
             body = full + (("\n\n" + src_html) if src_html else "") + tail
             return [(body, self.final_kb(), False)]
-        if self.long_pages and not self.stopped:  # رد طويل → صفحة تنفتح داخل تليجرام
+        if self.long_pages and not self.stopped:  # a long reply → a page that opens inside Telegram
             try:
                 nodes = render.to_telegraph_nodes(md)
                 if self.sources:
                     nodes.append({"tag": "hr"})
-                    nodes.append({"tag": "h3", "children": ["المصادر"]})
+                    nodes.append({"tag": "h3", "children": ["Sources"]})
                     nodes.append({"tag": "ul", "children": [
                         {"tag": "li", "children": [{"tag": "a", "attrs": {"href": s["url"]},
                                                     "children": [s.get("title") or s["url"]]}]}
                         for s in self.sources if s.get("url")]})
                 url = await tph.create_page(render.telegraph_title(md), nodes)
-                head = lines_html("📄 <b>الرد كامل</b> — طويل، فخليته بصفحة مرتبة تنفتح جوّا تليجرام:",
-                                  f'<a href="{esc(url)}">📖 افتح الرد كامل</a>')
+                head = lines_html("📄 <b>Full reply</b> — it's long, so I put it on a tidy page that opens inside Telegram:",
+                                  f'<a href="{esc(url)}">📖 Open the full reply</a>')
                 return [(head + tail, self.final_kb(), True)]
             except Exception:
                 log.warning("telegraph failed; splitting instead", exc_info=True)
-        chunks = render.split_md(md)  # احتياطي: تقسيم — نضمن إن ما ينقص شي
+        chunks = render.split_md(md)  # fallback: split — guarantees nothing is lost
         pages = [[render.page_html(c, False), None, False] for c in chunks]
         if src_html:
             pages.append([src_html, None, False])
@@ -672,7 +680,7 @@ class ResponseUI:
 
     async def _loop(self) -> None:
         last_typing = 0.0
-        interval = EDIT_INTERVAL * (2 if self.board is not None else 1)  # 3 رسائل تتحدث → أهدى على تليجرام
+        interval = EDIT_INTERVAL * (2 if self.board is not None else 1)  # 3 messages updating → gentler on Telegram's limits
         while True:
             await asyncio.sleep(interval)
             if time.monotonic() - last_typing > 4.5:
@@ -682,7 +690,7 @@ class ResponseUI:
             await self.flush()
 
     async def start(self) -> None:
-        await self.flush()  # يطلع "يفكر…" فوراً
+        await self.flush()  # shows "Thinking…" right away
         self._loop_task = asyncio.create_task(self._loop())
 
     async def finish(self) -> None:
@@ -704,20 +712,20 @@ class ResponseUI:
         return self.think.ids() + self.work.ids() + self.reply.ids()
 
 
-# ================= التوليد =================
+# ================= Generation =================
 
 @dataclass
 class Turn:
-    """رسالة المستخدم ورد البوت عليها (عشان إعادة التوليد وتعديل الرسالة)."""
+    """The user's message and the bot's reply to it (for regenerate and message edits)."""
     user_msg_id: int | None
-    content: object          # اللي ينرسل للموديل (نص، أو نص + صور)
-    history_text: str        # اللي ينحفظ في الذاكرة
+    content: object          # what is sent to the model (text, or text + images)
+    history_text: str        # what is saved in memory
     overrides: dict
     user_id: int | None
     response_ids: list[int] = field(default_factory=list)
     mode: str = "chat"               # chat | agent
-    project: str = ""                # وضع الوكلاء: اسم المشروع
-    checkpoint: str | None = None    # نقطة الرجوع لتعديلات هذا الطلب
+    project: str = ""                # coding mode: the project name
+    checkpoint: str | None = None    # the checkpoint for this request's changes
 
 
 def turn_history(chat_id: int, turn: Turn) -> deque:
@@ -729,7 +737,7 @@ def save_turn_history(turn: Turn) -> None:
 
 
 last_turn: dict[int, Turn] = {}
-no_tools: set[str] = set()  # موديل/مزود ما يدعم الأدوات
+no_tools: set[str] = set()  # model/provider pairs that don't support tools
 
 
 def tools_key(kw: dict) -> str:
@@ -737,7 +745,7 @@ def tools_key(kw: dict) -> str:
 
 
 def keep_recent_reasoning(history: deque, keep: int = 10) -> None:
-    """نخلي reasoning_details في آخر 10 ردود (كل ردود الذاكرة)."""
+    """Keep reasoning_details on the last 10 replies (all replies in memory)."""
     seen = 0
     for msg in reversed(history):
         if msg.get("role") == "assistant" and "reasoning_details" in msg:
@@ -749,7 +757,7 @@ chat_locks: dict[int, asyncio.Lock] = defaultdict(asyncio.Lock)
 
 
 async def stream_round(ui: ResponseUI, messages: list, kw: dict, tool_kwargs: dict):
-    """جولة وحدة مع الموديل. يرجع (نص الرد، التفكير، تفاصيل التفكير، طلبات الأدوات)."""
+    """One round with the model. Returns (reply text, reasoning, reasoning details, tool calls)."""
     headers = {"X-Title": t} if (t := load_title()) else {}
 
     def on_delta(raw: str, reasoning: str, _calls) -> None:
@@ -769,33 +777,33 @@ def error_hint(e: Exception) -> str:
     code = getattr(e, "status_code", None)
     msg = str(e).lower()
     if code == 401:
-        return ("OpenRouter رفض المفتاح. تأكد إن السر OPENROUTER_API_KEY فيه المفتاح كامل "
-                "(يبدأ بـ sk-or-v1-) من openrouter.ai/keys، وإن المفتاح ما انحذف.")
+        return ("OpenRouter rejected the key. Make sure the OPENROUTER_API_KEY secret holds the full key "
+                "(it starts with sk-or-v1-) from openrouter.ai/keys, and that the key wasn't deleted.")
     if code == 402 or "credit" in msg:
-        return "الرصيد في OpenRouter ما يكفي."
+        return "Not enough OpenRouter credit."
     if code == 429:
-        return "فيه ضغط على المزود، جرّب بعد شوي."
+        return "The provider is overloaded — try again in a moment."
     if "tool" in msg and ("support" in msg or "endpoint" in msg):
-        return "المزود المحدد ما يدعم الأدوات (وضع البرمجة يحتاجها) — جرّب من ⚙️ الإعدادات: «أي مزود»."
+        return "The selected provider doesn't support tools (Coding mode needs them) — try ⚙️ Settings: \"Any provider\"."
     if code == 404 or "no endpoints" in msg or "provider" in msg:
-        return "المزود المحدد مو متاح حالياً — جرّب من ⚙️ الإعدادات: «أي مزود»."
+        return "The selected provider isn't available right now — try ⚙️ Settings: \"Any provider\"."
     return ""
 
 
 def error_html(e: Exception, owner: bool) -> str:
-    text = RLM + "⚠️ <b>صار خطأ وما قدرت أكمل الرد.</b>\n" + RLM + "اضغط 🔄 عشان تحاول مرة ثانية."
+    text = "⚠️ <b>An error occurred and I couldn't finish the reply.</b>\nTap 🔄 to try again."
     if owner and (hint := error_hint(e)):
-        text += "\n" + RLM + "💡 " + esc(hint)
+        text += "\n💡 " + esc(hint)
     if owner:
         text += f"\n<blockquote expandable>{esc(type(e).__name__)}: {esc(str(e)[:700])}</blockquote>"
     return text
 
 
-regen_msg: dict[int, int] = {}  # الرسالة اللي عليها زر 🔄 في كل شات
+regen_msg: dict[int, int] = {}  # the message carrying the 🔄 button in each chat
 
 
 async def drop_old_buttons(bot, chat_id: int) -> None:
-    """زر إعادة التوليد يبقى على آخر رد بس."""
+    """The regenerate button stays on the latest reply only."""
     mid = regen_msg.pop(chat_id, None)
     if mid:
         with contextlib.suppress(TelegramError):
@@ -803,16 +811,16 @@ async def drop_old_buttons(bot, chat_id: int) -> None:
 
 
 async def send_transcript(bot, chat_id: int, turn: "Turn", ui: "ResponseUI") -> int | None:
-    """ملف txt بعد الرد: الهوية، رسالة المستخدم، التفكير كامل، والرد. للمالك فقط."""
+    """A txt file after the reply: the persona, the user's message, the full thinking, and the reply. Owner only."""
     text = (
-        "هويته:\n" + load_persona() + "\n\n"
-        "رسالتي:\n" + (turn.history_text or "") + "\n\n"
-        "تفكيره كامل:\n" + (ui._full_thinking().strip() or "—") + "\n\n"
-        "رسالته:\n" + (ui.reply_md.strip() or "—") + "\n"
+        "Persona:\n" + load_persona() + "\n\n"
+        "My message:\n" + (turn.history_text or "") + "\n\n"
+        "Full thinking:\n" + (ui._full_thinking().strip() or "—") + "\n\n"
+        "Reply:\n" + (ui.reply_md.strip() or "—") + "\n"
     )
     try:
-        m = await bot.send_document(chat_id, InputFile(io.BytesIO(text.encode("utf-8")), filename="رد.txt"),
-                                    caption="📄 سجل الرد")
+        m = await bot.send_document(chat_id, InputFile(io.BytesIO(text.encode("utf-8")), filename="reply.txt"),
+                                    caption="📄 Reply transcript")
         return m.message_id
     except TelegramError as e:
         log.warning("transcript failed: %s", e)
@@ -820,7 +828,7 @@ async def send_transcript(bot, chat_id: int, turn: "Turn", ui: "ResponseUI") -> 
 
 
 def active_tools(owner: bool, use_search: bool) -> list:
-    """أدوات البحث للجميع، وأدوات GitHub للمالك فقط (ولو التوكن مضبوط)."""
+    """Search tools for everyone, GitHub tools for the owner only (and only if the token is set)."""
     tools = list(TOOLS) if use_search else []
     if owner and github_tools.enabled():
         tools += github_tools.GITHUB_TOOLS
@@ -834,16 +842,16 @@ def describe_tool(name: str, args: str) -> str:
 
 
 async def dispatch_tool(name: str, args: str, owner: bool):
-    """ينفّذ الأداة. أدوات GitHub للمالك فقط — فحص ثاني حتى لو انطلبت بالغلط."""
+    """Runs the tool. GitHub tools are owner-only — a second check even if one is requested by mistake."""
     if github_tools.is_github_tool(name):
         if not owner:
-            return "هذي الأداة لصاحب البوت فقط.", []
+            return "This tool is for the bot owner only.", []
         return await github_tools.run_github(name, args), []
     return await run_tool(name, args)
 
 
 async def _generate(bot, chat_id: int, turn: Turn) -> None:
-    """يولد رد كامل (لازم يكون قفل الشات ماسك)."""
+    """Generates a full reply (the chat lock must be held)."""
     overrides = turn.overrides
     owner = is_owner_id(turn.user_id)
     github_on = owner and github_tools.enabled()
@@ -868,18 +876,18 @@ async def _generate(bot, chat_id: int, turn: Turn) -> None:
                 tool_kwargs = {}
             elif round_no < MAX_TOOL_ROUNDS:
                 tool_kwargs = {"tools": tools_list}
-            else:  # خلصت الجولات — لازم يجاوب بدون أدوات إضافية
+            else:  # out of rounds — must answer without more tools
                 tool_kwargs = {"tools": tools_list, "tool_choice": "none"}
             ui.begin_round()
             try:
                 content, reasoning, details, calls = await stream_round(ui, messages, kw, tool_kwargs)
             except APIError as e:
-                # بعض المزودين ما يدعمون الأدوات: نكمل بدونها بدل ما يفشل الرد
+                # some providers don't support tools: continue without them instead of failing the reply
                 if not tool_kwargs or "tool" not in str(e).lower():
                     raise
                 no_tools.add(tools_key(kw))
                 tools_list, tool_kwargs = [], {}
-                ui.add_step("⚠️ الأدوات غير مدعومة مع هذا المزود — كمّلت بدونها")
+                ui.add_step("⚠️ Tools aren't supported by this provider — continued without them")
                 ui.begin_round()
                 content, reasoning, details, calls = await stream_round(ui, messages, kw, tool_kwargs)
             rounds += 1
@@ -893,7 +901,7 @@ async def _generate(bot, chat_id: int, turn: Turn) -> None:
                                 "function": {"name": c["name"], "arguments": c["args"]}} for c in calls],
             }
             if details:
-                assistant["reasoning_details"] = details  # نرجعها مثل ما هي عشان يكمل تفكيره
+                assistant["reasoning_details"] = details  # send it back as-is so it continues its reasoning
             messages.append(assistant)
             for c in calls:
                 ui.add_step(describe_tool(c["name"], c["args"]))
@@ -903,7 +911,7 @@ async def _generate(bot, chat_id: int, turn: Turn) -> None:
     except asyncio.CancelledError:
         if not ui.stopped:
             raise
-        asyncio.current_task().uncancel()  # المستخدم ضغط ⏹ — نكمل ونثبت اللي انكتب
+        asyncio.current_task().uncancel()  # the user tapped ⏹ — keep what was written
     except Exception as e:
         log.exception("model API error")
         ui.error = error_html(e, is_owner_id(turn.user_id))
@@ -923,25 +931,25 @@ async def _generate(bot, chat_id: int, turn: Turn) -> None:
         history.append({"role": "user", "content": turn.history_text})
         entry = {"role": "assistant", "content": reply}
         if final_details and rounds == 1 and not ui.stopped:
-            entry["reasoning_details"] = final_details  # يكمل تفكيره من حيث وقف في الرسالة الجاية
+            entry["reasoning_details"] = final_details  # it continues reasoning where it left off in the next message
         history.append(entry)
         keep_recent_reasoning(history)
         save_histories()
 
-    # ملف txt بعد الرد — للمالك فقط عشان الهوية ما تطلع لأي أحد ثاني
+    # txt file after the reply — owner only, so the persona never reaches anyone else
     if owner and overrides.get("export_txt", cfg("export_txt")) and (reply or ui.parts):
         doc_id = await send_transcript(bot, chat_id, turn, ui)
         if doc_id:
-            turn.response_ids.insert(0, doc_id)  # ينحذف مع الرد لو ضغطت 🔄، وزر 🔄 يبقى على الرد
+            turn.response_ids.insert(0, doc_id)  # deleted with the reply on 🔄, and the 🔄 button stays on the reply
             track(chat_id, doc_id)
 
 
-# ================= وضع الوكلاء =================
+# ================= Coding mode =================
 
-session_usage = agent.Usage()          # الاستهلاك من بداية التشغيل الحالي
-diffs: "OrderedDict[str, str]" = OrderedDict()      # فرق كل طلب (زر 📄 الفرق)
-reports: "OrderedDict[str, str]" = OrderedDict()    # تقارير الوكلاء (زر 🤖 التقارير)
-asks: "OrderedDict[str, list[str]]" = OrderedDict()  # خيارات أسئلة القائد (أزرار)
+session_usage = agent.Usage()          # usage since this process started
+diffs: "OrderedDict[str, str]" = OrderedDict()      # each request's diff (the 📄 Diff button)
+reports: "OrderedDict[str, str]" = OrderedDict()    # the agents' reports (the 🤖 Reports button)
+asks: "OrderedDict[str, list[str]]" = OrderedDict()  # options of the lead's questions (buttons)
 
 
 def _remember(store: OrderedDict, key: str, value, keep: int = 40) -> None:
@@ -955,7 +963,7 @@ def new_key() -> str:
 
 
 def record_usage(models: dict) -> None:
-    """يجمع الاستهلاك (التوكنز والتكلفة) لكل موديل: للجلسة الحالية وللإجمالي المحفوظ."""
+    """Adds up usage (tokens and cost) per model: for this session and the saved all-time total."""
     if not models:
         return
     data = _read_json(dpath("usage.json"), {})
@@ -984,7 +992,7 @@ def get_ws(name: str | None = None) -> Workspace:
 
 
 def journal_add(project: str, request: str, reply: str, files: list[dict], ok: bool) -> None:
-    """سجل المشروع: سطرين لكل طلب — يعطي القائد سياق كل اللي صار بدون ما نرسل المحادثات القديمة كاملة."""
+    """The project journal: two lines per request — gives the lead the context of everything that happened without resending old conversations in full."""
     data = _read_json(dpath("journal.json"), {})
     entries = data.setdefault(project, [])
     entries.append({"t": time.strftime("%Y-%m-%d %H:%M"), "req": " ".join(request.split())[:300],
@@ -998,11 +1006,11 @@ def journal_text(project: str) -> str:
     entries = _read_json(dpath("journal.json"), {}).get(project) or []
     limit = int(AGENT_CFG.get("journal_chars", 8000))
     lines, used = [], 0
-    for e in reversed(entries):  # الأحدث أهم؛ لو طال السجل نختصر القديم
-        files = f" | الملفات: {' '.join(e['files'])}" if e.get("files") else ""
-        line = f"- [{e['t']}] {'' if e.get('ok', True) else '⚠️ '}الطلب: {e['req']} → {e['out']}{files}"
+    for e in reversed(entries):  # the newest matters most; if the journal gets long, the oldest is summarized away
+        files = f" | files: {' '.join(e['files'])}" if e.get("files") else ""
+        line = f"- [{e['t']}] {'' if e.get('ok', True) else '⚠️ '}request: {e['req']} → {e['out']}{files}"
         if used + len(line) > limit:
-            lines.append(f"- … و{len(entries) - len(lines)} طلبات أقدم")
+            lines.append(f"- … and {len(entries) - len(lines)} older requests")
             break
         lines.append(line)
         used += len(line)
@@ -1010,7 +1018,7 @@ def journal_text(project: str) -> str:
 
 
 def restore_checkpoint(project: str, cp_id: str | None = None) -> tuple[int, list[str]] | None:
-    """يرجّع ملفات المشروع لحالها قبل آخر طلب (لو cp_id هو الأحدث)."""
+    """Restores the project files to how they were before the latest request (if cp_id is the latest)."""
     store = checkpoints()
     cp = store.pop(project, cp_id)
     if not cp:
@@ -1019,7 +1027,7 @@ def restore_checkpoint(project: str, cp_id: str | None = None) -> tuple[int, lis
 
 
 def lead_kwargs(overrides: dict) -> dict:
-    """طلب القائد: نفس شكل المحادثة لكن بإعدادات نسخة البرمجة (افتراضياً تفكير high) + حساب الاستهلاك."""
+    """The lead's request: same shape as chat but with the Coding version's settings (reasoning high by default) + usage accounting."""
     kw = request_kwargs(overrides, "agent")
     kw["extra_body"]["usage"] = {"include": True}
     return kw
@@ -1051,14 +1059,14 @@ def make_env(ws: Workspace, changes: Changes, board: "agent.Board", web_on: bool
 
 
 async def lead_round(ui: ResponseUI, messages: list, kw: dict, tool_kwargs: dict):
-    """جولة للقائد مع إعادة محاولة لو المزود مضغوط (الشغل الطويل ما يضيع بسبب خطأ مؤقت)."""
+    """A lead round with retries when the provider is overloaded (long work isn't lost to a transient error)."""
     for attempt in range(3):
         try:
             return await stream_round(ui, messages, kw, tool_kwargs)
         except Exception as e:
             if attempt == 2 or not agent._transient(e):
                 raise
-            ui.add_step(f"⏳ ضغط على المزود — إعادة محاولة {attempt + 1}")
+            ui.add_step(f"⏳ Provider busy — retry {attempt + 1}")
             ui.begin_round()
             await asyncio.sleep(4 * (attempt + 1) ** 2)
 
@@ -1068,7 +1076,7 @@ def _btn(text: str, data: str) -> InlineKeyboardButton:
 
 
 async def _generate_agent(bot, chat_id: int, turn: Turn) -> None:
-    """وضع الوكلاء: Kimi يقود (يخطط، يقرأ، يكتب، يشغّل، يوزّع على GLM، يراجع)، والرد ملخص الشغل."""
+    """Coding mode: Kimi leads (plans, reads, writes, runs, delegates to GLM, reviews), and the reply summarizes the work."""
     overrides = turn.overrides
     show_thinking = overrides.get("show_thinking", cfg("show_thinking", "agent"))
     long_pages = overrides.get("long_pages", cfg("long_pages", "agent"))
@@ -1083,13 +1091,15 @@ async def _generate_agent(bot, chat_id: int, turn: Turn) -> None:
     gh_on = github_tools.enabled()
     tools = agent.lead_tools(plan, env.web_tools, list(github_tools.GITHUB_TOOLS) if gh_on else [], gh_on)
     history = turn_history(chat_id, turn)
-    persona = load_persona() if AGENT_CFG.get("persona_voice", True) else None
+    persona = load_persona() if cfg("persona_voice", "agent") and AGENT_CFG.get("persona_voice", True) else None
     system = agent.lead_system(env, config.LEAD_PROMPT, plan, persona, GITHUB_NOTE, journal_text(ws.name))
     messages = [{"role": "system", "content": system}, *history, {"role": "user", "content": turn.content}]
     await drop_old_buttons(bot, chat_id)
 
     ui = ResponseUI(bot, chat_id, show_thinking, long_pages, board=board)
     env.on_status = lambda text: setattr(ui, "status", text)
+    if cfg("permissions", "agent") == "ask":
+        env.approve = make_approver(bot, chat_id, ui)
     ui.task = asyncio.current_task()
     active[chat_id] = ui
     ctx = agent.ToolCtx(env)
@@ -1099,12 +1109,12 @@ async def _generate_agent(bot, chat_id: int, turn: Turn) -> None:
     try:
         await ui.start()
         for round_no in range(max_rounds + 1):
-            if ui.inbox:  # المالك أرسل توجيه وهو يشتغل → يوصل للقائد فوراً
+            if ui.inbox:  # the owner sent steering while it works → it reaches the lead right away
                 note = "\n\n".join(ui.inbox)
                 ui.inbox.clear()
-                messages.append({"role": "user", "content": f"[رسالة من المالك أثناء التنفيذ]\n{note}"})
-                turn.history_text += f"\n\n[أثناء التنفيذ]: {note}"
-                ui.add_step("📨 توجيه منك: " + " ".join(note.split())[:80])
+                messages.append({"role": "user", "content": f"[Message from the owner during the run]\n{note}"})
+                turn.history_text += f"\n\n[During the run]: {note}"
+                ui.add_step("📨 Your note: " + " ".join(note.split())[:80])
             if agent.trim_context(messages):
                 ctx.seen_reads.clear()
             tool_kwargs = {"tools": tools} if round_no < max_rounds else {"tools": tools, "tool_choice": "none"}
@@ -1123,7 +1133,7 @@ async def _generate_agent(bot, chat_id: int, turn: Turn) -> None:
                 ui.add_step(agent.describe(c["name"], c["args"]) or describe_tool(c["name"], c["args"]))
                 if c["name"] in agent.TERMINAL:
                     terminal = (c["name"], llm.parse_args(c["args"]) or {}, content)
-                    messages.append({"role": "tool", "tool_call_id": c["id"], "content": "انعرض على المالك."})
+                    messages.append({"role": "tool", "tool_call_id": c["id"], "content": "Shown to the owner."})
                     continue
                 result, sources = await agent.execute_lead(env, ctx, c["name"], c["args"])
                 ui.add_sources(sources)
@@ -1134,7 +1144,7 @@ async def _generate_agent(bot, chat_id: int, turn: Turn) -> None:
     except asyncio.CancelledError:
         if not ui.stopped:
             raise
-        asyncio.current_task().uncancel()  # المالك ضغط ⏹ — نثبت اللي صار
+        asyncio.current_task().uncancel()  # the owner tapped ⏹ — keep what happened
     except Exception as e:
         log.exception("agent turn failed")
         ui.error = error_html(e, True)
@@ -1148,18 +1158,18 @@ async def _generate_agent(bot, chat_id: int, turn: Turn) -> None:
         kind, args, pre = terminal
         lead_in = (pre.strip() + "\n\n") if pre.strip() else ""
         if kind == "ask_user":
-            q = str(args.get("question") or "").strip() or "عندي سؤال قبل ما أكمل:"
+            q = str(args.get("question") or "").strip() or "I have a question before I continue:"
             opts = [" ".join(str(o).split())[:60] for o in (args.get("options") or []) if str(o).strip()][:5]
             ui.reply_md = lead_in + "❓ " + q
             if opts:
                 _remember(asks, key, opts)
                 ui.extra_rows += [[_btn(o, f"ask:{key}:{i}")] for i, o in enumerate(opts)]
-                ui.reply_md += "\n\n_اختر من الأزرار أو اكتب جوابك._"
+                ui.reply_md += "\n\n_Pick a button or type your answer._"
         else:
-            ui.reply_md = lead_in + (str(args.get("plan") or "").strip() or "(خطة فاضية)")
-            ui.extra_rows.append([_btn("✅ نفّذ الخطة", f"plan:go:{ws.name}"[:64]), _btn("✖️ لا", "plan:no")])
+            ui.reply_md = lead_in + (str(args.get("plan") or "").strip() or "(empty plan)")
+            ui.extra_rows.append([_btn("✅ Run the plan", f"plan:go:{ws.name}"[:64]), _btn("✖️ No", "plan:no")])
     elif not ui.reply_md.strip() and last_text and not ui.error:
-        ui.reply_md = last_text  # القائد خلص بدون رد أخير — نعرض آخر كلامه بدل رد فاضي
+        ui.reply_md = last_text  # the lead finished without a final reply — show its last text instead of an empty reply
 
     files = changes.files()
     ui.final_files = files
@@ -1167,11 +1177,11 @@ async def _generate_agent(bot, chat_id: int, turn: Turn) -> None:
         checkpoints().push(ws.name, key, turn.history_text, changes)
         turn.checkpoint = key
         _remember(diffs, key, changes.diff())
-        ui.extra_rows.append([_btn("↩️ تراجع", f"undo:{key}"), _btn("📄 الفرق", f"diff:{key}"),
-                              _btn("📦 المشروع", "zip")])
+        ui.extra_rows.append([_btn("↩️ Undo", f"undo:{key}"), _btn("📄 Diff", f"diff:{key}"),
+                              _btn("📦 Project", "zip")])
     if board.agents:
         _remember(reports, key, agent.reports_markdown(board))
-        ui.extra_rows.append([_btn(f"🤖 تقارير الوكلاء ({len(board.agents)})", f"rep:{key}")])
+        ui.extra_rows.append([_btn(f"🤖 Agent reports ({len(board.agents)})", f"rep:{key}")])
 
     await ui.finish()
     turn.response_ids = ui.message_ids()
@@ -1180,6 +1190,7 @@ async def _generate_agent(bot, chat_id: int, turn: Turn) -> None:
         regen_msg[chat_id] = turn.response_ids[-1]
     track(chat_id, *turn.response_ids)
     record_usage(board.usage.models)
+    last_boards[chat_id] = board
     reply = ui.reply_md.strip()
     if reply and not ui.error:
         history.append({"role": "user", "content": turn.history_text})
@@ -1187,21 +1198,21 @@ async def _generate_agent(bot, chat_id: int, turn: Turn) -> None:
         history.append({"role": "assistant", "content": reply + ("\n\n" + log_text if log_text else "")})
         save_agent_histories()
     if reply or files:
-        journal_add(ws.name, turn.history_text, reply or "(بدون رد)", files, ok=not (ui.error or ui.stopped))
+        journal_add(ws.name, turn.history_text, reply or "(no reply)", files, ok=not (ui.error or ui.stopped))
 
     if overrides.get("export_txt", cfg("export_txt", "agent")) and (reply or ui.parts):
         doc_id = await send_transcript(bot, chat_id, turn, ui)
         if doc_id:
             turn.response_ids.insert(0, doc_id)
             track(chat_id, doc_id)
-    if ui.inbox:  # توجيه وصل بعد آخر جولة → طلب جديد بعد هذا مباشرة
+    if ui.inbox:  # steering that arrived after the last round → a new request right after this one
         note = "\n\n".join(ui.inbox)
         asyncio.create_task(generate(bot, chat_id, Turn(None, note, note, {}, turn.user_id,
                                                          mode="agent", project=ws.name)))
 
 
 async def run_turn(bot, chat_id: int, turn: Turn) -> None:
-    """لازم يكون قفل الشات ماسك."""
+    """The chat lock must be held."""
     if turn.mode == "agent":
         await _generate_agent(bot, chat_id, turn)
     else:
@@ -1209,12 +1220,12 @@ async def run_turn(bot, chat_id: int, turn: Turn) -> None:
 
 
 async def generate(bot, chat_id: int, turn: Turn) -> None:
-    async with chat_locks[chat_id]:  # الرسائل الجديدة تنتظر دورها
+    async with chat_locks[chat_id]:  # new messages wait their turn
         await run_turn(bot, chat_id, turn)
 
 
 async def redo(bot, chat_id: int, user_msg_id: int | None, replacement: Turn | None = None) -> bool:
-    """يعيد آخر رد (🔄) أو يرد من جديد على رسالة انعدلت."""
+    """Regenerates the latest reply (🔄) or answers an edited message again."""
     ui = active.get(chat_id)
     if ui:
         ui.stop()
@@ -1227,7 +1238,7 @@ async def redo(bot, chat_id: int, user_msg_id: int | None, replacement: Turn | N
             history.pop()
             history.pop()
             save_turn_history(turn)
-        if turn.mode == "agent" and turn.checkpoint:  # 🔄 في وضع الوكلاء = نرجّع الملفات ونعيد من نفس النقطة
+        if turn.mode == "agent" and turn.checkpoint:  # 🔄 in coding mode = restore the files and redo from the same point
             restore_checkpoint(turn.project, turn.checkpoint)
         await delete_many(bot, chat_id, turn.response_ids)
         untrack(chat_id, turn.response_ids)
@@ -1238,7 +1249,7 @@ async def redo(bot, chat_id: int, user_msg_id: int | None, replacement: Turn | N
         return True
 
 
-# ================= استقبال رسائل المستخدم =================
+# ================= Receiving user messages =================
 
 TEXT_EXT = {"txt", "md", "markdown", "csv", "tsv", "json", "jsonl", "xml", "yaml", "yml", "ini", "toml", "cfg",
             "log", "py", "js", "ts", "tsx", "jsx", "html", "htm", "css", "scss", "java", "kt", "c", "h", "cpp",
@@ -1263,7 +1274,7 @@ class Item:
     text: str = ""
     images: list[str] = field(default_factory=list)
     files: list[tuple[str, str]] = field(default_factory=list)
-    notes: list[str] = field(default_factory=list)   # وضع الوكلاء: ملفات انحفظت في المشروع
+    notes: list[str] = field(default_factory=list)   # coding mode: files saved into the project
 
 
 async def download(bot, file_id: str) -> bytes:
@@ -1272,13 +1283,13 @@ async def download(bot, file_id: str) -> bytes:
 
 
 async def build_item(msg: Message, bot, ws: Workspace | None = None) -> Item | str:
-    """يحول رسالة المستخدم لمحتوى. يرجع نص خطأ لو النوع ما ينفع.
-    ws (وضع الوكلاء للمالك): الملفات تنحفظ داخل المشروع — أي نوع، وzip ينفك."""
+    """Turns the user's message into content. Returns an error string if the type isn't supported.
+    ws (coding mode, owner): files are saved into the project — any type, and zips are extracted."""
     item = Item(msg=msg, text=msg.text or msg.caption or "")
     if ws is not None and msg.document:
         doc = msg.document
         if doc.file_size and doc.file_size > 20 * 1024 * 1024:
-            return "الملف كبير، حد تليجرام للبوتات 20 ميقا."
+            return "The file is too big — Telegram's limit for bots is 20 MB."
         data = await download(bot, doc.file_id)
         try:
             item.notes.append(await asyncio.to_thread(ws.save_upload, doc.file_name or "file", data))
@@ -1288,7 +1299,7 @@ async def build_item(msg: Message, bot, ws: Workspace | None = None) -> Item | s
         if (doc.mime_type or "").startswith("image/"):
             item.images.append(f"data:{doc.mime_type};base64," + base64.b64encode(data).decode())
         elif not name.lower().endswith(".zip") and (text := decode_text(data)) is not None and len(text) <= 6000:
-            item.files.append((name, text))  # ملف صغير: نرسله مباشرة ونوفّر جولة قراءة
+            item.files.append((name, text))  # a small file: send it directly and save a read round
         return item
     if msg.photo:
         data = await download(bot, msg.photo[-1].file_id)
@@ -1299,7 +1310,7 @@ async def build_item(msg: Message, bot, ws: Workspace | None = None) -> Item | s
     elif msg.document:
         doc = msg.document
         if doc.file_size and doc.file_size > MAX_FILE_BYTES:
-            return "الملف كبير، الحد 10 ميقا."
+            return "The file is too big — the limit is 10 MB."
         name = doc.file_name or "file"
         ext = name.rsplit(".", 1)[-1].lower() if "." in name else ""
         mime = doc.mime_type or ""
@@ -1309,15 +1320,15 @@ async def build_item(msg: Message, bot, ws: Workspace | None = None) -> Item | s
         elif ext == "pdf" or mime == "application/pdf":
             text = await asyncio.to_thread(pdf_text, data)
             if not text.strip():
-                return "ملف الـ PDF ما فيه نص أقدر أقراه (غالباً صور)."
+                return "This PDF has no text I can read (probably scanned images)."
             item.files.append((name, text))
         else:
             text = decode_text(data) if (ext in TEXT_EXT or mime.startswith("text/") or not ext) else None
             if text is None:
-                return f"ما أقدر أقرأ ملفات .{ext or '؟'} — أرسل نص أو صورة أو PDF أو ملف نصي."
+                return f"I can't read .{ext or '?'} files — send text, an image, a PDF or a text file."
             item.files.append((name, text))
     elif not item.text:
-        return "ما أقدر أتعامل مع هذا النوع من الرسائل. أرسل نص أو صورة أو ملف."
+        return "I can't handle this kind of message. Send text, an image or a file."
     return item
 
 
@@ -1328,7 +1339,7 @@ def pdf_text(data: bytes) -> str:
 
 
 def quote_context(msg: Message) -> str:
-    """لو المستخدم رد على رسالة، نعطي الموديل المقطع اللي رد عليه."""
+    """If the user replied to a message, give the model the part they replied to."""
     replied = msg.reply_to_message
     if not replied:
         return ""
@@ -1338,7 +1349,7 @@ def quote_context(msg: Message) -> str:
         return ""
     if len(quoted) > 1500:
         quoted = quoted[:1500] + "…"
-    return f"[المستخدم يرد على هذا المقطع: «{quoted}»]\n"
+    return f"[The user is replying to this part: \"{quoted}\"]\n"
 
 
 def build_turn(items: list[Item], owner: bool) -> Turn | str | None:
@@ -1348,7 +1359,7 @@ def build_turn(items: list[Item], owner: bool) -> Turn | str | None:
         try:
             overrides, text = split_overrides(text)
         except ValueError as e:
-            return f"إعداد غلط في الرسالة: {e}"
+            return f"Invalid setting in the message: {e}"
     images = [u for it in items for u in it.images]
     files = [f for it in items for f in it.files]
     notes = [n for it in items for n in it.notes]
@@ -1357,36 +1368,36 @@ def build_turn(items: list[Item], owner: bool) -> Turn | str | None:
     agent_turn = owner and cfg("agent_mode")
     prefix = quote_context(items[0].msg)
     if notes:
-        prefix += "".join(f"[📎 المالك رفع للمشروع: {n}]\n" for n in notes)
-    mentions = mention_files(text) if agent_turn and text else ""  # للموديل بس، ما ينحفظ بالذاكرة
-    file_blocks = "".join(f"📎 الملف: {name}\n```\n{body[:MAX_FILE_CHARS]}\n```\n\n" for name, body in files)
+        prefix += "".join(f"[📎 The owner uploaded to the project: {n}]\n" for n in notes)
+    mentions = mention_files(text) if agent_turn and text else ""  # for the model only, not saved in memory
+    file_blocks = "".join(f"📎 File: {name}\n```\n{body[:MAX_FILE_CHARS]}\n```\n\n" for name, body in files)
     full = prefix + mentions + file_blocks + text
     content: object = full
     if images:
-        content = [{"type": "text", "text": full or "وش تشوف في الصورة؟"}] + \
+        content = [{"type": "text", "text": full or "What do you see in this image?"}] + \
                   [{"type": "image_url", "image_url": {"url": u}} for u in images]
-    if agent_turn:  # الملف محفوظ في المشروع — الذاكرة تحتاج اسمه بس
-        saved = "".join(f"📎 الملف: {n}\n" for n, _ in files)
+    if agent_turn:  # the file is saved in the project — memory only needs its name
+        saved = "".join(f"📎 File: {n}\n" for n, _ in files)
     else:
-        saved = "".join(f"📎 الملف: {n}\n```\n{b[:20_000]}\n```\n\n" for n, b in files)
-    history_text = prefix + "".join("[🖼 صورة] " for _ in images) + saved + text
+        saved = "".join(f"📎 File: {n}\n```\n{b[:20_000]}\n```\n\n" for n, b in files)
+    history_text = prefix + "".join("[🖼 image] " for _ in images) + saved + text
     if agent_turn and THINK_HARDER.search(text) and "effort" not in overrides:
-        overrides["effort"] = "max"  # «ultrathink» / «فكر بعمق» مثل Claude Code
+        overrides["effort"] = "max"  # "ultrathink" / "think hard", like Claude Code
     return Turn(user_msg_id=items[-1].msg.message_id, content=content, history_text=history_text.strip(),
                 overrides=overrides, user_id=items[0].msg.from_user.id if items[0].msg.from_user else None,
                 mode="agent" if agent_turn else "chat", project=current_project() if agent_turn else "")
 
 
-THINK_HARDER = re.compile(r"ultrathink|think\s+(very\s+)?hard|فكر\s*(بعمق|زين|كويس)|فكّر\s*(بعمق|زين)", re.I)
+THINK_HARDER = re.compile(r"ultrathink|think\s+(very\s+|really\s+)?(hard|harder|deeply)", re.I)
 _MENTION = re.compile(r"(?<![\w@])@([\w./\-]+\.[\w]+|[\w.\-]+/[\w./\-]*)")
 
 
 def mention_files(text: str) -> str:
-    """@مسار داخل الرسالة (وضع الوكلاء) → نرفق محتوى الملف، أو شجرة المجلد، مثل Claude Code."""
+    """@path inside a message (coding mode) → attach the file content, or the folder listing, like Claude Code."""
     ws = get_ws()
     out, used = [], 0
     for m in _MENTION.finditer(text):
-        path = m.group(1).rstrip(".,،")
+        path = m.group(1).rstrip(".,\u060c")
         try:
             full = ws.resolve(path)
         except WorkspaceError:
@@ -1400,11 +1411,11 @@ def mention_files(text: str) -> str:
         if used + len(body) > 40_000:
             break
         used += len(body)
-        out.append(f"[محتوى @{path}]\n{body}\n")
+        out.append(f"[Content of @{path}]\n{body}\n")
     return "".join(out)
 
 
-pending: dict[int, dict] = {}  # رسائل تنتظر بقية أجزائها
+pending: dict[int, dict] = {}  # messages waiting for their remaining parts
 
 
 async def process_items(bot, chat_id: int, items: list[Item]) -> None:
@@ -1413,7 +1424,7 @@ async def process_items(bot, chat_id: int, items: list[Item]) -> None:
     if turn is None:
         return
     if isinstance(turn, str):
-        await send_html(bot, chat_id, RLM + "⚠️ " + esc(turn))
+        await send_html(bot, chat_id, "⚠️ " + esc(turn))
         return
     await generate(bot, chat_id, turn)
 
@@ -1439,25 +1450,35 @@ async def on_user_message(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         item = await build_item(msg, context.bot, get_ws() if agent_on else None)
     except Exception:
         log.exception("download failed")
-        item = "ما قدرت أحمّل الملف، جرّب مرة ثانية."
+        item = "I couldn't download the file — please try again."
     if isinstance(item, str):
-        await send_html(context.bot, chat_id, RLM + "⚠️ " + esc(item))
+        await send_html(context.bot, chat_id, "⚠️ " + esc(item))
         return
     if username := context.bot.username:
         item.text = re.sub(rf"@{re.escape(username)}\b", "", item.text, flags=re.I).strip()
-    if is_owner(update):  # نوسّع اختصارات المالك (!اسم) قبل الإرسال للموديل
+    if is_owner(update):  # expand the owner's snippets (!name) before sending to the model
         item.text = expand_snippets(item.text)
 
-    # ألبوم صور أو رسالة طويلة انقسمت: ننتظر شوي ونجمعها في رسالة وحدة
+    # a photo album or a long message Telegram split: wait a moment and merge into one
     entry = pending.get(chat_id)
     looks_split = msg.media_group_id is not None or len(msg.text or "") >= 3500
 
-    # وضع الوكلاء شغّال على طلب: رسالة نصية من المالك = توجيه يوصل للقائد بالجولة الجاية (مثل Claude Code)
+    # Coding mode shortcuts (like Claude Code): "$ cmd" runs a shell command, "# note" saves to project memory
+    plain = item.text and not (item.images or item.files or item.notes) and not entry and not looks_split
+    if agent_on and plain and item.text.startswith("$ "):
+        await run_shell(context.bot, chat_id, item.text[2:].strip())
+        return
+    if agent_on and plain and item.text.startswith("# ") and "\n" not in item.text.strip():
+        add_memory(item.text[2:])
+        await send_html(context.bot, chat_id, "🧠 Saved to project memory (AGENTS.md).")
+        return
+
+    # coding mode is working on a request: a text message from the owner = steering for the lead's next step (like Claude Code)
     running = active.get(chat_id)
     if (running is not None and running.board is not None and is_owner(update) and not running.finishing
             and item.text and not (item.images or item.files or item.notes) and not entry and not looks_split):
         running.inbox.append(item.text)
-        await send_html(context.bot, chat_id, RLM + "📨 <i>وصلت — بيشوفها القائد بالخطوة الجاية بدون ما يوقف الشغل.</i>")
+        await send_html(context.bot, chat_id, "📨 <i>Got it — the lead will see it at the next step, without stopping the work.</i>")
         return
     if entry or looks_split:
         if entry:
@@ -1471,7 +1492,7 @@ async def on_user_message(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
 
 async def on_edited_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """المستخدم عدّل رسالته الأخيرة: نرد عليها من جديد (مثل تطبيقات الذكاء الاصطناعي)."""
+    """The user edited their latest message: answer it again (like AI apps do)."""
     msg = update.edited_message
     if not msg or not msg.text:
         return
@@ -1484,13 +1505,13 @@ async def on_edited_message(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         await redo(context.bot, msg.chat_id, msg.message_id, replacement=new)
 
 
-# ================= الأزرار =================
+# ================= Buttons =================
 
 async def on_stop(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     q = update.callback_query
     ui = active.get(q.message.chat_id) if q.message else None
     if ui and q.message.message_id in ui.message_ids() and ui.stop():
-        await q.answer("⏹ تم الإيقاف")
+        await q.answer("⏹ Stopped")
     else:
         await q.answer()
 
@@ -1499,13 +1520,13 @@ async def on_regen(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     q = update.callback_query
     chat_id = q.message.chat_id
     if chat_id in active:
-        await q.answer("استنى يخلص الرد الحالي")
+        await q.answer("Wait for the current reply to finish")
         return
     turn = last_turn.get(chat_id)
     if not turn or q.message.message_id not in turn.response_ids:
-        await q.answer("أقدر أعيد توليد آخر رد بس")
+        await q.answer("I can only regenerate the latest reply")
         return
-    await q.answer("🔄 جاري إعادة التوليد")
+    await q.answer("🔄 Regenerating")
     await redo(context.bot, chat_id, turn.user_msg_id)
 
 
@@ -1513,49 +1534,49 @@ async def on_full_thinking(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     q = update.callback_query
     text = think_store.get(q.data.split(":", 1)[1])
     if not text:
-        await q.answer("التفكير الكامل ما عاد محفوظ", show_alert=True)
+        await q.answer("The full thinking is no longer stored", show_alert=True)
         return
     await q.answer()
-    msg = await context.bot.send_document(q.message.chat_id, InputFile(io.BytesIO(text.encode()), filename="التفكير.txt"),
-                                          caption="💭 سلسلة التفكير كاملة")
+    msg = await context.bot.send_document(q.message.chat_id, InputFile(io.BytesIO(text.encode()), filename="thinking.txt"),
+                                          caption="💭 The full chain of thought")
     track(q.message.chat_id, msg.message_id)
 
 
-# ================= الأوامر =================
+# ================= Commands =================
 
 def welcome_html(owner: bool) -> str:
     text = lines_html(
-        "✨ <b>أهلاً فيك!</b>",
-        "اكتب أي شي وأنا حاضر.",
+        "✨ <b>Welcome!</b>",
+        "Write anything — I'm here.",
         "",
-        "<b>وش تقدر تسوي:</b>",
-        "• تشوف تفكيري والرد وهو ينكتب قدامك",
-        "• أبحث لك في الإنترنت 🔎 وأعطيك المصادر",
-        "• ترسل لي صور 🖼 أو ملفات 📎 (PDF ونصوص)",
-        "• توقف الرد ⏹ أو تعيد توليده 🔄",
-        "• تعدّل رسالتك ✏️ وأرد عليها من جديد",
-        "• ترد على أي رسالة عشان تسألني عنها",
+        "<b>What you can do:</b>",
+        "• Watch my thinking and the reply being written live",
+        "• I search the web for you 🔎 and give you the sources",
+        "• Send me images 🖼 or files 📎 (PDF and text)",
+        "• Stop a reply ⏹ or regenerate it 🔄",
+        "• Edit your message ✏️ and I answer it again",
+        "• Reply to any message to ask me about it",
         "",
-        f"<b>{NEW_CHAT_BTN}</b> تحت أو /new — يبدأ من الصفر (الرسائل القديمة تبقى في الشات).",
+        f"<b>{NEW_CHAT_BTN}</b> below or /new — starts fresh (old messages stay in the chat).",
     )
     if owner:
-        gh = ("• 🐙 متصل بـ GitHub — أعطني أمر وأكتب/أعدّل/أنشئ مباشرة (مستودعات، ملفات، فروع، PR)"
+        gh = ("• 🐙 Connected to GitHub — give me an order and I write/edit/create directly (repos, files, branches, PRs, CI)"
               if github_tools.enabled() else
-              "• 🐙 GitHub غير مربوط — أضف السر GH_PAT لأقدر أكتب وأعدّل على مستودعاتك")
+              "• 🐙 GitHub not connected — add the GH_PAT secret so I can write and edit your repositories")
         text += "\n\n" + lines_html(
-            "👑 <b>أوامر المالك</b>",
-            "• /setpersona — تحديد الهوية · /persona — عرضها",
-            "• /setrules — تعديل قواعد القفل · /rules — عرضها",
-            "• /snip <code>اسم نص</code> — حفظ اختصار، وبعدها اكتب <code>!اسم</code> بأي رسالة · /snippets",
-            "• /settings — لوحة التحكم",
-            "• /set <code>إعداد قيمة</code> — مثل <code>/set temperature 0.7</code>",
-            "• /resetall — مسح ذاكرة كل المحادثات",
-            "• إعدادات لرسالة وحدة: <code>effort=max web_search=off سؤالك</code>",
+            "👑 <b>Owner commands</b>",
+            "• /setpersona — set the persona · /persona — show it",
+            "• /setrules — edit the lock rules · /rules — show them",
+            "• /snip <code>name text</code> — save a snippet, then write <code>!name</code> in any message · /snippets",
+            "• /settings — the control panel",
+            "• /set <code>setting value</code> — e.g. <code>/set temperature 0.7</code>",
+            "• /resetall — wipe the memory of every chat",
+            "• Settings for one message: <code>effort=max web_search=off your question</code>",
             gh,
             "",
-            "💻 <b>وضع البرمجة</b> (مثل Claude Code) — /code",
-            "القائد يخطط ويوزّع الشغل على وكلاء بالتوازي، يكتب ويشغّل ويختبر داخل مشروع حقيقي،",
-            "ويتحكم بـ GitHub ويتابع CI ويصلّح الأخطاء. /project /files /zip /undo /sh /watch /plan /cost",
+            "💻 <b>Coding mode</b> (like Claude Code) — /code",
+            "The lead plans and splits work across parallel agents, writes, runs and tests inside a real project,",
+            "controls GitHub, watches CI and fixes failures. /project /files /zip /undo /sh /watch /plan /cost",
         )
     return text
 
@@ -1570,35 +1591,35 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def cmd_new(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """محادثة جديدة: البوت ينسى كل شي صار قبل، والرسائل القديمة تبقى في الشات مثل ما هي."""
+    """New chat: the bot forgets everything before, and the old messages stay in the chat as they are."""
     chat_id = update.effective_chat.id
     ui = active.get(chat_id)
     if ui:
         ui.stop()
     pending.pop(chat_id, None)
     async with chat_locks[chat_id]:
-        await drop_old_buttons(context.bot, chat_id)  # زر 🔄 القديم ما عاد يخص المحادثة الجديدة
+        await drop_old_buttons(context.bot, chat_id)  # the old 🔄 button no longer belongs to the new chat
         last_turn.pop(chat_id, None)
         if is_owner(update) and cfg("agent_mode"):
             agent_histories.pop(agent_key(chat_id, current_project()), None)
             save_agent_histories()
             await send_html(context.bot, chat_id, lines_html(
-                "✨ <b>جلسة برمجة جديدة</b>",
-                f"ملفات المشروع <code>{esc(current_project())}</code> وسجله المختصر باقية — بس المحادثة بدأت من جديد.",
+                "✨ <b>New coding session</b>",
+                f"The files of project <code>{esc(current_project())}</code> and its journal are kept — only the conversation starts over.",
             ), main_keyboard(True))
             return
         histories.pop(chat_id, None)
         save_histories()
         await send_html(context.bot, chat_id, lines_html(
-            "✨ <b>محادثة جديدة</b>",
-            "بدأنا من الصفر — ما أتذكر أي شي من المحادثة اللي قبل.",
+            "✨ <b>New chat</b>",
+            "Starting fresh — I don't remember anything from the previous conversation.",
         ), main_keyboard(is_owner(update)))
 
 
 async def owner_only(update: Update, context) -> bool:
     if is_owner(update):
         return True
-    await send_html(context.bot, update.effective_chat.id, RLM + "🔒 هذا الأمر لصاحب البوت فقط.")
+    await send_html(context.bot, update.effective_chat.id, "🔒 This command is for the bot owner only.")
     return False
 
 
@@ -1610,18 +1631,18 @@ async def cmd_resetall(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     agent_histories.clear()
     save_agent_histories()
     last_turn.clear()
-    await send_html(context.bot, update.effective_chat.id, RLM + "🧹 <b>انمسحت ذاكرة كل المحادثات.</b>")
+    await send_html(context.bot, update.effective_chat.id, "🧹 <b>The memory of every chat was wiped.</b>")
 
 
-# ----- الهوية -----
+# ----- Persona -----
 
-capture: dict[int, dict] = {}  # وضع إدخال الهوية على عدة رسائل
-PERSONA_KB = InlineKeyboardMarkup([[InlineKeyboardButton("✅ حفظ", callback_data="persona:save"),
-                                    InlineKeyboardButton("✖️ إلغاء", callback_data="persona:cancel")]])
+capture: dict[int, dict] = {}  # persona input mode across several messages
+PERSONA_KB = InlineKeyboardMarkup([[InlineKeyboardButton("✅ Save", callback_data="persona:save"),
+                                    InlineKeyboardButton("✖️ Cancel", callback_data="persona:cancel")]])
 
 
 def after_command(text: str) -> str:
-    """النص بعد الأمر بالضبط (نشيل بس المسافة اللي بعد الأمر)."""
+    """The exact text after the command (only the space after the command is removed)."""
     m = re.match(r"^/\S+", text)
     rest = text[m.end():] if m else text
     return rest[1:] if rest[:1] in (" ", "\n", "\t") else rest
@@ -1629,15 +1650,15 @@ def after_command(text: str) -> str:
 
 async def read_persona_file(doc, bot) -> str:
     if doc.file_size and doc.file_size > 2 * 1024 * 1024:
-        raise ValueError("الملف كبير (الحد 2 ميقا)")
+        raise ValueError("The file is too big (limit 2 MB)")
     text = decode_text(await download(bot, doc.file_id))
     if text is None:
-        raise ValueError("ما قدرت أقرأ الملف — لازم يكون نص (txt) بترميز UTF-8")
+        raise ValueError("I couldn't read the file — it must be text (txt) in UTF-8")
     return text
 
 
-# "الهدف" للتعديل: الهوية (persona) أو قواعد القفل (rules) — نفس آلية الإدخال لهما
-TARGET_LABEL = {"persona": "الهوية", "rules": "قواعد القفل"}
+# the edit "target": the persona or the lock rules — both use the same input flow
+TARGET_LABEL = {"persona": "persona", "rules": "lock rules"}
 TARGET_VIEW = {"persona": "/persona", "rules": "/rules"}
 
 
@@ -1651,16 +1672,16 @@ def load_target(target: str) -> str:
 
 async def store_control(bot, chat_id: int, text: str, target: str) -> None:
     _save_target(target, text)
-    if target == "persona":  # الهوية الجديدة ما تتأثر بكلام قديم
+    if target == "persona":  # a new persona isn't influenced by old conversation
         histories.clear()
         save_histories()
         last_turn.clear()
     label = TARGET_LABEL[target]
     lines = text.count("\n") + 1
     await send_html(bot, chat_id, lines_html(
-        f"✅ <b>انحفظت {label} حرف بحرف</b>",
-        f"📏 {len(text):,} حرف · {lines:,} سطر",
-        f"تقدر تتأكد منها بـ {TARGET_VIEW[target]} (ترسل لك نسخة ملف طبق الأصل).",
+        f"✅ <b>The {label} were saved exactly, character for character</b>" if target == "rules" else f"✅ <b>The {label} was saved exactly, character for character</b>",
+        f"📏 {len(text):,} characters · {lines:,} lines",
+        f"You can check it with {TARGET_VIEW[target]} (it sends you an exact file copy).",
     ))
 
 
@@ -1673,12 +1694,12 @@ def capture_text(parts: list[str], target: str, note: str = "") -> str:
     label = TARGET_LABEL[target]
     chars = sum(len(p) for p in parts)
     lines = [
-        f"📝 <b>وضع إدخال {label}</b>",
-        note or f"أرسل {label} الحين: رسالة وحدة، أو عدة رسائل، أو ملف <code>.txt</code>.",
-        "كل حرف ينحفظ مثل ما هو بالضبط. للنصوص الطويلة جداً الأفضل ملف <code>.txt</code>.",
+        f"📝 <b>{label.capitalize()} input mode</b>",
+        note or f"Send the {label} now: one message, several messages, or a <code>.txt</code> file.",
+        "Every character is saved exactly as is. For very long texts a <code>.txt</code> file is best.",
         "",
-        f"📥 استلمت: <b>{len(parts)}</b> جزء · <b>{chars:,}</b> حرف",
-        "لما تخلص اضغط ✅ حفظ (أو اكتب /done).",
+        f"📥 Received: <b>{len(parts)}</b> parts · <b>{chars:,}</b> characters",
+        "When you're done, tap ✅ Save (or send /done).",
     ]
     return lines_html(*lines)
 
@@ -1697,8 +1718,8 @@ async def set_control(update: Update, context: ContextTypes.DEFAULT_TYPE, target
         if doc:
             await store_control(bot, chat_id, await read_persona_file(doc, bot), target)
         elif rest.strip():
-            if len(raw) >= 3900:  # تليجرام قسم الرسالة — ننتظر بقية الأجزاء
-                await start_capture(bot, chat_id, [rest], target, f"{label} طويلة وتليجرام قسمها. أرسل بقية الأجزاء لو فيه.")
+            if len(raw) >= 3900:  # Telegram split the message — wait for the remaining parts
+                await start_capture(bot, chat_id, [rest], target, f"The {label} is long and Telegram split it. Send the remaining parts, if any.")
             else:
                 await store_control(bot, chat_id, rest, target)
         elif replied and (replied.text or replied.caption):
@@ -1706,7 +1727,7 @@ async def set_control(update: Update, context: ContextTypes.DEFAULT_TYPE, target
         else:
             await start_capture(bot, chat_id, [], target)
     except ValueError as e:
-        await send_html(bot, chat_id, RLM + "⚠️ " + esc(str(e)))
+        await send_html(bot, chat_id, "⚠️ " + esc(str(e)))
 
 
 async def cmd_setpersona(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1727,21 +1748,21 @@ async def finish_capture(bot, chat_id: int, save: bool) -> None:
         with contextlib.suppress(TelegramError):
             await state["prompt"].edit_reply_markup(None)
     if not save:
-        await send_html(bot, chat_id, RLM + f"✖️ تم إلغاء تغيير {label}.")
+        await send_html(bot, chat_id, f"✖️ Changing the {label} was cancelled.")
     elif not state["parts"]:
-        await send_html(bot, chat_id, RLM + f"⚠️ ما وصلني أي نص، {label} ما تغيّرت.")
+        await send_html(bot, chat_id, f"⚠️ I didn't receive any text — the {label} stayed the same.")
     else:
         await store_control(bot, chat_id, "\n".join(state["parts"]), target)
 
 
 async def capture_messages(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """يلتقط رسائل الهوية قبل أي شي ثاني (حتى لو بدأت بـ /)."""
+    """Captures persona messages before anything else (even if they start with /)."""
     msg = update.message
     if not msg or msg.chat_id not in capture or not is_owner(update):
         return
     text = msg.text
     track(msg.chat_id, msg.message_id)
-    if text in ("/done", "/save", "/تم"):
+    if text in ("/done", "/save"):
         await finish_capture(context.bot, msg.chat_id, True)
         raise ApplicationHandlerStop
     if text == "/cancel":
@@ -1760,10 +1781,10 @@ async def capture_messages(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         elif msg.caption:
             part = msg.caption
         else:
-            await send_html(context.bot, msg.chat_id, RLM + "⚠️ أرسل نص أو ملف .txt")
+            await send_html(context.bot, msg.chat_id, "⚠️ Send text or a .txt file")
             raise ApplicationHandlerStop
     except ValueError as e:
-        await send_html(context.bot, msg.chat_id, RLM + "⚠️ " + esc(str(e)))
+        await send_html(context.bot, msg.chat_id, "⚠️ " + esc(str(e)))
         raise ApplicationHandlerStop from None
     state["parts"].append(part)
     if state.get("prompt"):
@@ -1777,7 +1798,7 @@ async def capture_messages(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 async def on_persona_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     q = update.callback_query
     if not is_owner(update):
-        await q.answer("لصاحب البوت فقط", show_alert=True)
+        await q.answer("Owner only", show_alert=True)
         return
     await q.answer()
     await finish_capture(context.bot, q.message.chat_id, q.data == "persona:save")
@@ -1791,16 +1812,16 @@ async def view_control(update: Update, context: ContextTypes.DEFAULT_TYPE, targe
     label = TARGET_LABEL[target]
     p = load_target(target)
     await send_html(bot, chat_id, lines_html(
-        f"📜 <b>{label} الحالية</b>",
-        f"📏 {len(p):,} حرف · {p.count(chr(10)) + 1:,} سطر",
+        f"📜 <b>Current {label}</b>",
+        f"📏 {len(p):,} characters · {p.count(chr(10)) + 1:,} lines",
     ))
-    for i in range(0, len(p), 4000):  # النص نفسه بدون أي تنسيق
+    for i in range(0, len(p), 4000):  # the text itself, without any formatting
         with contextlib.suppress(TelegramError):
             m = await bot.send_message(chat_id, p[i : i + 4000] or "—", link_preview_options=NO_PREVIEW)
             track(chat_id, m.message_id)
     fname = "persona.txt" if target == "persona" else "rules.txt"
     m = await bot.send_document(chat_id, InputFile(io.BytesIO(p.encode("utf-8")), filename=fname),
-                                caption=f"📄 نسخة طبق الأصل من {label}")
+                                caption=f"📄 An exact copy of the {label}")
     track(chat_id, m.message_id)
 
 
@@ -1813,7 +1834,7 @@ async def cmd_rules(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def cmd_settitle(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """X-Title اللي ينرسل لـ OpenRouter. ينحفظ مشفّر — ما يظهر في المستودع."""
+    """The X-Title sent to OpenRouter. Stored encrypted — it never appears in the repository."""
     if not await owner_only(update, context):
         return
     chat_id = update.effective_chat.id
@@ -1821,25 +1842,25 @@ async def cmd_settitle(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     raw = after_command(update.message.text or "").strip()
     if not raw:
         await send_html(context.bot, chat_id, lines_html(
-            "الاستخدام: <code>/settitle اسم التطبيق</code> (بالإنجليزي)",
-            "ولإيقافه: <code>/settitle off</code>",
+            "Usage: <code>/settitle App Name</code> (Latin characters)",
+            "To turn it off: <code>/settitle off</code>",
         ))
         return
-    if raw.lower() in ("off", "none", "remove", "حذف", "ايقاف", "إيقاف"):
+    if raw.lower() in ("off", "none", "remove"):
         save_title("")
-        await send_html(context.bot, chat_id, RLM + "🗑 انشال X-Title — ما عاد ينرسل.")
+        await send_html(context.bot, chat_id, "🗑 X-Title removed — it's no longer sent.")
         return
-    title = " ".join(raw.split())  # سطر واحد بدون فواصل أسطر
+    title = " ".join(raw.split())  # one line, no line breaks
     if not title.isascii():
         await send_html(context.bot, chat_id, lines_html(
-            "⚠️ X-Title لازم يكون <b>بالإنجليزي</b> (حروف وأرقام ورموز).",
-            "ترويسات HTTP ما تقبل الحروف العربية، والطلب بيفشل لو انكتب بالعربي.",
+            "⚠️ X-Title must use <b>Latin characters</b> (letters, digits and symbols).",
+            "HTTP headers don't accept non-ASCII characters, so requests would fail.",
         ))
         return
     save_title(title[:100])
-    note = "🔒 محفوظ مشفّر" if vault.enabled() else "⚠️ غير مشفّر — أضف PERSONA_KEY عشان ينحفظ مشفّر"
+    note = "🔒 Stored encrypted" if vault.enabled() else "⚠️ Not encrypted — add PERSONA_KEY to store it encrypted"
     await send_html(context.bot, chat_id, lines_html(
-        f"✅ انحفظ X-Title: <code>{esc(title[:100])}</code>",
+        f"✅ X-Title saved: <code>{esc(title[:100])}</code>",
         note,
     ))
 
@@ -1850,18 +1871,18 @@ async def cmd_title(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     chat_id = update.effective_chat.id
     track(chat_id, update.message.message_id)
     t = load_title()
-    await send_html(context.bot, chat_id, RLM + (f"🏷 X-Title الحالي: <code>{esc(t)}</code>" if t
-                                                  else "🏷 ما فيه X-Title (ما ينرسل). حدّده بـ /settitle"))
+    await send_html(context.bot, chat_id, (f"🏷 Current X-Title: <code>{esc(t)}</code>" if t
+                                                  else "🏷 No X-Title (nothing is sent). Set one with /settitle"))
 
 
-# ----- الاختصارات (جمل/ملفات محفوظة) -----
+# ----- Snippets (saved text/files) -----
 
-SNIP_NAME = re.compile(r"[\w؀-ۿ][\w؀-ۿ-]{0,39}")
+SNIP_NAME = re.compile(r"\w[\w-]{0,39}")  # \w covers letters of every script
 MAX_SNIPPET = 100_000
 
 
 def expand_snippets(text: str) -> str:
-    """يستبدل !الاسم بالنص/الملف المحفوظ. يستبدل المعروف فقط، والباقي يبقى مثل ما هو."""
+    """Replaces !name with the saved text/file. Only known names are replaced; the rest stays as it is."""
     snips = load_snippets()
     if not snips or "!" not in text:
         return text
@@ -1871,14 +1892,14 @@ def expand_snippets(text: str) -> str:
         if not s:
             return m.group(0)
         if s.get("type") == "file":
-            return f"\n[ملف محفوظ: {s.get('filename') or m.group(1)}]\n{s.get('content', '')}\n"
+            return f"\n[Saved file: {s.get('filename') or m.group(1)}]\n{s.get('content', '')}\n"
         return s.get("content", "")
 
     return re.sub(r"!(" + SNIP_NAME.pattern + r")", repl, text)
 
 
 async def cmd_snip(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """حفظ اختصار: /snip اسم نص... — أو رد على رسالة/ملف بـ /snip اسم."""
+    """Save a snippet: /snip name text... — or reply to a message/file with /snip name."""
     if not await owner_only(update, context):
         return
     msg, bot, chat_id = update.message, context.bot, update.effective_chat.id
@@ -1887,9 +1908,9 @@ async def cmd_snip(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     parts = rest.split(maxsplit=1)
     if not parts or not SNIP_NAME.fullmatch(parts[0]):
         await send_html(bot, chat_id, lines_html(
-            "الاستخدام: <code>/snip اسم النص</code>",
-            "أو رد على رسالة أو ملف بـ <code>/snip اسم</code>.",
-            "بعدها اكتب <code>!اسم</code> داخل أي رسالة وأنا أفهم إنك تقصده.",
+            "Usage: <code>/snip name text</code>",
+            "Or reply to a message or a file with <code>/snip name</code>.",
+            "Then write <code>!name</code> in any message and I'll know what you mean.",
         ))
         return
     name = parts[0]
@@ -1904,19 +1925,19 @@ async def cmd_snip(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         elif replied and (replied.text or replied.caption):
             content, typ, fname = (replied.text or replied.caption), "text", None
         else:
-            await send_html(bot, chat_id, RLM + "⚠️ اكتب النص بعد الاسم، أو رد على رسالة/ملف.")
+            await send_html(bot, chat_id, "⚠️ Write the text after the name, or reply to a message/file.")
             return
     except ValueError as e:
-        await send_html(bot, chat_id, RLM + "⚠️ " + esc(str(e)))
+        await send_html(bot, chat_id, "⚠️ " + esc(str(e)))
         return
     snips = load_snippets()
     snips[name] = {"type": typ, "content": content[:MAX_SNIPPET], "filename": fname}
     save_snippets(snips)
-    kind = "ملف" if typ == "file" else "نص"
+    kind = "file" if typ == "file" else "text"
     await send_html(bot, chat_id, lines_html(
-        f"✅ انحفظ الاختصار <code>!{esc(name)}</code> ({kind})",
-        f"📏 {len(content):,} حرف",
-        f"استخدمه بكتابة <code>!{esc(name)}</code> داخل أي رسالة.",
+        f"✅ Snippet <code>!{esc(name)}</code> saved ({kind})",
+        f"📏 {len(content):,} characters",
+        f"Use it by writing <code>!{esc(name)}</code> in any message.",
     ))
 
 
@@ -1928,16 +1949,16 @@ async def cmd_snippets(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     snips = load_snippets()
     if not snips:
         await send_html(context.bot, chat_id, lines_html(
-            "ما فيه اختصارات بعد.",
-            "أضف واحد: <code>/snip اسم النص</code>، وبعدها اكتب <code>!اسم</code> في رسالتك.",
+            "No snippets yet.",
+            "Add one: <code>/snip name text</code>, then write <code>!name</code> in your message.",
         ))
         return
-    rows = ["🔖 <b>الاختصارات</b>", ""]
+    rows = ["🔖 <b>Snippets</b>", ""]
     for name, s in snips.items():
         kind = "📎" if s.get("type") == "file" else "📝"
         preview = " ".join((s.get("content") or "").split())[:40]
         rows.append(f"{kind} <code>!{esc(name)}</code> — {esc(preview)}")
-    rows += ["", "للحذف: <code>/delsnip اسم</code>"]
+    rows += ["", "To delete: <code>/delsnip name</code>"]
     await send_html(context.bot, chat_id, lines_html(*rows))
 
 
@@ -1951,15 +1972,15 @@ async def cmd_delsnip(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     if name in snips:
         del snips[name]
         save_snippets(snips)
-        await send_html(context.bot, chat_id, RLM + f"🗑 انحذف الاختصار <code>!{esc(name)}</code>")
+        await send_html(context.bot, chat_id, f"🗑 Snippet <code>!{esc(name)}</code> deleted")
     else:
-        await send_html(context.bot, chat_id, RLM + "⚠️ ما فيه اختصار بهذا الاسم. شوف /snippets")
+        await send_html(context.bot, chat_id, "⚠️ No snippet with that name. See /snippets")
 
 
-# ----- الإعدادات -----
+# ----- Settings -----
 
 def mode_params(mode: str) -> list[str]:
-    """إعدادات النسخة: المحادثة أو البرمجة (المشتركة global ما تنعرض كإعداد)."""
+    """A version's settings: Chat or Coding (shared global ones aren't listed as settings)."""
     want = "code" if mode == "agent" else "chat"
     return [k for k in PARAMS if want in config.PARAM_MODES.get(k, ("chat", "code"))]
 
@@ -1972,26 +1993,26 @@ def settings_html(mode: str = "chat") -> str:
     def show(k):
         v = cfg(k, mode)
         if v is None or v == "default":
-            return "<i>افتراضي</i>"
+            return "<i>default</i>"
         if isinstance(v, bool):
             return "✅" if v else "❌"
         if k in ("provider", "worker_provider") and v == "any":
-            return "<i>أي مزود (مع بديل تلقائي)</i>"
+            return "<i>any provider (with automatic fallback)</i>"
         return f"<code>{esc(str(v))}</code>"
 
-    title = "💻 <b>إعدادات وضع البرمجة</b>" if mode == "agent" else "⚙️ <b>الإعدادات</b>"
+    title = "💻 <b>Coding mode settings</b>" if mode == "agent" else "⚙️ <b>Settings</b>"
     rows = [title, ""]
     rows += [f"• <b>{param_label(k, mode)}:</b> {show(k)}" for k in mode_params(mode)]
-    rows += [f"• <b>GitHub:</b> {'✅ متصل' if github_tools.enabled() else '❌ غير مربوط (أضف GH_PAT)'}"]
+    rows += [f"• <b>GitHub:</b> {'✅ connected' if github_tools.enabled() else '❌ not connected (add GH_PAT)'}"]
     if mode == "agent":
-        rows += [f"• <b>📁 المشروع الحالي:</b> <code>{esc(current_project())}</code>",
-                 "", "<i>إعدادات البرمجة مستقلة عن المحادثة — تعديل وحدة ما يأثر على الثانية.</i>"]
-    rows += ["", "<i>للأرقام:</i> <code>/set temperature 0.7</code> · <code>/set max_tokens 2000</code> · <code>/set top_p off</code>"]
+        rows += [f"• <b>📁 Current project:</b> <code>{esc(current_project())}</code>",
+                 "", "<i>Coding settings are independent of Chat — changing one never affects the other.</i>"]
+    rows += ["", "<i>Numbers:</i> <code>/set temperature 0.7</code> · <code>/set max_tokens 2000</code> · <code>/set top_p off</code>"]
     return lines_html(*rows)
 
 
 def settings_keyboard(mode: str = "chat") -> InlineKeyboardMarkup:
-    tag = "cset" if mode == "agent" else "set"   # الزر يعرف أي نسخة يعدّل حتى لو تغيّر الوضع بعدين
+    tag = "cset" if mode == "agent" else "set"   # the button knows which version it edits, even if the mode changes later
 
     def btn(label, key, value, current):
         return InlineKeyboardButton(("● " if current == value else "") + label, callback_data=f"{tag}:{key}:{value}")
@@ -2006,32 +2027,34 @@ def settings_keyboard(mode: str = "chat") -> InlineKeyboardMarkup:
     e, prov = cfg("effort", mode), cfg("provider", mode)
     if mode != "agent":
         return InlineKeyboardMarkup([
-            head("🧠 مستوى التفكير:"),
-            [btn({"default": "افتراضي"}.get(x, x), "effort", x, e) for x in EFFORTS],
-            head("🔌 المزود:"),
+            head("🧠 Reasoning effort:"),
+            [btn({"default": "default"}.get(x, x), "effort", x, e) for x in EFFORTS],
+            head("🔌 Provider:"),
             [btn(p.split("/")[0], "provider", p, prov) for p in PROVIDERS],
-            [btn("الاثنين", "provider", ",".join(PROVIDERS), prov), btn("أي مزود", "provider", "any", prov)],
-            [toggle("التفكير", "show_thinking"), toggle("البحث", "web_search")],
-            [toggle("الردود الطويلة كصفحة", "long_pages")],
-            [toggle("ملف txt بعد كل رد", "export_txt")],
-            [InlineKeyboardButton("💻 التحويل لوضع البرمجة", callback_data="set:agent_mode:on")],
+            [btn("Both", "provider", ",".join(PROVIDERS), prov), btn("Any provider", "provider", "any", prov)],
+            [toggle("Thinking", "show_thinking"), toggle("Web search", "web_search")],
+            [toggle("Long replies as a page", "long_pages")],
+            [toggle("txt file after each reply", "export_txt")],
+            [InlineKeyboardButton("💻 Switch to Coding mode", callback_data="set:agent_mode:on")],
         ])
     wp = cfg("worker_provider", mode)
     return InlineKeyboardMarkup([
-        head("🧠 تفكير القائد:"),
-        [btn({"default": "افتراضي"}.get(x, x), "effort", x, e) for x in EFFORTS],
-        head("🔌 مزود القائد:"),
+        head("🧠 Lead reasoning:"),
+        [btn({"default": "default"}.get(x, x), "effort", x, e) for x in EFFORTS],
+        head("🔌 Lead provider:"),
         [btn(p.split("/")[0], "provider", p, prov) for p in PROVIDERS],
-        [btn("الاثنين", "provider", ",".join(PROVIDERS), prov), btn("أي مزود", "provider", "any", prov)],
-        head("👷 الوكلاء بالتوازي:"),
+        [btn("Both", "provider", ",".join(PROVIDERS), prov), btn("Any provider", "provider", "any", prov)],
+        head("👷 Parallel agents:"),
         [btn(str(n), "max_agents", n, cfg("max_agents", mode)) for n in (2, 3, 4, 6, 8)],
-        head("🔌 مزود الوكلاء:"),
+        head("🔌 Agent provider:"),
         [btn(p.split("/")[0], "worker_provider", p, wp) for p in config.WORKER_PROVIDERS[:3]]
-        + [btn("أي مزود", "worker_provider", "any", wp)],
-        [toggle("📝 الخطة أولاً", "plan_mode"), toggle("التفكير", "show_thinking")],
-        [toggle("البحث", "web_search"), toggle("الطويل كصفحة", "long_pages")],
-        [toggle("ملف txt بعد كل رد", "export_txt")],
-        [InlineKeyboardButton("💬 الرجوع لوضع المحادثة", callback_data="set:agent_mode:off")],
+        + [btn("Any provider", "worker_provider", "any", wp)],
+        [toggle("📝 Plan first", "plan_mode"), toggle("Thinking", "show_thinking")],
+        [toggle("Web search", "web_search"), toggle("Long as a page", "long_pages")],
+        [toggle("🎭 Persona voice", "persona_voice"), toggle("txt after each reply", "export_txt")],
+        [btn("🔓 Auto-run", "permissions", "auto", cfg("permissions", mode)),
+         btn("🔐 Ask first", "permissions", "ask", cfg("permissions", mode))],
+        [InlineKeyboardButton("💬 Back to Chat mode", callback_data="set:agent_mode:off")],
     ])
 
 
@@ -2049,7 +2072,7 @@ async def on_settings_button(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await q.answer()
         return
     if not is_owner(update):
-        await q.answer("لصاحب البوت فقط", show_alert=True)
+        await q.answer("Owner only", show_alert=True)
         return
     tag, key, raw = q.data.split(":", 2)
     mode = "agent" if tag == "cset" else "chat"
@@ -2057,8 +2080,8 @@ async def on_settings_button(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await q.answer()
         return
     save_setting(key, parse_value(key, raw), mode)
-    await q.answer("تم ✅")
-    if key == "agent_mode":  # تبديل النسخة: الكيبورد والقائمة واللوحة كلها تتغيّر
+    await q.answer("Done ✅")
+    if key == "agent_mode":  # switching versions: the keyboard, the menu and the panel all change
         await switch_mode(context.bot, q.message.chat_id, bool(cfg("agent_mode")), q.message)
         return
     with contextlib.suppress(BadRequest):
@@ -2075,14 +2098,14 @@ async def cmd_set(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     keys = mode_params(mode)
     if len(args) < 2 or args[0] not in keys:
         await send_html(context.bot, chat_id, lines_html(
-            "الاستخدام: <code>/set الإعداد القيمة</code>",
-            "الإعدادات: " + " · ".join(f"<code>{k}</code>" for k in keys),
+            "Usage: <code>/set setting value</code>",
+            "Settings: " + " · ".join(f"<code>{k}</code>" for k in keys),
         ))
         return
     try:
         save_setting(args[0], parse_value(args[0], " ".join(args[1:])), mode)
     except ValueError as e:
-        await send_html(context.bot, chat_id, RLM + "⚠️ قيمة غلط: " + esc(str(e)))
+        await send_html(context.bot, chat_id, "⚠️ Invalid value: " + esc(str(e)))
         return
     await send_html(context.bot, chat_id, settings_html(mode), settings_keyboard(mode))
 
@@ -2094,7 +2117,7 @@ def shortcut(key: str, value_fn):
     return handler
 
 
-# ----- وضع الوكلاء: الأوامر -----
+# ----- Coding mode: commands -----
 
 def _max_agents() -> int:
     try:
@@ -2104,7 +2127,7 @@ def _max_agents() -> int:
 
 
 async def _owner_cmd(update: Update, context) -> int | None:
-    """فحص المالك + تسجيل رسالة الأمر. يرجّع chat_id أو None."""
+    """Owner check + tracking the command message. Returns chat_id or None."""
     if not await owner_only(update, context):
         return None
     chat_id = update.effective_chat.id
@@ -2117,23 +2140,23 @@ def code_welcome_html() -> str:
     ws = get_ws()
     n, size = ws.stats()
     return lines_html(
-        "💻 <b>وضع البرمجة</b>",
-        f"🧠 القائد: <code>{esc(str(cfg('model', 'agent')))}</code> · تفكير {esc(str(cfg('effort', 'agent')))}",
-        f"👷 المنفّذين: <code>{esc(str(cfg('worker_model', 'agent')))}</code> — حتى {_max_agents()} بالتوازي",
-        f"📁 المشروع: <code>{esc(ws.name)}</code> ({n} ملف · {human(size)}) — /project للتبديل",
+        "💻 <b>Coding mode</b>",
+        f"🧠 Lead: <code>{esc(str(cfg('model', 'agent')))}</code> · reasoning {esc(str(cfg('effort', 'agent')))}",
+        f"👷 Agents: <code>{esc(str(cfg('worker_model', 'agent')))}</code> — up to {_max_agents()} in parallel",
+        f"📁 Project: <code>{esc(ws.name)}</code> ({n} files · {human(size)}) — /project to switch",
         "",
-        "اطلب أي مشروع أو مهمة برمجية: أفهم، أخطط، أوزّع الشغل على الوكلاء، أكتب وأشغّل وأختبر، وأرجع لك بالنتيجة.",
-        "• أرسل ملفات أو <code>zip</code> وتنحفظ في المشروع · <code>@مسار</code> يرفق ملف من المشروع",
-        "• اكتب وهو شغّال وتوصل رسالتك للقائد فوراً · ⏹ يوقف · «فكر بعمق» أو ultrathink = تفكير أقصى",
-        "• /plan خطة قبل التنفيذ · /undo تراجع · /files /zip · /sh أمر · /watch متابعة CI",
-        "• /init يكتب ذاكرة المشروع · /review مراجعة · /context /status /cost",
+        "Ask for any project or coding task: I understand it, plan, split the work across agents, write, run and test, and come back with the result.",
+        "• Send files or a <code>zip</code> and they're saved into the project · <code>@path</code> attaches a project file",
+        "• Write while it works and your message reaches the lead right away · ⏹ stops · \"think hard\" or ultrathink = maximum reasoning",
+        "• /plan plan before executing · /undo undo · /files /zip · <code>$ cmd</code> runs a command · <code># note</code> saves to memory · /watch CI",
+        "• /init writes project memory · /review · /security_review · /context /status /cost /doctor",
         "",
-        "<i>هذي نسخة البرمجة: إعداداتها وشكلها مستقلين — الهوية والاختصارات وGitHub مشتركة مع المحادثة.</i>",
+        "<i>This is the Coding version: its settings and look are its own — the persona, snippets and GitHub are shared with Chat.</i>",
     )
 
 
 async def refresh_owner_menu(bot) -> None:
-    """قائمة «/» عند المالك تتغيّر مع النسخة."""
+    """The owner's "/" menu changes with the version."""
     if OWNER_ID:
         with contextlib.suppress(TelegramError):
             await bot.set_my_commands(_menu_commands("code" if cfg("agent_mode") else "owner"),
@@ -2143,7 +2166,7 @@ async def refresh_owner_menu(bot) -> None:
 async def switch_mode(bot, chat_id: int, on: bool, settings_msg: Message | None = None) -> None:
     save_setting("agent_mode", on)
     await refresh_owner_menu(bot)
-    if settings_msg is not None:  # لوحة الإعدادات المفتوحة تتحول للوحة النسخة الثانية
+    if settings_msg is not None:  # an open settings panel turns into the other version's panel
         mode = owner_mode()
         with contextlib.suppress(TelegramError):
             await settings_msg.edit_text(settings_html(mode), parse_mode=ParseMode.HTML,
@@ -2152,8 +2175,8 @@ async def switch_mode(bot, chat_id: int, on: bool, settings_msg: Message | None 
         await send_html(bot, chat_id, code_welcome_html(), main_keyboard(True))
     else:
         await send_html(bot, chat_id, lines_html(
-            "💬 <b>وضع المحادثة</b>",
-            "رجعنا للمحادثة العادية بإعداداتها. مشاريع البرمجة وذاكرتها محفوظة — ترجع لها بـ /code.",
+            "💬 <b>Chat mode</b>",
+            "Back to normal chat with its own settings. Coding projects and their memory are kept — return with /code.",
         ), main_keyboard(True))
 
 
@@ -2175,8 +2198,8 @@ async def cmd_plan(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     on = not cfg("plan_mode", "agent")
     save_setting("plan_mode", on, "agent")
     await send_html(context.bot, chat_id, lines_html(
-        "📝 <b>وضع التخطيط شغّال</b>" if on else "⚡️ <b>وضع التخطيط مقفل</b>",
-        "القائد يستكشف ويقدّم خطة، وما ينفّذ إلا لما توافق ✅" if on else "القائد ينفّذ مباشرة.",
+        "📝 <b>Plan mode on</b>" if on else "⚡️ <b>Plan mode off</b>",
+        "The lead explores and presents a plan, and executes only after you approve ✅" if on else "The lead executes directly.",
     ))
 
 
@@ -2187,14 +2210,14 @@ def list_projects() -> list[str]:
 
 def projects_html() -> str:
     cur = current_project()
-    rows = [f"📁 <b>المشروع الحالي:</b> <code>{esc(cur)}</code>", ""]
+    rows = [f"📁 <b>Current project:</b> <code>{esc(cur)}</code>", ""]
     for name in list_projects()[:30]:
         n, size = Workspace(ws_base(), name).stats()
         cps = checkpoints().count(name)
-        rows.append(f"{'●' if name == cur else '○'} <code>{esc(name)}</code> — {n} ملف · {human(size)}"
+        rows.append(f"{'●' if name == cur else '○'} <code>{esc(name)}</code> — {n} files · {human(size)}"
                     + (f" · ↩️ {cps}" if cps else ""))
-    rows += ["", "تبديل/إنشاء: <code>/project الاسم</code> · حذف: <code>/project delete الاسم</code>",
-             "استنساخ من GitHub: <code>/clone owner/repo</code>"]
+    rows += ["", "Switch/create: <code>/project name</code> · delete: <code>/project delete name</code>",
+             "Clone from GitHub: <code>/clone owner/repo</code>"]
     return lines_html(*rows)
 
 
@@ -2210,9 +2233,9 @@ async def switch_project(bot, chat_id: int, name: str) -> None:
     save_setting("project", ws.name, "agent")
     n, size = ws.stats()
     await send_html(bot, chat_id, lines_html(
-        f"📁 <b>المشروع:</b> <code>{esc(ws.name)}</code>",
-        f"{n} ملف · {human(size)}" if n else "مشروع فاضي — جاهز تبدأ فيه.",
-        "" if cfg("agent_mode") else "شغّل /code عشان تشتغل عليه.",
+        f"📁 <b>Project:</b> <code>{esc(ws.name)}</code>",
+        f"{n} files · {human(size)}" if n else "Empty project — ready to start.",
+        "" if cfg("agent_mode") else "Switch on /code to work on it.",
     ))
 
 
@@ -2221,27 +2244,27 @@ async def cmd_project(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         return
     args = context.args or []
     if not args:
-        get_ws()  # المشروع الحالي يكون موجود
+        get_ws()  # make sure the current project exists
         await send_html(context.bot, chat_id, projects_html(), projects_kb())
         return
     try:
-        if args[0].lower() in ("delete", "rm", "حذف") and len(args) > 1:
+        if args[0].lower() in ("delete", "rm") and len(args) > 1:
             name = valid_name(args[1])
             if name not in list_projects():
-                raise WorkspaceError("ما فيه مشروع بهذا الاسم")
+                raise WorkspaceError("No project with that name")
             await send_html(context.bot, chat_id, lines_html(
-                f"🗑 متأكد تبي تحذف المشروع <code>{esc(name)}</code> بكل ملفاته؟", "ما ينفع التراجع بعدها."),
-                InlineKeyboardMarkup([[_btn("🗑 احذف نهائياً", f"projdel:{name}"[:64]), _btn("✖️ لا", "noop")]]))
+                f"🗑 Delete project <code>{esc(name)}</code> with all its files?", "This can't be undone."),
+                InlineKeyboardMarkup([[_btn("🗑 Delete permanently", f"projdel:{name}"[:64]), _btn("✖️ No", "noop")]]))
             return
         await switch_project(context.bot, chat_id, valid_name(args[0]))
     except WorkspaceError as e:
-        await send_html(context.bot, chat_id, RLM + "⚠️ " + esc(str(e)))
+        await send_html(context.bot, chat_id, "⚠️ " + esc(str(e)))
 
 
 async def on_project_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     q = update.callback_query
     if not is_owner(update):
-        await q.answer("لصاحب البوت فقط", show_alert=True)
+        await q.answer("Owner only", show_alert=True)
         return
     kind, _, name = q.data.partition(":")
     await q.answer()
@@ -2265,7 +2288,7 @@ async def on_project_button(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         save_setting("project", "main", "agent")
     with contextlib.suppress(TelegramError):
         await q.edit_message_reply_markup(None)
-    await send_html(context.bot, q.message.chat_id, RLM + f"🗑 انحذف المشروع <code>{esc(name)}</code>.")
+    await send_html(context.bot, q.message.chat_id, f"🗑 Project <code>{esc(name)}</code> deleted.")
 
 
 async def send_file(bot, chat_id: int, data: bytes, filename: str, caption: str = "") -> None:
@@ -2273,7 +2296,7 @@ async def send_file(bot, chat_id: int, data: bytes, filename: str, caption: str 
         m = await bot.send_document(chat_id, InputFile(io.BytesIO(data), filename=filename), caption=caption or None)
         track(chat_id, m.message_id)
     except TelegramError as e:
-        await send_html(bot, chat_id, RLM + "⚠️ ما قدرت أرسل الملف: " + esc(str(e)))
+        await send_html(bot, chat_id, "⚠️ I couldn't send the file: " + esc(str(e)))
 
 
 async def cmd_files(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2284,10 +2307,10 @@ async def cmd_files(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     try:
         text = ws.tree(400) if path == "." else ws.list_files("**/*", path)
     except WorkspaceError as e:
-        await send_html(context.bot, chat_id, RLM + "⚠️ " + esc(str(e)))
+        await send_html(context.bot, chat_id, "⚠️ " + esc(str(e)))
         return
     n, size = ws.stats()
-    head = RLM + f"🗂 <b>{esc(ws.name)}</b> — {n} ملف · {human(size)}"
+    head = f"🗂 <b>{esc(ws.name)}</b> — {n} files · {human(size)}"
     if len(text) > 3500:
         await send_html(context.bot, chat_id, head)
         await send_file(context.bot, chat_id, text.encode(), f"{ws.name}-files.txt")
@@ -2303,11 +2326,11 @@ async def cmd_get(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     try:
         full = ws.resolve(path)
         if not path or not full.is_file():
-            raise WorkspaceError("اكتب مسار ملف موجود: <code>/get src/app.py</code>")
+            raise WorkspaceError("Give the path of an existing file: <code>/get src/app.py</code>")
         if full.stat().st_size > 45_000_000:
-            raise WorkspaceError("الملف أكبر من حد تليجرام")
+            raise WorkspaceError("The file is bigger than Telegram's limit")
     except WorkspaceError as e:
-        await send_html(context.bot, chat_id, RLM + "⚠️ " + str(e))
+        await send_html(context.bot, chat_id, "⚠️ " + str(e))
         return
     await send_file(context.bot, chat_id, full.read_bytes(), full.name, f"📄 {ws.rel(full)}")
 
@@ -2317,10 +2340,10 @@ async def send_zip(bot, chat_id: int) -> None:
     try:
         data = await asyncio.to_thread(ws.zip_bytes)
     except WorkspaceError as e:
-        await send_html(bot, chat_id, RLM + "⚠️ " + esc(str(e)))
+        await send_html(bot, chat_id, "⚠️ " + esc(str(e)))
         return
     n, _ = ws.stats()
-    await send_file(bot, chat_id, data, f"{ws.name}.zip", f"📦 {ws.name} — {n} ملف")
+    await send_file(bot, chat_id, data, f"{ws.name}.zip", f"📦 {ws.name} — {n} files")
 
 
 async def cmd_zip(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2330,55 +2353,42 @@ async def cmd_zip(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def cmd_sh(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """تشغيل أمر مباشرة في المشروع (مثل ! في Claude Code)."""
+    """Run a command directly in the project (like ! in Claude Code). Shortcut: start a message with "$ "."""
     if (chat_id := await _owner_cmd(update, context)) is None:
         return
     command = after_command(update.message.text or "").strip()
     if not command:
-        await send_html(context.bot, chat_id, RLM + "الاستخدام: <code>/sh ls -la</code> — يشتغل داخل مجلد المشروع")
+        await send_html(context.bot, chat_id, "Usage: <code>/sh ls -la</code> — or just send <code>$ ls -la</code>")
         return
-    if agent._DANGER.search(command):
-        await send_html(context.bot, chat_id, RLM + "⛔ أمر خطير مرفوض.")
-        return
-    ws = get_ws()
-    await context.bot.send_chat_action(chat_id, ChatAction.TYPING)
-    r = await ws.run(command, 300)
-    status = "⏱ انتهت المهلة" if r["timed_out"] else ("✅" if r["code"] == 0 else f"❌ exit {r['code']}")
-    out = r["output"].strip() or "(بدون مخرجات)"
-    head = RLM + f"{status} · <code>{esc(command[:200])}</code> · {r['seconds']:.1f}ث"
-    if len(out) > 3300:
-        await send_html(context.bot, chat_id, head)
-        await send_file(context.bot, chat_id, out.encode(), "output.txt")
-    else:
-        await send_html(context.bot, chat_id, f"{head}\n<pre>{esc(out)}</pre>")
+    await run_shell(context.bot, chat_id, command)
 
 
 async def do_undo(bot, chat_id: int, cp_id: str | None = None) -> None:
     project = current_project()
     top = checkpoints().peek(project)
     if not top:
-        await send_html(bot, chat_id, RLM + "ما فيه تعديلات أقدر أتراجع عنها في هذا المشروع.")
+        await send_html(bot, chat_id, "Nothing to undo in this project.")
         return
     if cp_id and top["id"] != cp_id:
-        await send_html(bot, chat_id, lines_html("⚠️ فيه تعديلات أحدث من هذي.",
-                                                 "استخدم /undo لين توصل لها (كل مرة يرجع طلب واحد)."))
+        await send_html(bot, chat_id, lines_html("⚠️ There are newer changes than this one.",
+                                                 "Use /undo until you reach it (each undo reverts one request)."))
         return
     restored, skipped = restore_checkpoint(project, top["id"]) or (0, [])
     history = agent_histories[agent_key(chat_id, project)]
     label = top.get("label", "")
     if len(history) >= 2 and history[-1].get("role") == "assistant" \
             and str(history[-2].get("content", ""))[:120] == label:
-        history.pop()  # الطلب اللي تراجعنا عنه ما يبقى في ذاكرة القائد
+        history.pop()  # the undone request doesn't stay in the lead's memory
         history.pop()
         save_agent_histories()
     if (t := last_turn.get(chat_id)) and t.checkpoint == top["id"]:
         t.checkpoint = None
     left = checkpoints().count(project)
     await send_html(bot, chat_id, lines_html(
-        f"↩️ <b>تراجعت عن:</b> {esc(top.get('label', '')[:100])}",
-        f"رجّعت {restored} ملف لحالها قبل الطلب" + (f" · ما قدرت أرجّع {len(skipped)} (كبيرة)" if skipped else ""),
-        "<i>تغييرات الأوامر (تثبيت، حذف بالأوامر…) ما تنحسب، مثل Claude Code.</i>",
-        f"باقي {left} نقطة رجوع." if left else "",
+        f"↩️ <b>Undid:</b> {esc(top.get('label', '')[:100])}",
+        f"Restored {restored} files to how they were before the request" + (f" · couldn't restore {len(skipped)} (too big)" if skipped else ""),
+        "<i>Changes made by commands (installs, deleting via shell…) aren't tracked, like in Claude Code.</i>",
+        f"{left} undo points left." if left else "",
     ))
 
 
@@ -2392,92 +2402,92 @@ async def cmd_diff(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if (chat_id := await _owner_cmd(update, context)) is None:
         return
     if not diffs:
-        await send_html(context.bot, chat_id, RLM + "ما فيه تعديلات بعد.")
+        await send_html(context.bot, chat_id, "No changes yet.")
         return
-    await send_file(context.bot, chat_id, next(reversed(diffs.values())).encode(), "changes.diff", "📄 فرق آخر طلب")
+    await send_file(context.bot, chat_id, next(reversed(diffs.values())).encode(), "changes.diff", "📄 Diff of the latest request")
 
 
 async def cmd_memory(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """ذاكرة المشروع الدائمة (AGENTS.md) — تنقرأ للقائد والوكلاء كل مرة، مثل CLAUDE.md."""
+    """The durable project memory (AGENTS.md) — read by the lead and the agents every time, like CLAUDE.md."""
     if (chat_id := await _owner_cmd(update, context)) is None:
         return
     ws = get_ws()
     f = ws.root / "AGENTS.md"
     note = after_command(update.message.text or "").strip()
     if note:
-        cur = f.read_text(encoding="utf-8") if f.is_file() else "# AGENTS.md — ذاكرة المشروع\n"
+        cur = f.read_text(encoding="utf-8") if f.is_file() else "# AGENTS.md — project memory\n"
         f.write_text(cur.rstrip("\n") + f"\n- {note}\n", encoding="utf-8")
-        await send_html(context.bot, chat_id, RLM + "🧠 انضافت لذاكرة المشروع (AGENTS.md).")
+        await send_html(context.bot, chat_id, "🧠 Added to project memory (AGENTS.md).")
         return
     if not f.is_file():
         await send_html(context.bot, chat_id, lines_html(
-            "ما فيه ذاكرة مشروع بعد.", "أضف: <code>/memory استخدم pytest للاختبارات</code>",
-            "أو خل القائد يكتبها بتحليل المشروع: /init"))
+            "No project memory yet.", "Add a note: <code>/memory use pytest for tests</code> (or send <code># note</code>)",
+            "or let the lead write it by analyzing the project: /init"))
         return
     text = f.read_text(encoding="utf-8", errors="replace")
     if len(text) > 3500:
-        await send_file(context.bot, chat_id, text.encode(), "AGENTS.md", "🧠 ذاكرة المشروع")
+        await send_file(context.bot, chat_id, text.encode(), "AGENTS.md", "🧠 Project memory")
     else:
-        await send_html(context.bot, chat_id, RLM + "🧠 <b>AGENTS.md</b>\n<pre>" + esc(text) + "</pre>")
+        await send_html(context.bot, chat_id, "🧠 <b>AGENTS.md</b>\n<pre>" + esc(text) + "</pre>")
 
 
 async def summarize_messages(msgs: list) -> str:
     def body(m):
         c = m.get("content")
-        return c if isinstance(c, str) else "[محتوى غير نصي]"
-    transcript = "\n\n".join(f"{'المستخدم' if m['role'] == 'user' else 'المساعد'}: {body(m)}" for m in msgs)
+        return c if isinstance(c, str) else "[non-text content]"
+    transcript = "\n\n".join(f"{'User' if m['role'] == 'user' else 'Assistant'}: {body(m)}" for m in msgs)
     kw = worker_kwargs()
     res = await llm.stream_chat(client, [
-        {"role": "system", "content": "لخّص المحادثة التالية تلخيص كثيف ودقيق يحفظ كل اللي يلزم لإكمالها: "
-                                      "الأهداف، القرارات، التفاصيل التقنية والأسماء والأرقام، وش انعمل وش باقي. "
-                                      "بنفس لغة المحادثة، نقاط مختصرة، بدون مقدمات."},
+        {"role": "system", "content": "Summarize the following conversation densely and precisely, keeping everything needed to continue it: "
+                                      "the goals, decisions, technical details, names and numbers, what was done and what remains. "
+                                      "Use the conversation's language, short bullet points, no preamble."},
         {"role": "user", "content": agent.clip(transcript, 150_000)}], kw)
     record_usage({kw["model"]: {**(res.usage or {}), "calls": 1}})
     return res.content.strip()
 
 
 async def cmd_compact(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """يضغط ذاكرة المحادثة الحالية لملخص (يوفّر توكنز ويحفظ السياق)، مثل /compact."""
+    """Compresses the current conversation memory into a summary (saves tokens, keeps the context), like /compact."""
     if (chat_id := await _owner_cmd(update, context)) is None:
         return
     agent_on = bool(cfg("agent_mode"))
     async with chat_locks[chat_id]:
         hist = agent_histories[agent_key(chat_id, current_project())] if agent_on else histories[chat_id]
         if len(hist) < 4:
-            await send_html(context.bot, chat_id, RLM + "المحادثة قصيرة — ما تحتاج ضغط.")
+            await send_html(context.bot, chat_id, "The conversation is short — no need to compact.")
             return
         await context.bot.send_chat_action(chat_id, ChatAction.TYPING)
         before = sum(len(str(m.get("content"))) for m in hist)
         try:
             summary = await summarize_messages(list(hist))
         except Exception as e:
-            await send_html(context.bot, chat_id, RLM + "⚠️ ما قدرت ألخّص: " + esc(str(e)[:200]))
+            await send_html(context.bot, chat_id, "⚠️ Couldn't summarize: " + esc(str(e)[:200]))
             return
         if not summary:
             return
         hist.clear()
-        hist.append({"role": "user", "content": "[ملخص المحادثة السابقة — للسياق]"})
+        hist.append({"role": "user", "content": "[Summary of the earlier conversation — for context]"})
         hist.append({"role": "assistant", "content": summary})
         (save_agent_histories if agent_on else save_histories)()
         last_turn.pop(chat_id, None)
     await send_html(context.bot, chat_id, lines_html(
-        "🗜 <b>انضغطت المحادثة</b>", f"{before:,} حرف ← {len(summary):,} حرف — السياق محفوظ كملخص."))
+        "🗜 <b>Conversation compacted</b>", f"{before:,} → {len(summary):,} characters — the context is kept as a summary."))
 
 
 async def cmd_cost(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if (chat_id := await _owner_cmd(update, context)) is None:
         return
     data = _read_json(dpath("usage.json"), {})
-    rows = ["💰 <b>الاستهلاك</b>", "", "<b>من بداية التشغيل الحالي:</b>"]
+    rows = ["💰 <b>Usage</b>", "", "<b>Since this run started:</b>"]
     rows += [f"• <code>{esc(m)}</code>: {agent.usage_line(u)}" for m, u in session_usage.models.items()] or ["—"]
-    rows += ["", f"<b>الإجمالي (من {esc(data.get('since', '—'))}):</b>"]
+    rows += ["", f"<b>All time (since {esc(data.get('since', '—'))}):</b>"]
     total = {"prompt": 0, "completion": 0, "cost": 0.0, "calls": 0}
     for m, u in (data.get("models") or {}).items():
         rows.append(f"• <code>{esc(m)}</code>: {agent.usage_line(u)}")
         for k in total:
             total[k] += u.get(k, 0)
-    rows += ["", f"<b>المجموع:</b> {agent.usage_line(total)}",
-             "<i>التكلفة حسب اللي يرجّعه OpenRouter مع كل طلب.</i>"]
+    rows += ["", f"<b>Total:</b> {agent.usage_line(total)}",
+             "<i>Cost as reported by OpenRouter with each request.</i>"]
     await send_html(context.bot, chat_id, lines_html(*rows))
 
 
@@ -2486,8 +2496,8 @@ async def cmd_clone(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
     args = context.args or []
     if not args or not github_tools.enabled():
-        await send_html(context.bot, chat_id, RLM + ("الاستخدام: <code>/clone owner/repo [branch]</code> — يصير مشروع جديد"
-                                                     if github_tools.enabled() else "⚠️ GitHub غير مربوط (GH_PAT)."))
+        await send_html(context.bot, chat_id, ("Usage: <code>/clone owner/repo [branch]</code> — becomes a new project"
+                                                     if github_tools.enabled() else "⚠️ GitHub is not connected (GH_PAT)."))
         return
     try:
         repo = args[0].removeprefix("https://github.com/").removesuffix(".git").strip("/")
@@ -2497,9 +2507,9 @@ async def cmd_clone(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await context.bot.send_chat_action(chat_id, ChatAction.TYPING)
         msg = await ws.clone(repo, args[1] if len(args) > 1 else None, github_tools.token())
         save_setting("project", ws.name, "agent")
-        await send_html(context.bot, chat_id, lines_html(f"⬇️ {esc(msg)}", f"📁 المشروع الحالي: <code>{esc(ws.name)}</code>"))
+        await send_html(context.bot, chat_id, lines_html(f"⬇️ {esc(msg)}", f"📁 Current project: <code>{esc(ws.name)}</code>"))
     except WorkspaceError as e:
-        await send_html(context.bot, chat_id, RLM + "⚠️ " + esc(str(e)))
+        await send_html(context.bot, chat_id, "⚠️ " + esc(str(e)))
 
 
 async def cmd_push(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2507,8 +2517,8 @@ async def cmd_push(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
     args = context.args or []
     if not args or not github_tools.enabled():
-        await send_html(context.bot, chat_id, RLM + ("الاستخدام: <code>/push owner/repo [branch] [رسالة]</code>"
-                                                     if github_tools.enabled() else "⚠️ GitHub غير مربوط (GH_PAT)."))
+        await send_html(context.bot, chat_id, ("Usage: <code>/push owner/repo [branch] [message]</code>"
+                                                     if github_tools.enabled() else "⚠️ GitHub is not connected (GH_PAT)."))
         return
     ws = get_ws()
     try:
@@ -2519,18 +2529,330 @@ async def cmd_push(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         message = " ".join(args[2:]) or "Update from Telegram"
         res = await ws.push(repo, branch, message, github_tools.token())
         await send_html(context.bot, chat_id, lines_html(
-            f"⬆️ <b>انرفع</b> على <code>{esc(repo)}</code> · 🌿 {esc(branch)} · <code>{res['commit']}</code>",
-            f'<a href="{esc(res["url"])}">فتح على GitHub</a>' if res["url"].startswith("http") else ""))
+            f"⬆️ <b>Pushed</b> to <code>{esc(repo)}</code> · 🌿 {esc(branch)} · <code>{res['commit']}</code>",
+            f'<a href="{esc(res["url"])}">Open on GitHub</a>' if res["url"].startswith("http") else ""))
     except WorkspaceError as e:
-        await send_html(context.bot, chat_id, RLM + "⚠️ " + esc(str(e)))
+        await send_html(context.bot, chat_id, "⚠️ " + esc(str(e)))
 
 
-# ----- أزرار الرد النهائي في وضع الوكلاء -----
+# ----- Claude Code parity: permissions, prompt commands, info commands -----
+
+approvals: dict[str, asyncio.Future] = {}
+last_boards: dict[int, "agent.Board"] = {}
+
+
+def make_approver(bot, chat_id: int, ui: "ResponseUI"):
+    """Permission mode "ask": commands and GitHub writes wait for the owner's tap (like Claude Code's prompts)."""
+    async def approve(what: str, detail: str) -> bool:
+        if ui.allow_all:
+            return True
+        key = secrets.token_hex(4)
+        fut = asyncio.get_running_loop().create_future()
+        approvals[key] = fut
+        kb = InlineKeyboardMarkup([[_btn("✅ Allow", f"perm:{key}:y"), _btn("✅ Allow all (this request)", f"perm:{key}:a")],
+                                   [_btn("❌ Deny", f"perm:{key}:n")]])
+        html = f"🔐 <b>Approval needed</b> — {esc(what)}\n<pre>{esc(detail[:1500])}</pre>"
+        msg = await send_html(bot, chat_id, html, kb)
+        before, ui.status = ui.status, "🔐 Waiting for your approval…"
+        choice = "t"
+        try:
+            choice = await asyncio.wait_for(fut, 900)
+        except asyncio.TimeoutError:
+            choice = "t"
+        finally:
+            approvals.pop(key, None)
+            ui.status = before
+            verdict = {"y": "✅ Allowed", "a": "✅ Allowed (all for this request)", "n": "❌ Denied",
+                       "t": "⌛️ Timed out — denied"}.get(choice, "❌ Denied")
+            if msg:
+                with contextlib.suppress(TelegramError):
+                    await msg.edit_text(f"{html}\n<b>{verdict}</b>", parse_mode=ParseMode.HTML)
+        if choice == "a":
+            ui.allow_all = True
+        return choice in ("y", "a")
+    return approve
+
+
+async def on_permission_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    q = update.callback_query
+    if not is_owner(update):
+        await q.answer("Owner only", show_alert=True)
+        return
+    _, key, choice = (q.data.split(":") + ["", ""])[:3]
+    fut = approvals.get(key)
+    if not fut or fut.done():
+        await q.answer("This request is no longer pending")
+        return
+    fut.set_result(choice)
+    await q.answer({"y": "Allowed", "a": "Allowed for this request", "n": "Denied"}.get(choice, "OK"))
+
+
+INIT_PROMPT = (
+    "Analyze this project and create (or improve) AGENTS.md at the project root — the persistent project memory "
+    "that you and every agent read at the start of each session. Explore efficiently (tree, manifests, entry points, "
+    "tests, CI config). Include: what the project is; exact install/build/run/test commands (verify them by running "
+    "the cheap ones); architecture and key directories; conventions (style, naming, libraries); gotchas. Keep it "
+    "concise (well under 150 lines), factual and specific to this project — no generic advice. If AGENTS.md already "
+    "exists, update it instead of duplicating.")
+REVIEW_PROMPT = (
+    "Review {target}. Use reviewer agents in parallel for large changes (split by area). Report findings ranked by "
+    "severity, each with file:line, the problem, why it matters, and a concrete fix. Skip cosmetic nits. "
+    "Do NOT modify any files — review only. End with a one-line verdict.")
+SECURITY_PROMPT = (
+    "Perform a security review of {target}: injection (SQL, command, path traversal), authentication and "
+    "authorization, secrets in code or logs, unsafe deserialization, SSRF, XSS/CSRF, dependency risks and insecure "
+    "defaults. Report only real, exploitable issues with severity, file:line, an exploit scenario and the fix. "
+    "Do NOT modify any files.")
+PR_COMMENTS_PROMPT = (
+    "Address the review comments on {target}: read the PR and all its comments (gh_pr get / comments), clone the repo "
+    "on the PR's head branch if it isn't in this project yet (git_clone with branch), fix every actionable comment "
+    "properly, verify, push to the same branch (git_push), watch CI until green, and summarize what you changed for "
+    "each comment.")
+
+
+def _review_target(args: list[str], default: str) -> str:
+    raw = " ".join(args).strip()
+    if m := re.fullmatch(r"([\w.\-]+/[\w.\-]+)#(\d+)", raw):
+        return f"pull request #{m.group(2)} in {m.group(1)} (use gh_pr get / files / comments)"
+    return raw or default
+
+
+async def run_agent_command(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str, short: str,
+                            overrides: dict | None = None) -> None:
+    """Runs a canned request as a coding-mode turn (works from either version)."""
+    if (chat_id := await _owner_cmd(update, context)) is None:
+        return
+    await generate(context.bot, chat_id, Turn(None, text, short, overrides or {}, update.effective_user.id,
+                                              mode="agent", project=current_project()))
+
+
+async def cmd_init(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await run_agent_command(update, context, INIT_PROMPT, "/init — write AGENTS.md")
+
+
+async def cmd_review(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    target = _review_target(context.args or [], "the latest changes in this project (git diff/status if it's a git "
+                                                "repo, otherwise the files changed recently per the project journal)")
+    await run_agent_command(update, context, REVIEW_PROMPT.format(target=target), f"/review {target[:80]}")
+
+
+async def cmd_security_review(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    target = _review_target(context.args or [], "the pending changes, or the whole project if there are none")
+    await run_agent_command(update, context, SECURITY_PROMPT.format(target=target), f"/security_review {target[:80]}")
+
+
+async def cmd_pr_comments(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    args = context.args or []
+    if not args or not re.fullmatch(r"[\w.\-]+/[\w.\-]+#\d+", args[0]):
+        if (chat_id := await _owner_cmd(update, context)) is not None:
+            await send_html(context.bot, chat_id, "Usage: <code>/pr_comments owner/repo#12</code>")
+        return
+    await run_agent_command(update, context, PR_COMMENTS_PROMPT.format(target=_review_target(args, "")),
+                            f"/pr_comments {args[0]}")
+
+
+def _tok(n_chars: int) -> int:
+    return max(0, round(n_chars / 3.5))  # rough estimate; real tokenization varies by model
+
+
+async def cmd_context(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """What the lead will see on the next request, and roughly how many tokens each part costs."""
+    if (chat_id := await _owner_cmd(update, context)) is None:
+        return
+    ws = get_ws()
+    gh_on = github_tools.enabled()
+    web_on = bool(cfg("web_search", "agent"))
+    env = make_env(ws, Changes(ws), agent.Board(ws.name), web_on)
+    tools = agent.lead_tools(bool(cfg("plan_mode", "agent")), env.web_tools,
+                             list(github_tools.GITHUB_TOOLS) if gh_on else [], gh_on)
+    persona = load_persona() if cfg("persona_voice", "agent") and AGENT_CFG.get("persona_voice", True) else ""
+    hist = agent_histories[agent_key(chat_id, ws.name)]
+    parts = [("Lead instructions", len(config.LEAD_PROMPT)),
+             ("Project tree", len(ws.tree(200))),
+             ("Project memory (AGENTS.md)", len(agent.project_memory(ws))),
+             ("Project journal", len(journal_text(ws.name))),
+             ("Agent types", len(agent.agent_types_text(ws))),
+             ("Persona (voice)", len(persona or "")),
+             ("Tool definitions", len(json.dumps(tools, ensure_ascii=False))),
+             (f"Conversation ({len(hist)} messages)", sum(len(str(m.get("content"))) for m in hist))]
+    total = sum(n for _, n in parts)
+    rows = [f"🧮 <b>Context for the next request</b> — <code>{esc(ws.name)}</code>", ""]
+    rows += [f"• {esc(name)}: ~{_tok(n):,} tokens" for name, n in parts]
+    rows += ["", f"<b>Total:</b> ~{_tok(total):,} tokens (+ your message)",
+             "<i>Old code versions are never resent — the lead reads current files on demand, and older requests "
+             "live in the short journal. /compact shrinks the conversation.</i>"]
+    await send_html(context.bot, chat_id, "\n".join(rows))
+
+
+async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if (chat_id := await _owner_cmd(update, context)) is None:
+        return
+    ws = get_ws()
+    n, size = ws.stats()
+    git = "not a git repo"
+    if (ws.root / ".git").exists():
+        code, out = await ws.git(["status", "--short", "--branch"])
+        if not code:
+            lines = out.splitlines()
+            git = f"{esc(lines[0].lstrip('# ')) if lines else '?'} · {len(lines) - 1} changed"
+    jobs = ws.job(None, "list")
+    running = jobs.count("running")
+    total = session_usage.total()
+    rows = [
+        "📊 <b>Status</b>",
+        "",
+        f"• <b>Version:</b> {'💻 Coding' if cfg('agent_mode') else '💬 Chat'}",
+        f"• <b>Lead:</b> <code>{esc(str(cfg('model', 'agent')))}</code> · {esc(str(cfg('provider', 'agent')))} · "
+        f"effort {esc(str(cfg('effort', 'agent')))}",
+        f"• <b>Agents:</b> <code>{esc(str(cfg('worker_model', 'agent')))}</code> · {esc(str(cfg('worker_provider', 'agent')))} · "
+        f"up to {_max_agents()} in parallel",
+        f"• <b>Project:</b> <code>{esc(ws.name)}</code> — {n} files · {human(size)} · git: {git}",
+        f"• <b>Plan mode:</b> {'on' if cfg('plan_mode', 'agent') else 'off'} · "
+        f"<b>Permissions:</b> {esc(str(cfg('permissions', 'agent')))}",
+        f"• <b>GitHub:</b> {'connected' if github_tools.enabled() else 'not connected'} · "
+        f"<b>CI watches:</b> {len(load_watches())}",
+        f"• <b>Background jobs:</b> {running} running · <b>Undo points:</b> {checkpoints().count(ws.name)}",
+        f"• <b>This session:</b> {agent.usage_line(total)}",
+    ]
+    await send_html(context.bot, chat_id, "\n".join(rows))
+
+
+async def cmd_jobs(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if (chat_id := await _owner_cmd(update, context)) is None:
+        return
+    ws = get_ws()
+    jobs = workspace_jobs(ws)
+    if not jobs:
+        await send_html(context.bot, chat_id, "No background jobs in this project.")
+        return
+    rows = ["📟 <b>Background jobs</b>", ""]
+    rows += [f"• <code>{j.id}</code> {esc(j.status())} — <code>{esc(j.command[:80])}</code>" for j in jobs]
+    kb = [[_btn(f"⏹ Stop job {j.id}", f"jobkill:{j.id}")] for j in jobs if j.running][:10]
+    await send_html(context.bot, chat_id, "\n".join(rows), InlineKeyboardMarkup(kb) if kb else None)
+
+
+def workspace_jobs(ws: Workspace) -> list:
+    import workspace as wsmod
+    return list(wsmod._jobs.get(str(ws.real), {}).values())
+
+
+async def on_job_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    q = update.callback_query
+    if not is_owner(update):
+        await q.answer("Owner only", show_alert=True)
+        return
+    try:
+        out = get_ws().job(int(q.data.split(":", 1)[1]), "kill")
+    except (WorkspaceError, ValueError) as e:
+        out = str(e)
+    await q.answer(out[:180])
+
+
+async def cmd_todos(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if (chat_id := await _owner_cmd(update, context)) is None:
+        return
+    board = last_boards.get(chat_id)
+    if not board or not board.todos:
+        await send_html(context.bot, chat_id, "No plan yet — the lead writes one for multi-step work.")
+        return
+    icon = {"pending": "⬜", "in_progress": "🔄", "completed": "✅"}
+    rows = [f"📋 <b>Latest plan</b> — <code>{esc(board.project)}</code>", ""]
+    rows += [f"{icon[t['status']]} {esc(t['content'])}" for t in board.todos]
+    await send_html(context.bot, chat_id, "\n".join(rows))
+
+
+async def cmd_export(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """The coding conversation + project journal as a Markdown file (like /export)."""
+    if (chat_id := await _owner_cmd(update, context)) is None:
+        return
+    project = current_project()
+    out = [f"# Coding session — {project}\n"]
+    for m in agent_histories[agent_key(chat_id, project)]:
+        who = "You" if m["role"] == "user" else "Lead"
+        out.append(f"## {who}\n\n{m['content'] if isinstance(m['content'], str) else '[non-text content]'}\n")
+    if journal := journal_text(project):
+        out.append(f"## Project journal\n\n{journal}\n")
+    await send_file(context.bot, chat_id, "\n".join(out).encode(), f"{project}-session.md", "📤 Session export")
+
+
+async def cmd_agents(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if (chat_id := await _owner_cmd(update, context)) is None:
+        return
+    ws = get_ws()
+    rows = ["🤖 <b>Agent types</b> — the lead picks one per task", ""]
+    for name, spec in agent.agent_types(ws).items():
+        flags = " · read-only" if spec.get("readonly") else ""
+        flags += f" · model {esc(spec['model'])}" if spec.get("model") else ""
+        rows.append(f"• <code>{esc(name)}</code>{flags} — {esc(spec['description'])}")
+    rows += ["", "<b>Custom agents:</b> add <code>.agents/NAME.md</code> (or <code>.claude/agents/NAME.md</code>) to the "
+             "project with the agent's instructions. Optional front matter: <code>description</code>, "
+             "<code>readonly: true</code>, <code>model: …</code>.",
+             "<b>Hooks:</b> <code>.agents/hooks.json</code> → <code>{\"after_edit\": \"ruff format {file}\"}</code> runs "
+             "after every file edit; any output goes back to the agent."]
+    await send_html(context.bot, chat_id, "\n".join(rows))
+
+
+async def cmd_doctor(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Health check of everything the bot depends on."""
+    if (chat_id := await _owner_cmd(update, context)) is None:
+        return
+    await context.bot.send_chat_action(chat_id, ChatAction.TYPING)
+    rows = ["🩺 <b>Doctor</b>", ""]
+
+    def line(ok: bool | None, text: str) -> None:
+        rows.append(f"{'✅' if ok else '⚠️' if ok is None else '❌'} {text}")
+
+    try:
+        async with httpx.AsyncClient(timeout=15) as http:
+            r = await http.get(f"{OPENROUTER_BASE_URL}/key", headers={"Authorization": f"Bearer {OPENROUTER_API_KEY}"})
+        line(r.status_code == 200, f"OpenRouter key (HTTP {r.status_code})")
+    except Exception as e:
+        line(False, f"OpenRouter unreachable: {esc(str(e)[:120])}")
+    if github_tools.enabled():
+        try:
+            line(True, f"GitHub token — signed in as <code>{esc(await github_tools.login())}</code>")
+        except Exception as e:
+            line(False, f"GitHub token rejected: {esc(str(e)[:120])}")
+    else:
+        line(None, "GitHub not connected (add the GH_PAT secret)")
+    line(vault.enabled() or None, "PERSONA_KEY set — persona and rules encrypted" if vault.enabled()
+         else "PERSONA_KEY missing — persona and rules stored unencrypted")
+    for tool in ("git", "python3", "node", "npm"):
+        line(bool(shutil.which(tool)) or None, f"{tool} {'available' if shutil.which(tool) else 'not installed'}")
+    free = shutil.disk_usage(DATA_DIR if DATA_DIR.exists() else Path(".")).free
+    line(free > 1_000_000_000 or None, f"Free disk: {human(free)}")
+    await send_html(context.bot, chat_id, "\n".join(rows))
+
+
+async def run_shell(bot, chat_id: int, command: str) -> None:
+    if agent._DANGER.search(command):
+        await send_html(bot, chat_id, "⛔ Destructive command refused.")
+        return
+    ws = get_ws()
+    await bot.send_chat_action(chat_id, ChatAction.TYPING)
+    r = await ws.run(command, 300)
+    status = "⏱ timed out" if r["timed_out"] else ("✅" if r["code"] == 0 else f"❌ exit {r['code']}")
+    out = r["output"].strip() or "(no output)"
+    head = f"{status} · <code>{esc(command[:200])}</code> · {r['seconds']:.1f}s"
+    if len(out) > 3300:
+        await send_html(bot, chat_id, head)
+        await send_file(bot, chat_id, out.encode(), "output.txt")
+    else:
+        await send_html(bot, chat_id, f"{head}\n<pre>{esc(out)}</pre>")
+
+
+def add_memory(note: str) -> None:
+    f = get_ws().root / "AGENTS.md"
+    cur = f.read_text(encoding="utf-8") if f.is_file() else "# AGENTS.md — project memory\n"
+    f.write_text(cur.rstrip("\n") + f"\n- {note.strip()}\n", encoding="utf-8")
+
+
+# ----- Buttons on coding mode's final reply -----
 
 async def on_agent_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     q = update.callback_query
     if not is_owner(update):
-        await q.answer("لصاحب البوت فقط", show_alert=True)
+        await q.answer("Owner only", show_alert=True)
         return
     chat_id = q.message.chat_id
     kind, _, rest = q.data.partition(":")
@@ -2540,34 +2862,34 @@ async def on_agent_button(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await do_undo(bot, chat_id, rest)
     elif kind == "diff":
         if not (text := diffs.get(rest)):
-            await q.answer("الفرق ما عاد محفوظ", show_alert=True)
+            await q.answer("The diff is no longer stored", show_alert=True)
             return
         await q.answer()
-        await send_file(bot, chat_id, text.encode(), "changes.diff", "📄 فرق التعديلات")
+        await send_file(bot, chat_id, text.encode(), "changes.diff", "📄 Diff of the changes")
     elif kind == "rep":
         if not (text := reports.get(rest)):
-            await q.answer("التقارير ما عادت محفوظة", show_alert=True)
+            await q.answer("The reports are no longer stored", show_alert=True)
             return
         await q.answer()
-        await send_file(bot, chat_id, text.encode(), "agents-reports.md", "🤖 تقارير الوكلاء")
+        await send_file(bot, chat_id, text.encode(), "agents-reports.md", "🤖 Agent reports")
     elif kind == "zip":
-        await q.answer("📦 أجهّز الملف…")
+        await q.answer("📦 Preparing the file…")
         await send_zip(bot, chat_id)
     elif kind == "ask":
         key, _, idx = rest.partition(":")
         opts = asks.get(key)
         if not opts or not idx.isdigit() or int(idx) >= len(opts):
-            await q.answer("السؤال ما عاد متاح — اكتب جوابك", show_alert=True)
+            await q.answer("This question is no longer available — type your answer", show_alert=True)
             return
         if chat_id in active:
-            await q.answer("استنى يخلص الرد الحالي")
+            await q.answer("Wait for the current reply to finish")
             return
         await q.answer()
         asks.pop(key, None)
         answer = opts[int(idx)]
         with contextlib.suppress(TelegramError):
             await q.edit_message_reply_markup(REGEN_KB)
-        await send_html(bot, chat_id, RLM + f"↩️ <b>اخترت:</b> {esc(answer)}")
+        await send_html(bot, chat_id, f"↩️ <b>You chose:</b> {esc(answer)}")
         await generate(bot, chat_id, Turn(None, answer, answer, {}, q.from_user.id, mode="agent",
                                           project=current_project()))
     elif kind == "plan":
@@ -2576,17 +2898,17 @@ async def on_agent_button(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         with contextlib.suppress(TelegramError):
             await q.edit_message_reply_markup(REGEN_KB)
         if action != "go":
-            await send_html(bot, chat_id, RLM + "تمام، ما نفّذت. اكتب ملاحظاتك على الخطة وأعدّلها.")
+            await send_html(bot, chat_id, "OK, nothing was executed. Send your notes on the plan and I'll revise it.")
             return
         if chat_id in active:
             return
-        await send_html(bot, chat_id, RLM + "✅ <b>وافقت على الخطة</b> — بدأ التنفيذ.")
-        text = "✅ موافق على الخطة. نفّذها الحين بالكامل، وتحقق من النتيجة فعلياً."
+        await send_html(bot, chat_id, "✅ <b>Plan approved</b> — execution started.")
+        text = "✅ Plan approved. Execute it fully now, and actually verify the result."
         await generate(bot, chat_id, Turn(None, text, text, {"plan_mode": False}, q.from_user.id, mode="agent",
                                           project=project or current_project()))
 
 
-# ----- متابعة CI على GitHub بالخلفية -----
+# ----- Background CI watching on GitHub -----
 
 watch_lock = asyncio.Lock()
 watch_alerts: "OrderedDict[str, dict]" = OrderedDict()
@@ -2600,9 +2922,9 @@ def load_watches() -> dict:
 def digest_text(d: dict) -> str:
     parts = []
     for j in d.get("failed_jobs") or []:
-        steps = "، ".join(j.get("failed_steps") or []) or "؟"
-        parts.append(f"❌ {j.get('job')} ({j.get('conclusion')}) — الخطوات الفاشلة: {steps}\n{j.get('log', '')}")
-    return "\n\n".join(parts) or "(ما لقيت تفاصيل الفشل)"
+        steps = ", ".join(j.get("failed_steps") or []) or "?"
+        parts.append(f"❌ {j.get('job')} ({j.get('conclusion')}) — failed steps: {steps}\n{j.get('log', '')}")
+    return "\n\n".join(parts) or "(no failure details found)"
 
 
 async def alert_failure(bot, repo: str, w: dict, r: dict) -> None:
@@ -2613,15 +2935,15 @@ async def alert_failure(bot, repo: str, w: dict, r: dict) -> None:
     text = digest_text(d)
     key = new_key()
     _remember(watch_alerts, key, {"repo": repo, "run": r, "digest": text, "chat": w["chat"]}, keep=60)
-    jobs = "، ".join(str(j.get("job")) for j in d.get("failed_jobs") or []) or "—"
-    html = lines_html(f"🔴 <b>فشل CI</b> — <code>{esc(repo)}</code>",
+    jobs = ", ".join(str(j.get("job")) for j in d.get("failed_jobs") or []) or "—"
+    html = lines_html(f"🔴 <b>CI failed</b> — <code>{esc(repo)}</code>",
                       f"⚙️ {esc(str(r.get('workflow')))} · 🌿 {esc(str(r.get('branch')))} · <code>{esc(str(r.get('sha')))}</code>",
                       f"❌ {esc(jobs)}")
     if r.get("url"):
-        html += f'\n<a href="{esc(r["url"])}">فتح التشغيل على GitHub</a>'
+        html += f'\n<a href="{esc(r["url"])}">Open the run on GitHub</a>'
     html += f"\n<blockquote expandable>{esc(text[:1500])}</blockquote>"
-    kb = InlineKeyboardMarkup([[_btn("🛠 صلّحها الوكلاء", f"wfix:{key}"), _btn("🔁 أعد التشغيل", f"wre:{key}")],
-                               [_btn("🔕 إيقاف المتابعة", f"woff:{key}")]])
+    kb = InlineKeyboardMarkup([[_btn("🛠 Fix it with agents", f"wfix:{key}"), _btn("🔁 Re-run", f"wre:{key}")],
+                               [_btn("🔕 Stop watching", f"woff:{key}")]])
     await send_html(bot, w["chat"], html, kb, keep=False)
     k = f"{r.get('workflow')}|{r.get('branch')}"
     streak = w.setdefault("autofix_streak", {})
@@ -2640,23 +2962,23 @@ async def start_ci_fix(bot, key: str) -> bool:
         project = valid_name(repo.split("/")[-1])
     except WorkspaceError:
         project = "main"
-    text = (f"🔴 فشل CI في المستودع {repo}\n"
-            f"- workflow: {r.get('workflow')} · الفرع: {r.get('branch')} · commit: {r.get('sha')} · run_id: {r.get('id')}\n"
-            f"- الرابط: {r.get('url')}\n\nتفاصيل الفشل:\n{a['digest'][:7000]}\n\n"
-            f"المطلوب: صلّح سبب الفشل من جذره. لو المستودع مو مستنسخ في هذا المشروع استنسخه (git_clone) على الفرع "
-            f"{r.get('branch')}. أعد إنتاج الخطأ محلياً بنفس أوامر الـ workflow، صلّحه وتحقق، ثم ارفع على نفس الفرع "
-            "(git_push) وتابع CI (gh_actions action=watch) لين يصير أخضر. لا تعطّل اختبارات ولا تتجاهل الخطأ.")
-    short = f"صلّح فشل CI في {repo} ({r.get('workflow')} على {r.get('branch')}، run {r.get('id')})"
+    text = (f"🔴 CI failed in repository {repo}\n"
+            f"- workflow: {r.get('workflow')} · branch: {r.get('branch')} · commit: {r.get('sha')} · run_id: {r.get('id')}\n"
+            f"- link: {r.get('url')}\n\nFailure details:\n{a['digest'][:7000]}\n\n"
+            f"Task: fix the root cause of the failure. If the repository isn't cloned in this project, clone it (git_clone) on branch "
+            f"{r.get('branch')}. Reproduce the error locally with the workflow's own commands, fix it and verify, then push to the same branch "
+            "(git_push) and watch CI (gh_actions action=watch) until it's green. Never disable tests or ignore the error.")
+    short = f"Fix the CI failure in {repo} ({r.get('workflow')} on {r.get('branch')}, run {r.get('id')})"
     save_setting("project", project, "agent")
     get_ws(project)
-    await send_html(bot, a["chat"], lines_html(f"🛠 <b>القائد بدأ يصلّح فشل CI</b> في <code>{esc(repo)}</code>",
-                                               f"📁 المشروع: <code>{esc(project)}</code>"))
+    await send_html(bot, a["chat"], lines_html(f"🛠 <b>The lead started fixing the CI failure</b> in <code>{esc(repo)}</code>",
+                                               f"📁 Project: <code>{esc(project)}</code>"))
     asyncio.create_task(generate(bot, a["chat"], Turn(None, text, short, {}, OWNER_ID, mode="agent", project=project)))
     return True
 
 
 async def watch_tick(bot) -> None:
-    """يفحص المستودعات المتابَعة: أي تشغيل CI خلص بفشل → تنبيه (وإصلاح تلقائي لو مفعّل)."""
+    """Checks the watched repositories: any CI run that finished with a failure → an alert (and an auto-fix if enabled)."""
     data = load_watches()
     if not data or not github_tools.enabled():
         return
@@ -2684,7 +3006,7 @@ async def watch_tick(bot) -> None:
             elif r.get("conclusion") == "success" and failing.pop(k, None):
                 w.setdefault("autofix_streak", {}).pop(k, None)
                 await send_html(bot, w["chat"], lines_html(
-                    f"✅ <b>رجع CI أخضر</b> — <code>{esc(repo)}</code>",
+                    f"✅ <b>CI is green again</b> — <code>{esc(repo)}</code>",
                     f"⚙️ {esc(str(r.get('workflow')))} · 🌿 {esc(str(r.get('branch')))} · <code>{esc(str(r.get('sha')))}</code>"),
                     keep=False)
         if not primed:
@@ -2706,45 +3028,45 @@ async def watch_loop(bot) -> None:
 
 
 async def cmd_watch(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """/watch owner/repo [branch] [auto] · /watch off owner/repo · /watch (القائمة)."""
+    """/watch owner/repo [branch] [auto] · /watch off owner/repo · /watch (the list)."""
     if (chat_id := await _owner_cmd(update, context)) is None:
         return
     bot = context.bot
     if not github_tools.enabled():
-        await send_html(bot, chat_id, RLM + "⚠️ GitHub غير مربوط — أضف السر GH_PAT.")
+        await send_html(bot, chat_id, "⚠️ GitHub is not connected — add the GH_PAT secret.")
         return
     args = context.args or []
     async with watch_lock:
         data = load_watches()
         if not args:
-            rows = ["👀 <b>متابعة CI</b>", ""]
+            rows = ["👀 <b>CI watching</b>", ""]
             rows += [f"• <code>{esc(r)}</code>" + (f" · 🌿 {esc(w['branch'])}" if w.get("branch") else "")
-                     + (" · 🛠 إصلاح تلقائي" if w.get("auto") else "") for r, w in data.items()] or ["ما فيه مستودعات متابَعة."]
-            rows += ["", "إضافة: <code>/watch owner/repo [branch] [auto]</code>",
-                     "<code>auto</code> = القائد يصلّح الفشل ويرفع لحاله · إيقاف: <code>/watch off owner/repo</code>"]
+                     + (" · 🛠 auto-fix" if w.get("auto") else "") for r, w in data.items()] or ["No repositories are being watched."]
+            rows += ["", "Add: <code>/watch owner/repo [branch] [auto]</code>",
+                     "<code>auto</code> = the lead fixes failures and pushes on its own · stop: <code>/watch off owner/repo</code>"]
             await send_html(bot, chat_id, lines_html(*rows))
             return
-        off = args[0].lower() in ("off", "stop", "ايقاف", "إيقاف")
+        off = args[0].lower() in ("off", "stop")
         raw = args[1] if off and len(args) > 1 else args[0]
         repo = raw.removeprefix("https://github.com/").removesuffix(".git").strip("/")
         try:
             if "/" not in repo:
                 repo = f"{await github_tools.login()}/{repo}"
         except Exception as e:
-            await send_html(bot, chat_id, RLM + "⚠️ " + esc(str(e)[:200]))
+            await send_html(bot, chat_id, "⚠️ " + esc(str(e)[:200]))
             return
         if off:
             data.pop(repo, None)
             _write_json(dpath("watches.json"), data)
-            await send_html(bot, chat_id, RLM + f"🔕 وقفت متابعة <code>{esc(repo)}</code>.")
+            await send_html(bot, chat_id, f"🔕 Stopped watching <code>{esc(repo)}</code>.")
             return
         extra = [a for a in args[1:]]
-        auto = any(a.lower() in ("auto", "تلقائي") for a in extra)
-        branch = next((a for a in extra if a.lower() not in ("auto", "تلقائي")), None)
+        auto = any(a.lower() == "auto" for a in extra)
+        branch = next((a for a in extra if a.lower() != "auto"), None)
         try:
             runs = await github_tools.recent_runs(repo, branch, 15)
         except Exception as e:
-            await send_html(bot, chat_id, RLM + "⚠️ ما قدرت أقرأ CI للمستودع: " + esc(str(e)[:300]))
+            await send_html(bot, chat_id, "⚠️ Couldn't read the repository's CI: " + esc(str(e)[:300]))
             return
         data[repo] = {"chat": chat_id, "branch": branch, "auto": auto, "primed": True,
                       "seen": sorted(r["id"] for r in runs if r.get("status") == "completed")}
@@ -2752,40 +3074,40 @@ async def cmd_watch(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     last = runs[0] if runs else None
     icon = {"success": "✅", "failure": "❌", None: "⏳"}.get(last.get("conclusion") if last else None, "⚪️") if last else ""
     await send_html(bot, chat_id, lines_html(
-        f"👀 <b>أتابع CI</b> في <code>{esc(repo)}</code>" + (f" · 🌿 {esc(branch)}" if branch else ""),
-        f"آخر تشغيل: {icon} {esc(str(last.get('workflow')))} على {esc(str(last.get('branch')))}" if last else "ما فيه تشغيلات بعد.",
-        "🛠 الإصلاح التلقائي شغّال: أي فشل، القائد يصلّحه ويرفع ويتابع لين يخضر." if auto
-        else "أي فشل يوصلك تنبيه مع زر «🛠 صلّحها الوكلاء».",
+        f"👀 <b>Watching CI</b> in <code>{esc(repo)}</code>" + (f" · 🌿 {esc(branch)}" if branch else ""),
+        f"Latest run: {icon} {esc(str(last.get('workflow')))} on {esc(str(last.get('branch')))}" if last else "No runs yet.",
+        "🛠 Auto-fix is on: on any failure the lead fixes it, pushes, and watches until it's green." if auto
+        else "Any failure sends you an alert with a \"🛠 Fix it with agents\" button.",
     ))
 
 
 async def on_watch_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     q = update.callback_query
     if not is_owner(update):
-        await q.answer("لصاحب البوت فقط", show_alert=True)
+        await q.answer("Owner only", show_alert=True)
         return
     kind, _, key = q.data.partition(":")
     a = watch_alerts.get(key)
     if not a:
-        await q.answer("التنبيه قديم — افتح /watch", show_alert=True)
+        await q.answer("This alert is old — open /watch", show_alert=True)
         return
     if kind == "wfix":
-        await q.answer("🛠 بدأ الإصلاح")
+        await q.answer("🛠 Fix started")
         with contextlib.suppress(TelegramError):
             await q.edit_message_reply_markup(None)
         await start_ci_fix(context.bot, key)
     elif kind == "wre":
         try:
             await github_tools.rerun(a["repo"], a["run"]["id"])
-            await q.answer("🔁 انعاد تشغيل الوظائف الفاشلة")
+            await q.answer("🔁 Re-running the failed jobs")
         except Exception as e:
-            await q.answer(f"ما قدرت: {str(e)[:150]}", show_alert=True)
+            await q.answer(f"Couldn't: {str(e)[:150]}", show_alert=True)
     elif kind == "woff":
         async with watch_lock:
             data = load_watches()
             data.pop(a["repo"], None)
             _write_json(dpath("watches.json"), data)
-        await q.answer("🔕 وقفت المتابعة")
+        await q.answer("🔕 Stopped watching")
         with contextlib.suppress(TelegramError):
             await q.edit_message_reply_markup(None)
 
@@ -2794,9 +3116,9 @@ async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
     log.error("unhandled error", exc_info=context.error)
 
 
-# ================= التشغيل =================
+# ================= Startup =================
 
-# خريطة الوظائف: كل "action" في config.json يشير لوظيفة هنا. الأسماء والقوائم في config.json.
+# The action map: every "action" in config.json points to a function here. Names and menus live in config.json.
 def _actions() -> dict:
     return {
         "start": cmd_start,
@@ -2828,6 +3150,17 @@ def _actions() -> dict:
         "clone": cmd_clone,
         "push": cmd_push,
         "watch": cmd_watch,
+        "init": cmd_init,
+        "review": cmd_review,
+        "security_review": cmd_security_review,
+        "pr_comments": cmd_pr_comments,
+        "context": cmd_context,
+        "status": cmd_status,
+        "jobs": cmd_jobs,
+        "todos": cmd_todos,
+        "export": cmd_export,
+        "agents": cmd_agents,
+        "doctor": cmd_doctor,
         "set": cmd_set,
         "effort": shortcut("effort", lambda c: (c.args or ["default"])[0]),
         "thinking": shortcut("show_thinking", lambda c: "off" if cfg("show_thinking", owner_mode()) else "on"),
@@ -2836,7 +3169,7 @@ def _actions() -> dict:
 
 
 def _menu_commands(scope: str) -> list:
-    """قائمة أوامر "/" حسب النطاق: default = للكل، owner = المالك بنسخة المحادثة، code = المالك بنسخة البرمجة."""
+    """The "/" command menu per scope: default = everyone, owner = the owner in Chat, code = the owner in Coding."""
     want = {"default": {"both", "default"}, "owner": {"both", "default", "owner", "owner_all"},
             "code": {"both", "default", "code", "owner_all"}}[scope]
     out = []
@@ -2848,7 +3181,7 @@ def _menu_commands(scope: str) -> list:
 
 
 async def set_menu(app: Application) -> None:
-    # قائمة الأوامر اللي تطلع عند زر "/" في تليجرام — من config.json
+    # the command list shown by Telegram's "/" button — from config.json
     with contextlib.suppress(TelegramError):
         await app.bot.set_my_commands(_menu_commands("default"), scope=BotCommandScopeDefault())
     await refresh_owner_menu(app.bot)
@@ -2856,36 +3189,36 @@ async def set_menu(app: Application) -> None:
 
 async def post_init(app: Application) -> None:
     await set_menu(app)
-    app.bot_data["watch_task"] = asyncio.create_task(watch_loop(app.bot))  # متابعة CI بالخلفية
+    app.bot_data["watch_task"] = asyncio.create_task(watch_loop(app.bot))  # background CI watching
 
 
 async def post_shutdown(app: Application) -> None:
     task = app.bot_data.get("watch_task")
     if task:
         task.cancel()
-    kill_all_jobs()  # أي خادم شغّله الوكلاء بالخلفية يوقف مع البوت
+    kill_all_jobs()  # any server the agents started in the background stops with the bot
 
 
 def build_app() -> Application:
     builder = (Application.builder().token(TELEGRAM_BOT_TOKEN).post_init(post_init).post_shutdown(post_shutdown)
                .concurrent_updates(True))
-    if api := os.getenv("TELEGRAM_API_BASE"):  # اختياري: خادم Bot API محلي
+    if api := os.getenv("TELEGRAM_API_BASE"):  # optional: a local Bot API server
         builder = builder.base_url(f"{api}/bot").base_file_url(f"{api}/file/bot")
-    app = builder.build()  # concurrent_updates عشان زر الإيقاف يشتغل والرد شغال
+    app = builder.build()  # concurrent_updates so the stop button works while a reply is running
     app.add_handler(MessageHandler(filters.UpdateType.MESSAGE, capture_messages), group=-1)
 
-    # تسجيل الأوامر من config.json
+    # register the commands from config.json
     actions = _actions()
     for c in config.COMMANDS:
         fn = actions.get(c.get("action"))
         if not fn or not c.get("names"):
-            log.warning("أمر غير معروف في config.json: %s", c)
+            log.warning("Unknown command in config.json: %s", c)
             continue
         app.add_handler(CommandHandler(c["names"], fn))
-        if c.get("caption"):  # يقبل الأمر مكتوب في وصف ملف/صورة
+        if c.get("caption"):  # accept the command written in a file/photo caption
             app.add_handler(MessageHandler(filters.CaptionRegex(rf"^/{re.escape(c['names'][0])}"), fn))
 
-    # أزرار الكيبورد السفلي
+    # the bottom keyboard buttons
     app.add_handler(MessageHandler(filters.Regex(f"^{re.escape(NEW_CHAT_BTN)}$"), cmd_new))
     app.add_handler(MessageHandler(filters.Regex(f"^{re.escape(SETTINGS_BTN)}$"), cmd_settings))
     app.add_handler(MessageHandler(filters.Regex(f"^{re.escape(AGENT_BTN)}$"), cmd_agent))
@@ -2902,6 +3235,8 @@ def build_app() -> Application:
     app.add_handler(CallbackQueryHandler(on_agent_button, pattern=r"^(undo|diff|rep|ask|plan):|^zip$"))
     app.add_handler(CallbackQueryHandler(on_project_button, pattern=r"^(proj|projdel):"))
     app.add_handler(CallbackQueryHandler(on_watch_button, pattern=r"^(wfix|wre|woff):"))
+    app.add_handler(CallbackQueryHandler(on_permission_button, pattern=r"^perm:"))
+    app.add_handler(CallbackQueryHandler(on_job_button, pattern=r"^jobkill:"))
 
     app.add_handler(MessageHandler(filters.UpdateType.EDITED_MESSAGE & filters.TEXT, on_edited_message))
     app.add_handler(MessageHandler(filters.UpdateType.MESSAGE & ~filters.COMMAND & ~filters.StatusUpdate.ALL,
@@ -2912,9 +3247,9 @@ def build_app() -> Application:
 
 def main() -> None:
     if OWNER_ID == 0:
-        log.warning("OWNER_ID غير محدد — أوامر المالك لن تعمل لأحد.")
+        log.warning("OWNER_ID is not set — owner commands won't work for anyone.")
     load_state()
-    log.info("البوت شغال عبر OpenRouter بموديل %s والمزود %s", cfg("model"), cfg("provider"))
+    log.info("Bot running via OpenRouter with model %s and provider %s", cfg("model"), cfg("provider"))
     build_app().run_polling(allowed_updates=Update.ALL_TYPES)
 
 

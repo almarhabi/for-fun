@@ -1,14 +1,14 @@
-"""أدوات GitHub للبوت — للمالك فقط. تحكّم كامل تقريباً بمستودعات المالك:
+"""The bot's GitHub tools — owner only. Near-complete control over the owner's repositories:
 
-- الملفات والفروع والمستودعات والـ PR (الأدوات الأساسية gh_*).
-- gh_repo: معلومات، فروع، commits، مقارنة، بحث في الكود، إصدارات.
-- gh_pr: عرض/ملفات/تعليقات/دمج/تحديث/إغلاق الـ PR.
-- gh_issue: عرض وإنشاء وتعديل والتعليق على الـ issues.
-- gh_actions: الـ workflows والتشغيلات، سجلات الأخطاء، إعادة التشغيل، الإلغاء، التشغيل اليدوي،
-  و«watch» يتابع CI مباشرة لين يخلص ويرجّع سبب الفشل.
+- Files, branches, repositories and PRs (the basic gh_* tools).
+- gh_repo: info, branches, commits, compare, code search, releases.
+- gh_pr: view / files / comments / merge / update / close a PR.
+- gh_issue: view, create, edit and comment on issues.
+- gh_actions: workflows and runs, error logs, re-run, cancel, manual dispatch,
+  and "watch", which follows CI live until it finishes and returns the cause of any failure.
 
-التوكن من السر GH_PAT. ما فيه حذف مستودعات (إجراء خطير وغير قابل للتراجع).
-البوت يتأكد إن الطالب هو المالك قبل ما يشغّل أي أداة هنا (الفحص في bot.py).
+The token comes from the GH_PAT secret. There is no repository deletion (dangerous and irreversible).
+The bot checks that the caller is the owner before running any tool here (the check is in bot.py).
 """
 
 import asyncio
@@ -22,74 +22,74 @@ import httpx
 
 API_BASE = os.getenv("GITHUB_API_BASE", "https://api.github.com").rstrip("/")
 MAX_READ_CHARS = 50_000
-WATCH_POLL = float(os.getenv("GH_WATCH_POLL", "15"))   # كل كم ثانية نفحص CI وقت المتابعة
+WATCH_POLL = float(os.getenv("GH_WATCH_POLL", "15"))   # seconds between CI checks while watching
 
-_REPO = {"type": "string", "description": "owner/name أو name"}
+_REPO = {"type": "string", "description": "owner/name or name"}
 
 GITHUB_TOOLS = [
     {"type": "function", "function": {
         "name": "gh_list_repos",
-        "description": "اعرض مستودعات المالك على GitHub (الأحدث تعديلاً). استخدمها لتعرف أسماء المستودعات.",
+        "description": "List the owner's GitHub repositories (most recently updated first). Use it to learn repository names.",
         "parameters": {"type": "object", "properties": {
-            "query": {"type": "string", "description": "فلترة بالاسم (اختياري)"}}}}},
+            "query": {"type": "string", "description": "Filter by name (optional)"}}}}},
     {"type": "function", "function": {
         "name": "gh_read_file",
-        "description": "اقرأ محتوى ملف من مستودع.",
+        "description": "Read a file's content from a repository.",
         "parameters": {"type": "object", "properties": {
             "repo": _REPO, "path": {"type": "string"},
-            "ref": {"type": "string", "description": "فرع أو commit (اختياري)"}},
+            "ref": {"type": "string", "description": "Branch or commit (optional)"}},
             "required": ["repo", "path"]}}},
     {"type": "function", "function": {
         "name": "gh_list_dir",
-        "description": "اعرض محتويات مجلد في مستودع (أو الجذر لو path فاضي).",
+        "description": "List a folder's contents in a repository (or the root if path is empty).",
         "parameters": {"type": "object", "properties": {
             "repo": _REPO, "path": {"type": "string"}, "ref": {"type": "string"}},
             "required": ["repo"]}}},
     {"type": "function", "function": {
         "name": "gh_put_file",
-        "description": "أنشئ ملفاً جديداً أو عدّل ملفاً موجوداً مباشرة على GitHub (يكتب المحتوى كامل ويعمل commit).",
+        "description": "Create a new file or update an existing one directly on GitHub (writes the full content and commits).",
         "parameters": {"type": "object", "properties": {
             "repo": _REPO, "path": {"type": "string"},
-            "content": {"type": "string", "description": "محتوى الملف كامل"},
-            "message": {"type": "string", "description": "رسالة الـ commit"},
-            "branch": {"type": "string", "description": "الفرع (اختياري، الافتراضي الفرع الرئيسي)"}},
+            "content": {"type": "string", "description": "The full file content"},
+            "message": {"type": "string", "description": "Commit message"},
+            "branch": {"type": "string", "description": "Branch (optional, default: the default branch)"}},
             "required": ["repo", "path", "content", "message"]}}},
     {"type": "function", "function": {
         "name": "gh_delete_file",
-        "description": "احذف ملفاً من مستودع (يعمل commit).",
+        "description": "Delete a file from a repository (commits).",
         "parameters": {"type": "object", "properties": {
             "repo": _REPO, "path": {"type": "string"},
             "message": {"type": "string"}, "branch": {"type": "string"}},
             "required": ["repo", "path", "message"]}}},
     {"type": "function", "function": {
         "name": "gh_create_repo",
-        "description": "أنشئ مستودعاً جديداً للمالك.",
+        "description": "Create a new repository for the owner.",
         "parameters": {"type": "object", "properties": {
             "name": {"type": "string"},
-            "private": {"type": "boolean", "description": "خاص؟ الافتراضي نعم"},
+            "private": {"type": "boolean", "description": "Private? Default yes"},
             "description": {"type": "string"},
-            "auto_init": {"type": "boolean", "description": "ينشئ README وفرع أول؟ الافتراضي نعم"}},
+            "auto_init": {"type": "boolean", "description": "Create a README and a first branch? Default yes"}},
             "required": ["name"]}}},
     {"type": "function", "function": {
         "name": "gh_create_branch",
-        "description": "أنشئ فرعاً جديداً من فرع موجود.",
+        "description": "Create a new branch from an existing one.",
         "parameters": {"type": "object", "properties": {
             "repo": _REPO, "branch": {"type": "string"},
-            "from_branch": {"type": "string", "description": "الفرع المصدر (اختياري)"}},
+            "from_branch": {"type": "string", "description": "Source branch (optional)"}},
             "required": ["repo", "branch"]}}},
     {"type": "function", "function": {
         "name": "gh_open_pr",
-        "description": "افتح Pull Request.",
+        "description": "Open a pull request.",
         "parameters": {"type": "object", "properties": {
             "repo": _REPO, "title": {"type": "string"},
-            "head": {"type": "string", "description": "الفرع اللي فيه التغييرات"},
-            "base": {"type": "string", "description": "الفرع الهدف"},
+            "head": {"type": "string", "description": "The branch with the changes"},
+            "base": {"type": "string", "description": "The target branch"},
             "body": {"type": "string"}},
             "required": ["repo", "title", "head", "base"]}}},
     {"type": "function", "function": {
         "name": "gh_repo",
-        "description": ("معلومات وتاريخ المستودع. action: info (الوصف والفرع الرئيسي وآخر commit) · branches · "
-                        "commits (sha/branch/path/limit) · commit (sha: الملفات والفرق) · compare (base, head) · "
+        "description": ("Repository info and history. action: info (description, default branch, last commit) · branches · "
+                        "commits (sha/branch/path/limit) · commit (sha: files and diff) · compare (base, head) · "
                         "search_code (query) · release (tag, title, body, branch) · delete_branch (branch)."),
         "parameters": {"type": "object", "properties": {
             "action": {"type": "string", "enum": ["info", "branches", "commits", "commit", "compare",
@@ -101,8 +101,8 @@ GITHUB_TOOLS = [
             "required": ["action", "repo"]}}},
     {"type": "function", "function": {
         "name": "gh_pr",
-        "description": ("Pull Requests. action: list (state) · get (number: التفاصيل وقابلية الدمج وحالة CI) · "
-                        "files (number: الملفات والفرق) · comments (number) · comment (number, body) · "
+        "description": ("Pull requests. action: list (state) · get (number: details, mergeability and CI status) · "
+                        "files (number: files and diff) · comments (number) · comment (number, body) · "
                         "merge (number, method: merge|squash|rebase) · update_branch (number) · close (number)."),
         "parameters": {"type": "object", "properties": {
             "action": {"type": "string", "enum": ["list", "get", "files", "comments", "comment", "merge",
@@ -113,7 +113,7 @@ GITHUB_TOOLS = [
             "required": ["action", "repo"]}}},
     {"type": "function", "function": {
         "name": "gh_issue",
-        "description": ("Issues. action: list (state, labels) · get (number مع التعليقات) · create (title, body, labels) · "
+        "description": ("Issues. action: list (state, labels) · get (number, with comments) · create (title, body, labels) · "
                         "update (number, title/body/state/labels) · comment (number, body)."),
         "parameters": {"type": "object", "properties": {
             "action": {"type": "string", "enum": ["list", "get", "create", "update", "comment"]},
@@ -124,18 +124,18 @@ GITHUB_TOOLS = [
     {"type": "function", "function": {
         "name": "gh_actions",
         "description": ("GitHub Actions / CI. action: workflows · runs (branch, status, workflow, limit) · "
-                        "run (run_id: الوظائف والخطوات) · logs (run_id أو job_id: سجل الأخطاء المختصر) · "
-                        "watch (run_id أو branch/sha: يتابع CI مباشرة لين يخلص ويرجّع سبب أي فشل) · "
+                        "run (run_id: jobs and steps) · logs (run_id or job_id: a short error log) · "
+                        "watch (run_id or branch/sha: follows CI live until it finishes and returns the cause of any failure) · "
                         "rerun (run_id, failed_only) · cancel (run_id) · dispatch (workflow, branch, inputs)."),
         "parameters": {"type": "object", "properties": {
             "action": {"type": "string", "enum": ["workflows", "runs", "run", "logs", "watch", "rerun",
                                                   "cancel", "dispatch"]},
             "repo": _REPO, "run_id": {"type": "integer"}, "job_id": {"type": "integer"},
             "branch": {"type": "string"}, "sha": {"type": "string"},
-            "status": {"type": "string", "description": "مثل failure, success, in_progress, queued"},
-            "workflow": {"type": "string", "description": "اسم ملف الـ workflow (ci.yml) أو رقمه"},
+            "status": {"type": "string", "description": "e.g. failure, success, in_progress, queued"},
+            "workflow": {"type": "string", "description": "Workflow file name (ci.yml) or id"},
             "inputs": {"type": "object"}, "failed_only": {"type": "boolean"},
-            "timeout": {"type": "integer", "description": "مهلة watch بالثواني (الافتراضي 900)"},
+            "timeout": {"type": "integer", "description": "watch timeout in seconds (default 900)"},
             "limit": {"type": "integer"}},
             "required": ["action", "repo"]}}},
 ]
@@ -162,23 +162,23 @@ def _headers() -> dict:
 
 def _short(text: str | None, n: int) -> str:
     text = text or ""
-    return text if len(text) <= n else text[:n] + f"…[+{len(text) - n} حرف]"
+    return text if len(text) <= n else text[:n] + f"…[+{len(text) - n} chars]"
 
 
-_TS = re.compile(r"^﻿?\d{4}-\d\d-\d\dT[\d:.]+Z ?")
+_TS = re.compile(r"^\ufeff?\d{4}-\d\d-\d\dT[\d:.]+Z ?")
 _ERR = re.compile(r"##\[error\]|\b(error|Error|ERROR|FAIL|FAILED|Failed|failed|Traceback|Exception|panic|fatal)\b")
 
 
 def log_excerpt(text: str, limit: int = 7000) -> str:
-    """من سجل GitHub Actions: سطور الأخطاء + آخر السجل (بدون الطوابع الزمنية والضجيج)."""
+    """From a GitHub Actions log: the error lines + the end of the log (without timestamps and noise)."""
     lines = [_TS.sub("", ln).rstrip() for ln in (text or "").splitlines()]
     lines = [ln for ln in lines if ln.strip() and not ln.startswith(("##[group]", "##[endgroup]"))]
     errors = [ln.replace("##[error]", "❌ ") for ln in lines if _ERR.search(ln)][-40:]
     tail = lines[-120:]
     out = ""
     if errors:
-        out += "سطور الأخطاء:\n" + "\n".join(errors) + "\n\n"
-    out += "آخر السجل:\n" + "\n".join(tail)
+        out += "Error lines:\n" + "\n".join(errors) + "\n\n"
+    out += "End of the log:\n" + "\n".join(tail)
     if len(out) > limit:
         out = out[: limit // 3] + "\n…\n" + out[-(limit - limit // 3):]
     return out
@@ -199,7 +199,7 @@ class _GH:
         return r.json() if r.content else {}
 
     async def _text(self, http, path) -> str:
-        """للسجلات: GitHub يحوّل لرابط نصي مؤقت (httpx ما يرسل التوكن لمضيف ثاني)."""
+        """For logs: GitHub redirects to a temporary text URL (httpx doesn't send the token to another host)."""
         r = await http.get(f"{API_BASE}{path}", headers=_headers(), follow_redirects=True)
         if r.status_code >= 400:
             raise RuntimeError(f"GitHub {r.status_code}: {r.text[:200]}")
@@ -216,7 +216,7 @@ class _GH:
             return repo
         return f"{await self.login(http)}/{repo}"
 
-    # ----- الأساسية -----
+    # ----- Basics -----
 
     async def list_repos(self, http, query=""):
         repos = await self._req(http, "GET", "/user/repos",
@@ -232,7 +232,7 @@ class _GH:
         params = {"ref": ref} if ref else {}
         res = await self._req(http, "GET", f"/repos/{full}/contents/{path.lstrip('/')}", params=params)
         if isinstance(res, list):
-            return {"error": "هذا مجلد مو ملف؛ استخدم gh_list_dir"}
+            return {"error": "This is a folder, not a file; use gh_list_dir"}
         if res.get("encoding") == "base64":
             raw = base64.b64decode(res.get("content", "")).decode("utf-8", "replace")
         else:
@@ -246,7 +246,7 @@ class _GH:
         params = {"ref": ref} if ref else {}
         res = await self._req(http, "GET", f"/repos/{full}/contents/{path.strip('/')}", params=params)
         if not isinstance(res, list):
-            return {"error": "هذا ملف مو مجلد؛ استخدم gh_read_file"}
+            return {"error": "This is a file, not a folder; use gh_read_file"}
         return {"repo": full, "path": path or "/",
                 "entries": [{"name": e["name"], "type": e["type"]} for e in res]}
 
@@ -277,7 +277,7 @@ class _GH:
         params = {"ref": branch} if branch else {}
         cur = await self._req(http, "GET", f"/repos/{full}/contents/{path}", params=params)
         if not isinstance(cur, dict) or not cur.get("sha"):
-            return {"error": "الملف غير موجود"}
+            return {"error": "File not found"}
         body = {"message": message, "sha": cur["sha"]}
         if branch:
             body["branch"] = branch
@@ -370,15 +370,15 @@ class _GH:
         if act == "delete_branch":
             info = await self._req(http, "GET", f"/repos/{full}")
             if a["branch"] == info.get("default_branch"):
-                return {"error": "ما أحذف الفرع الرئيسي للمستودع"}
+                return {"error": "I won't delete the repository's default branch"}
             await self._req(http, "DELETE", f"/repos/{full}/git/refs/heads/{a['branch']}")
             return {"ok": True, "deleted_branch": a["branch"]}
-        return {"error": f"action غير معروف: {act}"}
+        return {"error": f"Unknown action: {act}"}
 
     # ----- gh_pr -----
 
     async def _checks(self, http, full, ref) -> dict:
-        """ملخص حالة CI لـ commit/فرع: check runs + statuses."""
+        """A CI status summary for a commit/branch: check runs + statuses."""
         out = {}
         try:
             cr = await self._req(http, "GET", f"/repos/{full}/commits/{ref}/check-runs", params={"per_page": 50})
@@ -405,7 +405,7 @@ class _GH:
                                "base": p["base"]["ref"], "draft": p.get("draft"), "user": p["user"]["login"],
                                "updated": p.get("updated_at")} for p in res]}
         if n is None:
-            return {"error": "number مطلوب"}
+            return {"error": "number is required"}
         if act == "get":
             p = await self._req(http, "GET", f"/repos/{full}/pulls/{n}")
             out = {"number": n, "title": p.get("title"), "state": p.get("state"), "merged": p.get("merged"),
@@ -444,7 +444,7 @@ class _GH:
         if act == "close":
             await self._req(http, "PATCH", f"/repos/{full}/pulls/{n}", json={"state": "closed"})
             return {"ok": True, "closed": n}
-        return {"error": f"action غير معروف: {act}"}
+        return {"error": f"Unknown action: {act}"}
 
     # ----- gh_issue -----
 
@@ -466,7 +466,7 @@ class _GH:
             r = await self._req(http, "POST", f"/repos/{full}/issues", json=body)
             return {"ok": True, "number": r.get("number"), "url": r.get("html_url")}
         if n is None:
-            return {"error": "number مطلوب"}
+            return {"error": "number is required"}
         if act == "get":
             i = await self._req(http, "GET", f"/repos/{full}/issues/{n}")
             cs = await self._req(http, "GET", f"/repos/{full}/issues/{n}/comments", params={"per_page": 30})
@@ -482,7 +482,7 @@ class _GH:
         if act == "comment":
             r = await self._req(http, "POST", f"/repos/{full}/issues/{n}/comments", json={"body": a["body"]})
             return {"ok": True, "url": r.get("html_url")}
-        return {"error": f"action غير معروف: {act}"}
+        return {"error": f"Unknown action: {act}"}
 
     # ----- gh_actions -----
 
@@ -509,7 +509,7 @@ class _GH:
         return res.get("jobs") or []
 
     async def failure_digest(self, http, full, run_id, limit: int = 9000) -> dict:
-        """سبب فشل تشغيل: الوظائف الفاشلة وخطواتها ومقتطف من سجلها."""
+        """Why a run failed: the failed jobs, their steps and an excerpt of their logs."""
         jobs = await self.jobs(http, full, run_id)
         failed = [j for j in jobs if j.get("conclusion") in ("failure", "timed_out", "cancelled", "startup_failure")]
         out = []
@@ -518,8 +518,8 @@ class _GH:
             steps = [s.get("name") for s in j.get("steps") or [] if s.get("conclusion") == "failure"]
             try:
                 log = log_excerpt(await self._text(http, f"/repos/{full}/actions/jobs/{j['id']}/logs"), per)
-            except Exception as e:  # السجل ممكن يكون انحذف أو ما عندنا صلاحية
-                log = f"(ما قدرت أجيب السجل: {e})"
+            except Exception as e:  # the log may have expired or we may lack permission
+                log = f"(couldn't fetch the log: {e})"
             out.append({"job": j.get("name"), "job_id": j["id"], "conclusion": j.get("conclusion"),
                         "failed_steps": steps, "log": log})
         return {"failed_jobs": out, "jobs_total": len(jobs)}
@@ -559,13 +559,13 @@ class _GH:
             await self._req(http, "POST", f"/repos/{full}/actions/workflows/{a['workflow']}/dispatches",
                             json={"ref": ref, "inputs": a.get("inputs") or {}})
             return {"ok": True, "workflow": a["workflow"], "ref": ref,
-                    "note": "انطلق — تابعه بـ watch (branch) بعد ثواني"}
+                    "note": "Started — follow it with watch (branch) in a few seconds"}
         if act == "watch":
             return await self.watch(http, full, a, progress)
-        return {"error": f"action غير معروف: {act}"}
+        return {"error": f"Unknown action: {act}"}
 
     async def watch(self, http, full, a, progress=None):
-        """يتابع CI لين يخلص: تشغيل محدد، أو كل التشغيلات لآخر commit على فرع/sha."""
+        """Follows CI until it finishes: a specific run, or every run for the latest commit on a branch/sha."""
         timeout = max(30, min(int(a.get("timeout") or 900), 1800))
         deadline = time.monotonic() + timeout
         sha = a.get("sha")
@@ -573,7 +573,7 @@ class _GH:
             branch = a.get("branch") or (await self._req(http, "GET", f"/repos/{full}")).get("default_branch", "main")
             sha = (await self._req(http, "GET", f"/repos/{full}/commits/{branch}")).get("sha")
             if not sha:
-                return {"error": f"ما لقيت آخر commit على {branch}"}
+                return {"error": f"Couldn't find the latest commit on {branch}"}
         first_seen = time.monotonic()
         while True:
             if a.get("run_id"):
@@ -584,19 +584,19 @@ class _GH:
             if progress:
                 if runs:
                     done = len(runs) - len(pending)
-                    names = "، ".join(f"{r.get('name')}: {r.get('status') if r.get('status') != 'completed' else r.get('conclusion')}"
+                    names = ", ".join(f"{r.get('name')}: {r.get('status') if r.get('status') != 'completed' else r.get('conclusion')}"
                                      for r in runs[:4])
-                    progress(f"👀 يتابع CI ({done}/{len(runs)} خلصت) — {names}")
+                    progress(f"👀 Watching CI ({done}/{len(runs)} finished) — {names}")
                 else:
-                    progress("👀 ينتظر يبدأ CI…")
+                    progress("👀 Waiting for CI to start…")
             if runs and not pending:
                 break
             if not runs and time.monotonic() - first_seen > min(90, timeout):
                 return {"status": "no_runs", "sha": (sha or "")[:10],
-                        "note": "ما اشتغل أي workflow على هذا الـ commit (يمكن المستودع ما فيه CI لهذا الفرع)."}
+                        "note": "No workflow ran on this commit (the repository may have no CI for this branch)."}
             if time.monotonic() > deadline:
                 return {"status": "timeout", "runs": [self._run_row(r) for r in runs],
-                        "note": "CI ما خلص خلال المهلة — تابعه لاحقاً بـ watch أو runs"}
+                        "note": "CI didn't finish within the timeout — check it later with watch or runs"}
             await asyncio.sleep(WATCH_POLL)
         result = {"status": "completed", "sha": (sha or runs[0].get("head_sha") or "")[:10],
                   "runs": [self._run_row(r) for r in runs]}
@@ -629,25 +629,25 @@ _DISPATCH = {
 
 async def run_github(name: str, raw_args: str, progress=None) -> str:
     if not enabled():
-        return "GitHub غير مربوط: أضف السر GH_PAT عشان أقدر أكتب وأعدّل على GitHub."
+        return "GitHub is not connected: add the GH_PAT secret so I can write and edit on GitHub."
     try:
         args = json.loads(raw_args or "{}")
     except json.JSONDecodeError:
-        return "وسائط غير صالحة."
+        return "Invalid arguments."
     if name == "gh_actions":
         async def fn(h, a):
             return await _gh.actions(h, a, progress)
     else:
         fn = _DISPATCH.get(name)
     if not fn:
-        return f"أداة غير معروفة: {name}"
+        return f"Unknown tool: {name}"
     try:
         async with httpx.AsyncClient(timeout=30) as http:
             return json.dumps(await fn(http, args), ensure_ascii=False)
     except KeyError as e:
-        return f"ناقص وسيط مطلوب: {e}"
-    except Exception as e:  # نرجع الخطأ للموديل بدل ما يطيح البوت
-        return f"فشلت أداة GitHub: {e}"
+        return f"Missing required argument: {e}"
+    except Exception as e:  # return the error to the model instead of crashing the bot
+        return f"GitHub tool failed: {e}"
 
 
 async def login() -> str:
@@ -656,7 +656,7 @@ async def login() -> str:
 
 
 async def recent_runs(repo: str, branch: str | None = None, limit: int = 10) -> list[dict]:
-    """للمتابعة بالخلفية: آخر تشغيلات CI لمستودع."""
+    """For background watching: a repository's latest CI runs."""
     async with httpx.AsyncClient(timeout=30) as http:
         full = await _gh._owner_repo(http, repo)
         return [_GH._run_row(r) | {"head_sha": r.get("head_sha")} for r in await _gh.runs(http, full, branch, limit=limit)]
@@ -682,24 +682,24 @@ def describe_github(name: str, raw_args: str) -> str:
     repo = a.get("repo", "") or a.get("name", "")
     act = a.get("action", "")
     if name == "gh_actions":
-        return {"watch": f"👀 يتابع CI في {repo}", "logs": f"🧾 يقرأ سجل أخطاء CI في {repo}",
-                "rerun": f"🔁 يعيد تشغيل CI في {repo}", "cancel": f"⏹ يلغي تشغيل CI في {repo}",
-                "dispatch": f"🚀 يشغّل workflow {a.get('workflow', '')} في {repo}",
-                "run": f"⚙️ تفاصيل تشغيل CI في {repo}"}.get(act, f"⚙️ Actions ({act}) في {repo}")
+        return {"watch": f"👀 Watching CI in {repo}", "logs": f"🧾 Reading the CI error log in {repo}",
+                "rerun": f"🔁 Re-running CI in {repo}", "cancel": f"⏹ Cancelling a CI run in {repo}",
+                "dispatch": f"🚀 Running workflow {a.get('workflow', '')} in {repo}",
+                "run": f"⚙️ CI run details in {repo}"}.get(act, f"⚙️ Actions ({act}) in {repo}")
     if name == "gh_pr":
-        return {"merge": f"🔀 يدمج PR #{a.get('number', '')} في {repo}",
-                "comment": f"💬 يعلّق على PR #{a.get('number', '')}"}.get(act, f"🔀 PR ({act}) في {repo}")
+        return {"merge": f"🔀 Merging PR #{a.get('number', '')} in {repo}",
+                "comment": f"💬 Commenting on PR #{a.get('number', '')}"}.get(act, f"🔀 PR ({act}) in {repo}")
     if name == "gh_issue":
-        return f"🐞 Issue ({act}) في {repo}"
+        return f"🐞 Issue ({act}) in {repo}"
     if name == "gh_repo":
         return f"🐙 {repo}: {act}"
     return {
-        "gh_list_repos": "🐙 أعرض المستودعات",
-        "gh_read_file": f"📄 أقرأ {repo}:{a.get('path','')}",
-        "gh_list_dir": f"📂 محتويات {repo}/{a.get('path','')}",
-        "gh_put_file": f"✍️ أكتب {repo}:{a.get('path','')}",
-        "gh_delete_file": f"🗑 أحذف {repo}:{a.get('path','')}",
-        "gh_create_repo": f"➕ مستودع جديد {a.get('name','')}",
-        "gh_create_branch": f"🌿 فرع {a.get('branch','')} في {repo}",
-        "gh_open_pr": f"🔀 Pull Request في {repo}",
+        "gh_list_repos": "🐙 Listing repositories",
+        "gh_read_file": f"📄 Reading {repo}:{a.get('path','')}",
+        "gh_list_dir": f"📂 Listing {repo}/{a.get('path','')}",
+        "gh_put_file": f"✍️ Writing {repo}:{a.get('path','')}",
+        "gh_delete_file": f"🗑 Deleting {repo}:{a.get('path','')}",
+        "gh_create_repo": f"➕ New repository {a.get('name','')}",
+        "gh_create_branch": f"🌿 Branch {a.get('branch','')} in {repo}",
+        "gh_open_pr": f"🔀 Pull request in {repo}",
     }.get(name, f"🐙 {name}")

@@ -1,11 +1,11 @@
-"""مساحة العمل لوضع الوكلاء — مجلد المشروع اللي يشتغل فيه Kimi ووكلاؤه (مثل Claude Code).
+"""The coding-mode workspace — the project folder Kimi and its agents work in (like Claude Code).
 
-كل مشروع مجلد مستقل تحت data/workspaces/<الاسم>:
-- أدوات الملفات (قراءة/كتابة/تعديل/بحث) ما تقدر تطلع برا مجلد المشروع.
-- الأوامر تشتغل داخل المجلد بمتغيرات بيئة منظّفة: التوكنات والمفاتيح ما توصل لها أبداً.
-- كل تعديل بأدوات الملفات ينحفظ أصله قبل التعديل → «تراجع» و«الفرق» (نقاط رجوع).
-- حجز الملفات بين الوكلاء المتوازيين عشان ما يكتب اثنين على نفس الملف.
-- Git: استنساخ ورفع على GitHub بتوكن ما يشوفه الموديل ولا ينحفظ داخل المشروع.
+Every project is its own folder under data/workspaces/<name>:
+- File tools (read/write/edit/search) can never reach outside the project folder.
+- Commands run inside the folder with a scrubbed environment: tokens and keys never reach them.
+- Every file-tool edit saves the original first → "undo" and "diff" (checkpoints).
+- Files are claimed between parallel agents so two agents never write the same file.
+- Git: clone and push to GitHub with a token the model never sees and that is never stored in the project.
 """
 
 import asyncio
@@ -24,14 +24,14 @@ import zipfile
 from collections import defaultdict
 from pathlib import Path, PurePosixPath
 
-# مجلدات تبعيات/مخرجات ثقيلة: ما تنعرض في القوائم والبحث، وما تنضغط في zip
+# Heavy dependency/output folders: hidden from listings and search, and left out of zips
 SKIP_DIRS = {".git", "node_modules", ".venv", "venv", "__pycache__", ".pytest_cache", ".mypy_cache",
              ".ruff_cache", ".next", ".nuxt", ".cache", ".tox", ".gradle", ".idea", ".turbo",
              ".parcel-cache", ".svelte-kit", "target"}
 NAME_RE = re.compile(r"[\w][\w.\-]{0,47}")
-MAX_READ_CHARS = 60_000      # أقصى نص يرجع من قراءة ملف وحدة
-OUT_LIMIT = 16_000           # أقصى مخرجات أمر ترجع للموديل
-MAX_JOBS = 5                 # أوامر شغالة بالخلفية بنفس الوقت
+MAX_READ_CHARS = 60_000      # most text returned by a single file read
+OUT_LIMIT = 16_000           # most command output returned to the model
+MAX_JOBS = 5                 # background commands running at the same time
 GIT_BASE = os.getenv("GITHUB_GIT_BASE", "https://github.com").rstrip("/")
 
 _SENSITIVE = re.compile(r"TOKEN|SECRET|PASSW|API_?KEY|PRIVATE|CREDENTIAL|COOKIE|AUTH|"
@@ -40,15 +40,15 @@ _ANSI = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b\][^\x07]*\x07|\x1b[()][A-Za-
 
 
 class WorkspaceError(Exception):
-    """خطأ مفهوم يرجع للموديل كنص (مو عطل في البوت)."""
+    """An expected error that goes back to the model as text (not a bot failure)."""
 
 
-# ================= مساعدات =================
+# ================= Helpers =================
 
 def valid_name(name: str) -> str:
     name = (name or "").strip()
     if not NAME_RE.fullmatch(name) or ".." in name:
-        raise WorkspaceError("اسم المشروع لازم يكون حروف/أرقام و - _ . بس (حتى 48 حرف، بدون مسافات)")
+        raise WorkspaceError("A project name can only use letters, digits and - _ . (up to 48 characters, no spaces)")
     return name
 
 
@@ -65,22 +65,22 @@ def is_binary(data: bytes) -> bool:
 
 
 def clean_output(text: str) -> str:
-    """يشيل ألوان الطرفية وأشرطة التقدّم (\\r) عشان المخرجات تكون نظيفة للموديل."""
+    """Removes terminal colors and progress bars (\\r) so the output is clean for the model."""
     text = _ANSI.sub("", text.replace("\r\n", "\n"))
     return "\n".join(line.rsplit("\r", 1)[-1] for line in text.split("\n"))
 
 
 def clip(text: str, limit: int = OUT_LIMIT) -> str:
-    """يقص من النص الطويل الوسط: البداية والنهاية أهم (الأخطاء غالباً بالنهاية)."""
+    """Cuts the middle out of long text: the start and the end matter most (errors are usually at the end)."""
     if len(text) <= limit:
         return text
     head = limit // 3
     tail = limit - head
-    return f"{text[:head]}\n… [قطعت {len(text) - limit:,} حرف من الوسط] …\n{text[-tail:]}"
+    return f"{text[:head]}\n… [cut {len(text) - limit:,} characters from the middle] …\n{text[-tail:]}"
 
 
 def glob_re(pattern: str) -> re.Pattern:
-    """glob إلى regex مع دعم ** و {a,b}."""
+    """glob to regex, supporting ** and {a,b}."""
     p = pattern.strip()
     if p.startswith("./"):
         p = p[2:]
@@ -103,7 +103,7 @@ def glob_re(pattern: str) -> re.Pattern:
 
 
 def glob_match(pattern: str, rel: str) -> bool:
-    """النمط بدون / يطابق اسم الملف بأي مكان (مثل *.py)، ومع / يطابق المسار كامل."""
+    """A pattern without / matches the file name anywhere (like *.py); with / it matches the whole path."""
     target = rel if "/" in pattern.strip().removeprefix("./") else PurePosixPath(rel).name
     return bool(glob_re(pattern).match(target))
 
@@ -129,7 +129,7 @@ def count_lines(data: bytes | None) -> int | None:
 
 
 def line_delta(old: bytes | str, new: bytes | str) -> tuple[int | None, int | None]:
-    """كم سطر انضاف وكم انشال (مثل git diff --stat)."""
+    """How many lines were added and removed (like git diff --stat)."""
     if isinstance(old, bytes):
         if is_binary(old) or is_binary(new):
             return None, None
@@ -147,13 +147,13 @@ def line_delta(old: bytes | str, new: bytes | str) -> tuple[int | None, int | No
 
 
 def safe_env(extra: dict | None = None, ceiling: str | None = None) -> dict:
-    """بيئة الأوامر: نفس بيئة الجهاز بدون أي توكن/مفتاح/كلمة سر."""
-    # GIT_CONFIG_* الموروثة ممكن تحمل ترويسات توثيق — نشيلها كلها (لو شلنا بعضها git يرفض الإعداد الناقص)
+    """The environment for commands: the machine's environment without any token/key/password."""
+    # inherited GIT_CONFIG_* may carry auth headers — drop them all (dropping only some makes git reject the config)
     env = {k: v for k, v in os.environ.items() if not _SENSITIVE.search(k) and not k.startswith("GIT_CONFIG_")}
     env.update(CI="1", GIT_TERMINAL_PROMPT="0", PYTHONUNBUFFERED="1", PIP_DISABLE_PIP_VERSION_CHECK="1",
                NO_COLOR="1", DEBIAN_FRONTEND="noninteractive", PAGER="cat", GIT_PAGER="cat",
                npm_config_yes="true", PYTHONDONTWRITEBYTECODE="1")
-    if ceiling:  # git ما يطلع فوق مجلد المشاريع (المشروع داخل مستودع البوت نفسه)
+    if ceiling:  # git never climbs above the projects folder (projects live inside the bot's own repository)
         env["GIT_CEILING_DIRECTORIES"] = ceiling
     if extra:
         env.update(extra)
@@ -161,13 +161,13 @@ def safe_env(extra: dict | None = None, ceiling: str | None = None) -> dict:
 
 
 def _kill(proc) -> None:
-    """يوقف الأمر وكل اللي شغّله (مجموعة العمليات كاملة)."""
+    """Stops the command and everything it started (the whole process group)."""
     with contextlib.suppress(ProcessLookupError, PermissionError, OSError):
         os.killpg(proc.pid, signal.SIGKILL)
 
 
 class _Buf:
-    """يجمع مخرجات أمر: يحفظ البداية والنهاية بس لو كانت ضخمة."""
+    """Collects a command's output: keeps only the start and the end if it's huge."""
     HEAD, TAIL = 64_000, 400_000
 
     def __init__(self):
@@ -187,7 +187,7 @@ class _Buf:
 
     def text(self) -> str:
         if self.dropped:
-            return (clean_output(self.head.decode("utf-8", "replace")) + f"\n… [{self.dropped:,} بايت ما انحفظت] …\n"
+            return (clean_output(self.head.decode("utf-8", "replace")) + f"\n… [{self.dropped:,} bytes not kept] …\n"
                     + clean_output(self.tail.decode("utf-8", "replace")))
         return clean_output(bytes(self.head + self.tail).decode("utf-8", "replace"))
 
@@ -212,7 +212,7 @@ class Job:
 
     def status(self) -> str:
         secs = int(time.time() - self.started)
-        return f"شغال ({secs}ث)" if self.running else f"انتهى exit {self.proc.returncode}"
+        return f"running ({secs}s)" if self.running else f"finished, exit {self.proc.returncode}"
 
 
 _jobs: dict[str, dict[int, Job]] = {}
@@ -226,7 +226,7 @@ def kill_all_jobs() -> None:
                 _kill(j.proc)
 
 
-# ================= المشروع =================
+# ================= The project =================
 
 class Workspace:
     def __init__(self, base: Path, name: str):
@@ -248,12 +248,12 @@ class Workspace:
     def resolve(self, path: str | None) -> Path:
         raw = (path or ".").strip() or "."
         if raw.startswith("~"):
-            raise WorkspaceError("استخدم مسار داخل المشروع (نسبي مثل src/app.py)")
+            raise WorkspaceError("Use a path inside the project (relative, like src/app.py)")
         p = Path(raw)
         root = self.real
         full = (p if p.is_absolute() else root / p).resolve()
         if full != root and root not in full.parents:
-            raise WorkspaceError(f"المسار «{raw}» برا مجلد المشروع — كل المسارات لازم تكون داخل المشروع")
+            raise WorkspaceError(f"The path \"{raw}\" is outside the project folder — every path must be inside the project")
         return full
 
     def rel(self, full: Path) -> str:
@@ -275,24 +275,24 @@ class Workspace:
                     size += f.stat().st_size
         return n, size
 
-    # ----- قراءة -----
+    # ----- Reading -----
 
     def read(self, path: str, offset: int = 1, limit: int = 2000) -> str:
         full = self.resolve(path)
         if full.is_dir():
-            raise WorkspaceError(f"«{path}» مجلد — استخدم list_files")
+            raise WorkspaceError(f"\"{path}\" is a folder — use list_files")
         if not full.is_file():
-            raise WorkspaceError(f"الملف «{path}» مو موجود")
+            raise WorkspaceError(f"The file \"{path}\" doesn't exist")
         rel = self.rel(full)
         size = full.stat().st_size
         if size > 25_000_000:
-            raise WorkspaceError(f"الملف ضخم ({human(size)}) — استخدم grep أو run (head/sed) بدل القراءة")
+            raise WorkspaceError(f"The file is huge ({human(size)}) — use grep or run (head/sed) instead of reading it")
         data = full.read_bytes()
         if is_binary(data):
-            return f"[{rel}: ملف ثنائي {human(size)} — ما ينقرا كنص]"
+            return f"[{rel}: binary file, {human(size)} — can't be read as text]"
         text = data.decode("utf-8", "replace")
         if not text:
-            return f"[{rel}: الملف فاضي]"
+            return f"[{rel}: the file is empty]"
         lines = text.split("\n")
         if lines[-1] == "":
             lines.pop()
@@ -300,46 +300,46 @@ class Workspace:
         offset = max(1, int(offset or 1))
         limit = max(1, min(int(limit or 2000), 5000))
         if offset > total:
-            return f"[{rel}: فيه {total} سطر بس — offset {offset} أكبر من طول الملف]"
+            return f"[{rel}: has only {total} lines — offset {offset} is past the end of the file]"
         out, used = [], 0
         for i, line in enumerate(lines[offset - 1 : offset - 1 + limit], offset):
             if len(line) > 2000:
-                line = line[:2000] + " …[سطر طويل مقصوص]"
+                line = line[:2000] + " …[long line cut]"
             row = f"{i:>6}\t{line}"
             if used + len(row) > MAX_READ_CHARS and out:
                 break
             out.append(row)
             used += len(row) + 1
         end = offset + len(out) - 1
-        head = f"[{rel} — {total} سطر"
+        head = f"[{rel} — {total} lines"
         if offset > 1 or end < total:
-            head += f"، المعروض {offset}-{end}. للباقي استخدم offset={end + 1}"
+            head += f", showing {offset}-{end}. For the rest use offset={end + 1}"
         return head + "]\n" + "\n".join(out)
 
     def list_files(self, pattern: str = "**/*", path: str = ".", limit: int = 400) -> str:
         start = self.resolve(path)
         if not start.is_dir():
-            raise WorkspaceError(f"«{path}» مو مجلد")
+            raise WorkspaceError(f"\"{path}\" is not a folder")
         pattern = (pattern or "**/*").strip() or "**/*"
         hits = []
         for f in self.walk(start):
             if glob_match(pattern, f.relative_to(start).as_posix()):
                 hits.append(f)
         if not hits:
-            return f"ما فيه ملفات تطابق «{pattern}» في {self.rel(start)}"
+            return f"No files match \"{pattern}\" in {self.rel(start)}"
         rows = []
         for f in hits[:limit]:
             with contextlib.suppress(OSError):
                 rows.append(f"{self.rel(f)}  ({human(f.stat().st_size)})")
-        more = f"\n… و{len(hits) - limit} ملف كمان — ضيّق النمط" if len(hits) > limit else ""
-        return f"[{len(hits)} ملف]\n" + "\n".join(rows) + more
+        more = f"\n… and {len(hits) - limit} more files — narrow the pattern" if len(hits) > limit else ""
+        return f"[{len(hits)} files]\n" + "\n".join(rows) + more
 
     def grep(self, pattern: str, path: str = ".", glob: str | None = None, ignore_case: bool = False,
              limit: int = 150) -> str:
         try:
             rx = re.compile(pattern, re.I if ignore_case else 0)
         except re.error as e:
-            raise WorkspaceError(f"regex غير صالح: {e}") from None
+            raise WorkspaceError(f"Invalid regex: {e}") from None
         start = self.resolve(path)
         files = [start] if start.is_file() else self.walk(start)
         out, nfiles = [], 0
@@ -364,15 +364,15 @@ class Workspace:
                         break
             nfiles += hit
             if len(out) >= limit:
-                out.append(f"… وقفت عند {limit} نتيجة — ضيّق البحث")
+                out.append(f"… stopped at {limit} results — narrow the search")
                 break
         if not out:
-            return f"ما فيه نتائج لـ «{pattern}»"
-        return f"[{nfiles} ملف]\n" + "\n".join(out)
+            return f"No matches for \"{pattern}\""
+        return f"[{nfiles} files]\n" + "\n".join(out)
 
     def tree(self, max_entries: int = 200) -> str:
         if self.is_empty():
-            return "(المشروع فاضي)"
+            return "(the project is empty)"
         lines: list[str] = []
         more = 0
 
@@ -397,15 +397,15 @@ class Workspace:
 
         walk(self.root, "")
         if more:
-            lines.append(f"… (+{more} عنصر)")
+            lines.append(f"… (+{more} more)")
         return "\n".join(lines)
 
-    # ----- كتابة -----
+    # ----- Writing -----
 
     def write(self, path: str, content: str, append: bool = False) -> str:
         full = self.resolve(path)
         if full == self.real or full.is_dir():
-            raise WorkspaceError(f"«{path}» مجلد — حدّد مسار ملف")
+            raise WorkspaceError(f"\"{path}\" is a folder — give a file path")
         full.parent.mkdir(parents=True, exist_ok=True)
         existed = full.is_file()
         if append:
@@ -414,37 +414,59 @@ class Workspace:
         else:
             full.write_text(content, encoding="utf-8", newline="")
         n = count_lines(full.read_bytes()) or 0
-        verb = "أُضيف إلى" if append else ("انكتب فوق" if existed else "انكتب ملف جديد")
-        return f"✓ {verb} {self.rel(full)} ({n} سطر الحين)"
+        verb = "Appended to" if append else ("Overwrote" if existed else "Created")
+        return f"✓ {verb} {self.rel(full)} ({n} lines now)"
 
     def edit(self, path: str, old: str, new: str, replace_all: bool = False) -> str:
         full = self.resolve(path)
         if not full.is_file():
-            raise WorkspaceError(f"الملف «{path}» مو موجود — لإنشاء ملف استخدم write_file")
+            raise WorkspaceError(f"The file \"{path}\" doesn't exist — to create a file use write_file")
         if not old:
-            raise WorkspaceError("old_string فاضي — لكتابة ملف كامل استخدم write_file")
+            raise WorkspaceError("old_string is empty — to write a whole file use write_file")
         if old == new:
-            raise WorkspaceError("old_string و new_string متطابقين — ما فيه تغيير")
+            raise WorkspaceError("old_string and new_string are identical — nothing to change")
         text = full.read_bytes().decode("utf-8", "surrogateescape")
         count = text.count(old)
         if count == 0 and "\r\n" in text and "\n" in old and "\r\n" not in old:
-            old, new = old.replace("\n", "\r\n"), new.replace("\n", "\r\n")  # ملف بنهايات ويندوز
+            old, new = old.replace("\n", "\r\n"), new.replace("\n", "\r\n")  # a file with Windows line endings
             count = text.count(old)
         if count == 0:
             hint = ""
             if re.search(r"^\s*\d+\t", old, re.M):
-                hint = " — لا تنسخ أرقام الأسطر اللي يعرضها read_file"
+                hint = " — don't copy the line numbers that read_file shows"
             elif old.strip() and old.strip() in text:
-                hint = " — فيه فرق بالمسافات أو الأسطر الفاضية حوله"
-            raise WorkspaceError(f"ما لقيت old_string في {self.rel(full)}{hint}. اقرأ الملف وانسخ النص بالحرف.")
+                hint = " — there is a whitespace or blank-line difference around it"
+            raise WorkspaceError(f"old_string not found in {self.rel(full)}{hint}. Read the file and copy the text exactly.")
         if count > 1 and not replace_all:
-            raise WorkspaceError(f"old_string موجود {count} مرات في {self.rel(full)} — زِد سياق حوله ليصير فريد، "
-                                 "أو استخدم replace_all=true لو تبي تغيّرها كلها")
+            raise WorkspaceError(f"old_string occurs {count} times in {self.rel(full)} — add surrounding context to make "
+                                 "it unique, or use replace_all=true to change all of them")
         updated = text.replace(old, new) if replace_all else text.replace(old, new, 1)
         full.write_bytes(updated.encode("utf-8", "surrogateescape"))
         plus, minus = line_delta(text, updated)
-        where = f"{count} موضع" if replace_all else "موضع واحد"
-        return f"✓ عُدّل {self.rel(full)} ({where}، +{plus} −{minus} سطر)"
+        where = f"{count} places" if replace_all else "1 place"
+        return f"✓ Edited {self.rel(full)} ({where}, +{plus} −{minus} lines)"
+
+    def edit_many(self, path: str, edits: list) -> str:
+        """Several edits to one file in one go (like MultiEdit): either all apply or nothing is written."""
+        full = self.resolve(path)
+        if not full.is_file():
+            raise WorkspaceError(f"The file \"{path}\" doesn't exist — to create a file use write_file")
+        if not isinstance(edits, list) or not edits:
+            raise WorkspaceError("edits must be a list of edits")
+        original = text = full.read_bytes().decode("utf-8", "surrogateescape")
+        for i, e in enumerate(edits, 1):
+            old, new = str(e.get("old_string", "")), str(e.get("new_string", ""))
+            if not old or old == new:
+                raise WorkspaceError(f"Edit {i}: old_string is empty or identical to new_string — nothing was written")
+            count = text.count(old)
+            if count == 0:
+                raise WorkspaceError(f"Edit {i}: old_string not found (after applying the earlier edits) — nothing was written")
+            if count > 1 and not e.get("replace_all"):
+                raise WorkspaceError(f"Edit {i}: old_string occurs {count} times — add context — nothing was written")
+            text = text.replace(old, new) if e.get("replace_all") else text.replace(old, new, 1)
+        full.write_bytes(text.encode("utf-8", "surrogateescape"))
+        plus, minus = line_delta(original, text)
+        return f"✓ Edited {self.rel(full)} ({len(edits)} edits, +{plus} −{minus} lines)"
 
     def file_hash(self, full: Path) -> str | None:
         try:
@@ -452,7 +474,7 @@ class Workspace:
         except OSError:
             return None
 
-    # ----- الأوامر -----
+    # ----- Commands -----
 
     async def _spawn(self, command: str, cwd: Path):
         return await asyncio.create_subprocess_exec(
@@ -461,10 +483,10 @@ class Workspace:
             stderr=asyncio.subprocess.STDOUT, start_new_session=True)
 
     async def run(self, command: str, timeout: float = 180, cwd: str = ".") -> dict:
-        """يشغّل أمر bash داخل المشروع وينتظره. يرجع {code, output, seconds, timed_out}."""
+        """Runs a bash command inside the project and waits for it. Returns {code, output, seconds, timed_out}."""
         workdir = self.resolve(cwd)
         if not workdir.is_dir():
-            raise WorkspaceError(f"المجلد «{cwd}» مو موجود")
+            raise WorkspaceError(f"The folder \"{cwd}\" doesn't exist")
         t0 = time.monotonic()
         proc = await self._spawn(command, workdir)
         buf = _Buf()
@@ -479,7 +501,7 @@ class Workspace:
             reader.cancel()
             raise
         finally:
-            _kill(proc)  # ينظّف أي شي شغّله الأمر وبقى معلّق
+            _kill(proc)  # clean up anything the command started that is still hanging around
         with contextlib.suppress(Exception):
             await asyncio.wait_for(proc.wait(), 5)
         try:
@@ -493,38 +515,38 @@ class Workspace:
         workdir = self.resolve(cwd)
         jobs = _jobs.setdefault(str(self.real), {})
         if sum(j.running for j in jobs.values()) >= MAX_JOBS:
-            raise WorkspaceError(f"فيه {MAX_JOBS} أوامر شغالة بالخلفية — أوقف واحد بـ job(action=kill) أول")
+            raise WorkspaceError(f"{MAX_JOBS} background commands are already running — stop one with job(action=kill) first")
         proc = await self._spawn(command, workdir)
         buf = _Buf()
         job = Job(next(_job_seq), command, proc, buf, asyncio.create_task(_pump(proc.stdout, buf)))
         jobs[job.id] = job
-        await asyncio.wait({job.waiter}, timeout=3)  # نعطيه ثواني يطلع أول مخرجاته (أو يفشل بسرعة)
-        return (f"▶️ job {job.id} بالخلفية — {job.status()}\n{clip(buf.text(), 4000) or '(ما فيه مخرجات بعد)'}\n"
-                "للمخرجات: job(id, action=output) · للإيقاف: job(id, action=kill)")
+        await asyncio.wait({job.waiter}, timeout=3)  # give it a few seconds to print something (or fail fast)
+        return (f"▶️ job {job.id} in the background — {job.status()}\n{clip(buf.text(), 4000) or '(no output yet)'}\n"
+                "Output: job(id, action=output) · Stop: job(id, action=kill)")
 
     def job(self, jid: int | None = None, action: str = "output") -> str:
         jobs = _jobs.get(str(self.real), {})
         if action == "list" or jid is None:
             if not jobs:
-                return "ما فيه أوامر بالخلفية"
+                return "No background commands"
             return "\n".join(f"job {j.id}: {j.status()} — {j.command[:120]}" for j in jobs.values())
         j = jobs.get(int(jid))
         if not j:
-            raise WorkspaceError(f"ما فيه job رقم {jid}")
+            raise WorkspaceError(f"No job number {jid}")
         if action == "kill":
             _kill(j.proc)
-            return f"⏹ أوقفت job {j.id}"
-        return f"job {j.id} — {j.status()}\n$ {j.command}\n{clip(j.buf.text(), 8000) or '(ما فيه مخرجات)'}"
+            return f"⏹ Stopped job {j.id}"
+        return f"job {j.id} — {j.status()}\n$ {j.command}\n{clip(j.buf.text(), 8000) or '(no output)'}"
 
-    # ----- الملفات المرفوعة والتحميل -----
+    # ----- Uploads and downloads -----
 
     def save_upload(self, filename: str, data: bytes) -> str:
-        """يحفظ ملف أرسله المالك. zip ينفك تلقائياً (للجذر لو المشروع فاضي)."""
+        """Saves a file the owner sent. A zip is extracted automatically (into the root if the project is empty)."""
         name = re.sub(r"[\\/:\x00]", "_", PurePosixPath(filename or "file").name).strip(". ") or "file"
         if name.lower().endswith(".zip"):
             dest = "." if self.is_empty() else f"uploads/{name[:-4]}"
             n = self.extract_zip(data, dest)
-            return f"{n} ملف انفكّت من {name} إلى {dest}/"
+            return f"{n} files extracted from {name} into {dest}/"
         full = self.resolve(f"uploads/{name}")
         full.parent.mkdir(parents=True, exist_ok=True)
         full.write_bytes(data)
@@ -534,13 +556,13 @@ class Workspace:
         try:
             z = zipfile.ZipFile(io.BytesIO(data))
         except zipfile.BadZipFile:
-            raise WorkspaceError("ملف zip تالف") from None
+            raise WorkspaceError("Corrupted zip file") from None
         members = [m for m in z.infolist() if not m.is_dir()]
         if len(members) > 5000 or sum(m.file_size for m in members) > 300_000_000:
-            raise WorkspaceError("الأرشيف كبير جداً (حد 5000 ملف / 300MB)")
+            raise WorkspaceError("The archive is too big (limit 5000 files / 300MB)")
         names = [m.filename for m in members]
         tops = {n.split("/", 1)[0] for n in names}
-        strip = len(tops) == 1 and all("/" in n for n in names)  # مجلد واحد يغلّف الكل → نشيله
+        strip = len(tops) == 1 and all("/" in n for n in names)  # a single wrapping folder → drop it
         target = self.resolve(dest)
         n = 0
         for m in members:
@@ -565,18 +587,18 @@ class Workspace:
                 with contextlib.suppress(OSError):
                     raw += f.stat().st_size
                     if raw > limit * 4:
-                        raise WorkspaceError("المشروع كبير على تليجرام — ارفعه على GitHub بدل كذا")
+                        raise WorkspaceError("The project is too big for Telegram — push it to GitHub instead")
                     z.write(f, arcname=f"{self.name}/{self.rel(f)}")
         data = buf.getvalue()
         if len(data) > limit:
-            raise WorkspaceError(f"الملف المضغوط {human(len(data))} — أكبر من حد تليجرام")
+            raise WorkspaceError(f"The zip is {human(len(data))} — bigger than Telegram's limit")
         return data
 
     # ----- Git -----
 
     async def git(self, args: list[str], token: str = "", cwd: Path | None = None, timeout: float = 300) -> tuple[int, str]:
         extra = {}
-        if token:  # التوكن في ترويسة لهذا الأمر فقط — ما ينكتب في الرابط ولا في .git/config
+        if token:  # the token goes in a header for this command only — never in the URL or in .git/config
             b = base64.b64encode(f"x-access-token:{token}".encode()).decode()
             extra = {"GIT_CONFIG_COUNT": "1", "GIT_CONFIG_KEY_0": f"http.{GIT_BASE}/.extraheader",
                      "GIT_CONFIG_VALUE_0": f"AUTHORIZATION: basic {b}"}
@@ -588,7 +610,7 @@ class Workspace:
             out, _ = await asyncio.wait_for(proc.communicate(), timeout)
         except asyncio.TimeoutError:
             _kill(proc)
-            return 124, "انتهت المهلة"
+            return 124, "timed out"
         except asyncio.CancelledError:
             _kill(proc)
             raise
@@ -605,13 +627,13 @@ class Workspace:
         self.ensure()
         target = self.resolve(dest)
         if target.exists() and any(target.iterdir()):
-            raise WorkspaceError(f"المجلد «{dest}» مو فاضي — استنسخ في مجلد فرعي (dest) أو مشروع جديد")
+            raise WorkspaceError(f"The folder \"{dest}\" isn't empty — clone into a sub-folder (dest) or a new project")
         args = ["clone", "--depth", "50"] + (["--branch", branch] if branch else []) + [self.repo_url(full), str(target)]
         code, out = await self.git(args, token, cwd=self.real, timeout=600)
         if code:
-            raise WorkspaceError(f"فشل الاستنساخ: {out[-800:]}")
+            raise WorkspaceError(f"Clone failed: {out[-800:]}")
         n = sum(1 for _ in self.walk(target))
-        return f"✓ استنسخت {full}{'@' + branch if branch else ''} إلى {self.rel(target)}/ ({n} ملف)"
+        return f"✓ Cloned {full}{'@' + branch if branch else ''} into {self.rel(target)}/ ({n} files)"
 
     def _excludes(self) -> None:
         info = self.real / ".git" / "info"
@@ -631,42 +653,42 @@ class Workspace:
         if not (root / ".git").exists():
             code, out = await self.git(["init", "-q", "-b", branch])
             if code:
-                raise WorkspaceError(f"git init فشل: {out}")
+                raise WorkspaceError(f"git init failed: {out}")
         self._excludes()
         code, out = await self.git(["add", "-A"])
         if code:
-            raise WorkspaceError(f"git add فشل: {out[-600:]}")
+            raise WorkspaceError(f"git add failed: {out[-600:]}")
         code, out = await self.git(["-c", f"user.name={author[0]}", "-c", f"user.email={author[1]}", "-c", "commit.gpgsign=false",
                                     "commit", "-q", "-m", message or "Update from Telegram agent"])
         committed = code == 0
         if code and "nothing" not in out:
-            raise WorkspaceError(f"git commit فشل: {out[-600:]}")
+            raise WorkspaceError(f"git commit failed: {out[-600:]}")
         code, sha = await self.git(["rev-parse", "HEAD"])
         if code:
-            raise WorkspaceError("ما فيه شي ينرفع — المشروع فاضي")
+            raise WorkspaceError("Nothing to push — the project is empty")
         args = ["push"] + (["--force"] if force else []) + [self.repo_url(full), f"HEAD:refs/heads/{branch}"]
         code, out = await self.git(args, token, timeout=600)
         if code:
             hint = ""
             low = out.lower()
             if "rejected" in low or "fetch first" in low or "non-fast-forward" in low:
-                hint = " — الفرع على GitHub فيه commits مو عندك: ارفع على فرع جديد، أو استنسخه أول"
+                hint = " — the branch on GitHub has commits you don't have: push to a new branch, or clone it first"
             elif "not found" in low or "repository" in low and "exist" in low:
-                hint = " — المستودع مو موجود (أنشئه أول) أو التوكن ما عنده صلاحية"
-            raise WorkspaceError(f"git push فشل{hint}: {out[-700:]}")
+                hint = " — the repository doesn't exist (create it first) or the token lacks permission"
+            raise WorkspaceError(f"git push failed{hint}: {out[-700:]}")
         url = f"{GIT_BASE}/{full}/tree/{branch}" if GIT_BASE.startswith("http") else f"{full}@{branch}"
         return {"ok": True, "repo": full, "branch": branch, "commit": sha[:10], "new_commit": committed, "url": url}
 
 
-# ================= نقاط الرجوع (تراجع / فرق) =================
+# ================= Checkpoints (undo / diff) =================
 
 _BIG = "__too_big__"
 
 
 class Changes:
-    """يحفظ أصل كل ملف قبل أول تعديل عليه خلال طلب واحد — للتراجع والفرق والملخّص.
+    """Saves the original of every file before its first edit during one request — for undo, diff and the summary.
 
-    مثل Claude Code: يتتبّع تعديلات أدوات الملفات. تغييرات الأوامر (rm, mv, npm…) ما تنحسب.
+    Like Claude Code: it tracks edits made by the file tools. Changes made by commands (rm, mv, npm…) aren't tracked.
     """
     MAX_FILE = 2_000_000
 
@@ -753,7 +775,7 @@ class Changes:
 
 
 class Checkpoints:
-    """آخر نقاط الرجوع لكل مشروع (تنحفظ على القرص عشان تبقى بعد إعادة التشغيل)."""
+    """The latest checkpoints of each project (saved to disk so they survive restarts)."""
     KEEP = 10
     MAX_BYTES = 30_000_000
 
@@ -806,7 +828,7 @@ class Checkpoints:
 
 
 class Claims:
-    """حجز الملفات بين الوكلاء المتوازيين: كل وكيل له نطاق، وأول من يكتب ملف يحجزه."""
+    """File claims between parallel agents: each agent has a scope, and the first to write a file claims it."""
 
     def __init__(self):
         self.owner: dict[str, str] = {}
@@ -822,12 +844,12 @@ class Claims:
     def check(self, agent: str, rel: str) -> str | None:
         holder = self.owner.get(rel)
         if holder and holder != agent:
-            return (f"الملف {rel} يشتغل عليه الوكيل «{holder}» الحين — لا تعدّله. "
-                    "لو يحتاج تغيير، اذكره في تقريرك للقائد.")
+            return (f"The file {rel} is being worked on by agent \"{holder}\" right now — don't edit it. "
+                    "If it needs a change, describe it in your report to the lead.")
         if not in_scope(rel, self.scopes.get(agent) or []):
             for other, pats in self.scopes.items():
                 if other != agent and in_scope(rel, pats):
-                    return (f"الملف {rel} ضمن نطاق الوكيل «{other}» — لا تعدّله. "
-                            "اذكر التغيير المطلوب في تقريرك للقائد.")
+                    return (f"The file {rel} is in agent \"{other}\"'s scope — don't edit it. "
+                            "Describe the needed change in your report to the lead.")
         self.owner[rel] = agent
         return None

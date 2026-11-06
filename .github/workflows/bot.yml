@@ -1,7 +1,7 @@
 name: Telegram bot 24h
 
-# GitHub يوقف أي تشغيل بعد 6 ساعات، فالبوت يشتغل ~5:40 ساعة
-# ثم يحفظ بياناته ويشغّل نفسه من جديد. الجدولة احتياط لو توقف لأي سبب.
+# GitHub stops any run after 6 hours, so the bot runs ~5h40m,
+# then saves its data and restarts itself. The schedule is a backup in case it stops for any reason.
 on:
   workflow_dispatch:
   schedule:
@@ -12,8 +12,8 @@ on:
       - "telegram-persona-bot/**"
       - ".github/workflows/bot.yml"
 
-# نسخة وحدة بس تشتغل بنفس الوقت (تليجرام ما يقبل نسختين)
-# لو رفعت كود جديد، توقف النسخة القديمة وتشتغل الجديدة فوراً
+# Only one copy runs at a time (Telegram doesn't accept two)
+# When new code is pushed, the old copy stops and the new one starts right away
 concurrency:
   group: telegram-bot
   cancel-in-progress: ${{ github.event_name == 'push' }}
@@ -50,26 +50,26 @@ jobs:
             else echo "$n: OK"; fi
           done
           [ "$missing" = 0 ] || exit 1
-          # نتأكد إن OpenRouter يقبل المفتاح قبل التشغيل (بدون ما نطبع المفتاح)
+          # Make sure OpenRouter accepts the key before starting (without printing the key)
           key=$(printf '%s' "$OPENROUTER_API_KEY" | tr -d '\r\n' | sed -E 's/^[[:space:]"'"'"']+//; s/[[:space:]"'"'"']+$//; s/^[Bb]earer[[:space:]]+//')
           case "$key" in
             sk-or-*) ;;
-            *) echo "::warning::OPENROUTER_API_KEY ما يبدأ بـ sk-or- — غالباً منسوخ غلط أو مو مفتاح OpenRouter" ;;
+            *) echo "::warning::OPENROUTER_API_KEY doesn't start with sk-or- — it's probably copied wrong or not an OpenRouter key" ;;
           esac
           code=$(curl -s -o /tmp/key.json -w '%{http_code}' -H "Authorization: Bearer $key" https://openrouter.ai/api/v1/key)
-          if [ "$code" = "404" ]; then  # المسار القديم
+          if [ "$code" = "404" ]; then  # the older path
             code=$(curl -s -o /tmp/key.json -w '%{http_code}' -H "Authorization: Bearer $key" https://openrouter.ai/api/v1/auth/key)
           fi
           if [ "$code" != "200" ]; then
-            echo "::error::OpenRouter رفض المفتاح (HTTP $code): $(head -c 300 /tmp/key.json) — انسخ مفتاح جديد من openrouter.ai/keys وحدّث السر OPENROUTER_API_KEY"
+            echo "::error::OpenRouter rejected the key (HTTP $code): $(head -c 300 /tmp/key.json) — copy a new key from openrouter.ai/keys and update the OPENROUTER_API_KEY secret"
             exit 1
           fi
           echo "OpenRouter key OK: $(jq -c '.data | {limit, limit_remaining, usage, is_free_tier}' /tmp/key.json)"
 
       - run: pip install -r requirements.txt
 
-      # اختياري: تشغيل Tor داخل الرنر عشان البوت يبحث/يقرأ عبره.
-      # فعّله بإضافة متغيّر (Variables) اسمه USE_TOR بقيمة true.
+      # Optional: run Tor inside the runner so the bot searches/reads through it.
+      # Enable it by adding a variable (Variables) named USE_TOR with the value true.
       - name: Start Tor (optional)
         if: vars.USE_TOR == 'true'
         run: |
@@ -77,9 +77,9 @@ jobs:
           sudo service tor start || (tor &)
           echo "TOR_PROXY=socks5h://127.0.0.1:9050" >> "$GITHUB_ENV"
           for i in $(seq 1 60); do (echo > /dev/tcp/127.0.0.1/9050) >/dev/null 2>&1 && break; sleep 1; done
-          echo "Tor SOCKS جاهز على 9050"
+          echo "Tor SOCKS is ready on 9050"
 
-      # استرجاع الهوية وذاكرة المحادثات من التشغيل السابق
+      # Restore the persona, conversation memory and coding projects from the previous run
       - uses: actions/cache/restore@v4
         with:
           path: telegram-persona-bot/data
@@ -94,24 +94,35 @@ jobs:
           OWNER_ID: ${{ secrets.OWNER_ID }}
           OPENROUTER_MODEL: ${{ vars.OPENROUTER_MODEL }}
           OPENROUTER_PROVIDER: ${{ vars.OPENROUTER_PROVIDER }}
-          GH_PAT: ${{ secrets.GH_PAT }}   # اختياري: عشان البوت يكتب/يعدّل على GitHub (للمالك فقط)
-          TOR_PROXY: ${{ env.TOR_PROXY }}   # يتعبّى تلقائياً لو USE_TOR=true
-          PERSONA_KEY: ${{ secrets.PERSONA_KEY }}   # اختياري: مفتاح تشفير الهوية وقواعد القفل
+          AGENT_MODEL: ${{ vars.AGENT_MODEL }}         # optional: the coding agents' model (default z-ai/glm-5.3)
+          AGENT_PROVIDER: ${{ vars.AGENT_PROVIDER }}   # optional: the agents' provider (default baidu/fp8)
+          GH_PAT: ${{ secrets.GH_PAT }}   # optional: lets the bot write/edit on GitHub and watch CI (owner only)
+          TOR_PROXY: ${{ env.TOR_PROXY }}   # filled automatically when USE_TOR=true
+          PERSONA_KEY: ${{ secrets.PERSONA_KEY }}   # optional: the key that encrypts the persona and lock rules
         run: |
           mkdir -p data
           start=$(date +%s)
           timeout --signal=SIGINT 340m python bot.py || true
-          # لو طاح بسرعة (مثلاً مفتاح غلط) لا تعيد التشغيل فوراً — الجدولة بتحاول بعد 30 دقيقة
+          # If it crashed quickly (e.g. a wrong key) don't restart right away — the schedule retries in 30 minutes
           if [ $(( $(date +%s) - start )) -gt 300 ]; then echo "restart=true" >> "$GITHUB_OUTPUT"; fi
 
+      # Coding projects are saved too, without heavy dependency folders (they reinstall on demand)
       - name: Save data
         if: always()
         uses: actions/cache/save@v4
         with:
-          path: telegram-persona-bot/data
+          path: |
+            telegram-persona-bot/data
+            !telegram-persona-bot/data/workspaces/**/node_modules
+            !telegram-persona-bot/data/workspaces/**/.venv
+            !telegram-persona-bot/data/workspaces/**/venv
+            !telegram-persona-bot/data/workspaces/**/__pycache__
+            !telegram-persona-bot/data/workspaces/**/.next
+            !telegram-persona-bot/data/workspaces/**/target
           key: bot-data-${{ github.run_id }}-${{ github.run_attempt }}
 
-      # حذف النسخ القديمة من البيانات عشان المحادثات الممسوحة تنحذف نهائياً
+      # Delete the old data copies so wiped conversations are gone for good
+      # (and the leftover caches of the removed second bot)
       - name: Delete old data
         if: always()
         continue-on-error: true
@@ -119,8 +130,11 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           KEEP: bot-data-${{ github.run_id }}-${{ github.run_attempt }}
         run: |
+          gh cache list --key bot2-data- --limit 100 --json key --jq '.[].key' | while read -r k; do
+            [ -n "$k" ] && gh cache delete "$k" || true
+          done
           keys=$(gh cache list --key bot-data- --limit 100 --json key --jq '.[].key')
-          # لو ما انحفظت نسخة جديدة لا تحذف شي (عشان ما تضيع الهوية)
+          # If no new copy was saved, delete nothing (so the persona is never lost)
           echo "$keys" | grep -qx "$KEEP" || { echo "no new save, skipping"; exit 0; }
           echo "$keys" | while read -r k; do
             [ "$k" != "$KEEP" ] && gh cache delete "$k" || true

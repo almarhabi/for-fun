@@ -1,8 +1,9 @@
-"""تحويل ردود الموديل (Markdown) إلى رسائل تليجرام مرتبة (HTML) مع ضبط اتجاه النص.
+"""Turns the model's replies (Markdown) into tidy Telegram messages (HTML) with correct text direction.
 
-- ** و ## و - ... تتحول لخط عريض وعناوين وقوائم حقيقية بدل ما تطلع كرموز.
-- كل سطر عربي يبدأ بعلامة اتجاه (RLM) عشان يطلع من اليمين لليسار حتى لو بدأ بكلمة إنجليزية أو رقم.
-- علامات الاقتباس المزخرفة “” ‘’ تتحول لـ «» في النص العربي، ورموز مثل ^^ تنحذف.
+- **, ## and - ... become real bold text, headings and lists instead of showing up as symbols.
+- Right-to-left lines (Arabic script) start with a direction mark (RLM) so they lay out right-to-left even
+  when they begin with a Latin word or a number. Left-to-right lines are left as they are.
+- Curly quotes “” ‘’ become «» inside Arabic text, and symbols like ^^ are removed.
 """
 
 import html
@@ -11,10 +12,10 @@ from urllib.parse import urlparse
 
 RLM, LRM = "‏", "‎"
 CURSOR = "▌"
-PAGE_LIMIT = 3000  # حروف Markdown لكل رسالة (حد تليجرام 4096 بعد التحويل)
+PAGE_LIMIT = 3000  # Markdown characters per message (Telegram's limit is 4096 after conversion)
 TG_LIMIT = 4096
 
-_AR = re.compile(r"[؀-ۿݐ-ݿࢠ-ࣿﭐ-﷿ﹰ-﻿]")
+_AR = re.compile(r"[\u0600-\u06FF\u0750-\u077F\u08A0-\u08FF\uFB50-\uFDFF\uFE70-\uFEFF]")  # Arabic-script ranges
 _LAT = re.compile(r"[A-Za-z]")
 _TAG = re.compile(r"<(/?)([a-z-]+)(?:\s[^>]*)?>")
 _ALLOWED = {"b", "i", "u", "s", "code", "pre", "a", "blockquote", "tg-spoiler"}
@@ -49,7 +50,7 @@ def esc(s: str) -> str:
 
 
 def to_plain(html_text: str) -> str:
-    """نسخة بدون تنسيق (لو تليجرام رفض الـ HTML لأي سبب)."""
+    """A plain-text version (if Telegram rejects the HTML for any reason)."""
     return html.unescape(re.sub(r"<[^>]+>", "", html_text))
 
 
@@ -68,14 +69,14 @@ def valid_html(s: str) -> bool:
     return not stack
 
 
-# ---------- اتجاه النص ----------
+# ---------- Text direction ----------
 
 def _counts(text: str) -> tuple[int, int]:
     return len(_AR.findall(text)), len(_LAT.findall(text))
 
 
 def is_rtl(text: str) -> bool:
-    """هل الرسالة عربية في الغالب؟ (بدون حساب الأكواد)"""
+    """Is the message mostly right-to-left (Arabic script)? (code is not counted)"""
     text = re.sub(r"```.*?(```|$)", "", text, flags=re.S)
     text = re.sub(r"`[^`\n]*`", "", text)
     ar, lat = _counts(text)
@@ -83,23 +84,23 @@ def is_rtl(text: str) -> bool:
 
 
 def mark(line_html: str, plain: str, rtl: bool) -> str:
-    """يضيف علامة الاتجاه المناسبة لبداية السطر."""
+    """Adds the right direction mark at the start of a line."""
     if not plain.strip():
         return line_html
     ar, lat = _counts(plain)
     if rtl or (ar and ar >= lat):
         out = RLM + line_html
-        # سطر إنجليزي داخل رد عربي: نثبت علامة الترقيم في آخره بجانب الكلمة
-        if ar * 2 < lat and re.search(r"[A-Za-z][^A-Za-z؀-ۿ]*$", plain) and re.search(r"[^\w\s]\s*$", plain):
+        # a Latin line inside a right-to-left reply: keep its final punctuation next to the word
+        if ar * 2 < lat and re.search(r"[A-Za-z][^A-Za-z\u0600-\u06FF]*$", plain) and re.search(r"[^\w\s]\s*$", plain):
             out += LRM
         return out
     return line_html
 
 
-# ---------- التنسيق داخل السطر ----------
+# ---------- Inline formatting ----------
 
 def _clean_symbols(s: str, arabic_line: bool) -> str:
-    s = re.sub(r"(?<!\S)\^[_\-.o]?\^(?!\S)", "", s)  # ^^ و ^_^
+    s = re.sub(r"(?<!\S)\^[_\-.o]?\^(?!\S)", "", s)  # ^^ and ^_^
     s = re.sub(r"(?<=[\w)\]])\^\{?([0-9+\-]{1,4})\}?", lambda m: m.group(1).translate(_SUP), s)
     s = s.replace("\\(", "").replace("\\)", "").replace("\\[", "").replace("\\]", "").replace("$$", "")
     if arabic_line:
@@ -113,9 +114,9 @@ def _clean_symbols(s: str, arabic_line: bool) -> str:
 
 
 def inline(text: str, partial: bool = False) -> str:
-    """يحول تنسيق سطر واحد (عريض، مائل، كود، روابط...) إلى HTML آمن."""
+    """Turns one line's formatting (bold, italic, code, links...) into safe HTML."""
     if partial:
-        # أثناء الكتابة: نقفل التنسيق المفتوح عشان يطلع عريض من أول حرف بدل **
+        # while streaming: close any open formatting so it shows bold from the first letter instead of **
         if text.count("**") % 2:
             text += "**"
         if len(re.findall(r"(?<!`)`(?!`)", text)) % 2:
@@ -135,7 +136,7 @@ def inline(text: str, partial: bool = False) -> str:
         seg = esc(_clean_symbols(seg, arabic_line))
         for pat, rep in _INLINE_RULES:
             seg = pat.sub(rep, seg)
-        return seg.replace("**", "")  # أي ** باقية بدون زوج ما لها داعي تطلع
+        return seg.replace("**", "")  # a leftover unpaired ** shouldn't show up
 
     out, pos = [], 0
     for m in _CODE_SPAN.finditer(text):
@@ -144,14 +145,14 @@ def inline(text: str, partial: bool = False) -> str:
         pos = m.end()
     out.append(fmt(text[pos:]))
     result = "".join(out)
-    for _ in range(3):  # الروابط ممكن تكون داخل بعض
+    for _ in range(3):  # links can be nested
         result = re.sub(r"(\d+)", lambda m: holders[int(m.group(1))], result)
     if not valid_html(result):
         return esc(text.replace("**", ""))
     return result
 
 
-# ---------- الجداول ----------
+# ---------- Tables ----------
 
 def _cells(row: str) -> list[str]:
     r = row.strip()
@@ -163,7 +164,7 @@ def _cells(row: str) -> list[str]:
 
 
 def _table(rows: list[str], rtl: bool) -> str:
-    """الجداول ما تنعرض زين على الجوال، فنحولها لقائمة مرتبة."""
+    """Tables don't display well on phones, so they become a tidy list."""
     header, body = _cells(rows[0]), [_cells(r) for r in rows[1:] if r.strip()]
     if not body:
         joined = " · ".join(header)
@@ -186,10 +187,10 @@ def _table(rows: list[str], rtl: bool) -> str:
     return "\n\n".join(blocks)
 
 
-# ---------- الرسالة كاملة ----------
+# ---------- The whole message ----------
 
 def render(md: str, partial: bool = False) -> str:
-    """Markdown ← HTML تليجرام. partial=True لما يكون الرد لسا ينكتب."""
+    """Markdown → Telegram HTML. partial=True while the reply is still being written."""
     md = strip_split(md.replace("\r\n", "\n"), partial).strip("\n")
     rtl = is_rtl(md)
     lines = md.split("\n")
@@ -208,7 +209,7 @@ def render(md: str, partial: bool = False) -> str:
             while i < n and not lines[i].strip().startswith(marker):
                 body.append(lines[i])
                 i += 1
-            i += 1  # سطر الإغلاق
+            i += 1  # the closing fence line
             code = "\n".join(body).strip("\n")
             if code:
                 cls = f' class="language-{esc(lang)}"' if lang else ""
@@ -230,7 +231,7 @@ def render(md: str, partial: bool = False) -> str:
         head = _HEAD.match(line)
         if head:
             if out and out[-1] != "":
-                out.append("")  # مسافة قبل كل عنوان عشان تبان الأقسام
+                out.append("")  # a gap before every heading so sections stand out
             content = inline(head.group(2), last)
             html_line = f"<b><u>{content}</u></b>" if len(head.group(1)) == 1 else f"<b>{content}</b>"
             out.append(mark(html_line, head.group(2), rtl))
@@ -281,7 +282,7 @@ def render(md: str, partial: bool = False) -> str:
 
 
 def _open_fence(text: str) -> tuple[str, str] | None:
-    """لو النص ينتهي داخل بلوك كود، يرجع (العلامة، اللغة)."""
+    """If the text ends inside a code block, returns (fence, language)."""
     state = None
     for line in text.split("\n"):
         f = _FENCE.match(line)
@@ -292,13 +293,13 @@ def _open_fence(text: str) -> tuple[str, str] | None:
     return state
 
 
-SPLIT_MARK = "<<<split>>>"  # علامة قديمة؛ ما عاد نطلبها من الموديل، بس ننظّفها لو ظهرت
+SPLIT_MARK = "<<<split>>>"  # an old marker; no longer requested from the model, but cleaned up if it appears
 _SPLIT_RE = re.compile(r"[ \t]*<<<split>>>[ \t]*")
 _SPLIT_PARTIAL = re.compile(r"<{1,3}(?:s(?:p(?:l(?:i(?:t(?:>{0,2})?)?)?)?)?)?\Z")
 
 
 def strip_split(md: str, partial: bool = False) -> str:
-    """يشيل علامة <<<split>>> من النص (وأي بداية علامة وهو لسا يكتبها)."""
+    """Removes the <<<split>>> marker from the text (and any partial marker while it's still being written)."""
     md = _SPLIT_RE.sub("\n\n", md)
     if partial:
         md = _SPLIT_PARTIAL.sub("", md)
@@ -306,7 +307,7 @@ def strip_split(md: str, partial: bool = False) -> str:
 
 
 def _best_cut(window: str, limit: int) -> int:
-    """أفضل مكان للقطع داخل النافذة: قبل عنوان، ثم نهاية فقرة، ثم سطر، ثم نهاية جملة، ثم مسافة."""
+    """The best place to cut inside the window: before a heading, then a paragraph end, a line, a sentence end, a space."""
     heads = [m.start() for m in re.finditer(r"\n(?=[ \t]{0,3}#{1,6}\s)", window)]
     if heads and heads[-1] >= limit * 0.4:
         return heads[-1]
@@ -316,7 +317,7 @@ def _best_cut(window: str, limit: int) -> int:
     cut = window.rfind("\n")
     if cut >= limit * 0.4:
         return cut
-    ends = [m.end() for m in re.finditer(r"[.!?؟…؛:](?=\s)", window)]
+    ends = [m.end() for m in re.finditer(r"[.!?\u061F…\u061B:](?=\s)", window)]  # incl. Arabic ? and ;
     if ends and ends[-1] >= limit * 0.3:
         return ends[-1]
     cut = window.rfind(" ")
@@ -324,9 +325,9 @@ def _best_cut(window: str, limit: int) -> int:
 
 
 def split_md(text: str, limit: int = PAGE_LIMIT) -> list[str]:
-    """يقسم الرد لعدة رسائل: أولاً عند علامات الموديل <<<split>>>، وبعدها لو جزء طال عن الحد
-    يقطع عند أقرب نقطة طبيعية. التقسيم ثابت: الأجزاء المرسلة ما تتغير لما يكمل الرد."""
-    for k in range(len(SPLIT_MARK) - 1, 2, -1):  # علامة لسا ما اكتملت وهو يكتب
+    """Splits a reply into several messages: first at <<<split>>> markers, then any part that is too long is cut
+    at the nearest natural point. The split is stable: parts already sent don't change as the reply continues."""
+    for k in range(len(SPLIT_MARK) - 1, 2, -1):  # a marker that isn't complete yet while streaming
         if text.endswith(SPLIT_MARK[:k]):
             text = text[:-k]
             break
@@ -340,7 +341,7 @@ def split_md(text: str, limit: int = PAGE_LIMIT) -> list[str]:
             cut = _best_cut(rest[:limit], limit)
             piece, rest = rest[:cut], rest[cut:].lstrip("\n")
             fence = _open_fence(piece)
-            if fence:  # نقفل بلوك الكود هنا ونفتحه من جديد في الرسالة اللي بعدها
+            if fence:  # close the code block here and reopen it in the next message
                 piece += "\n" + fence[0]
                 rest = fence[0] + fence[1] + "\n" + rest
             if piece.strip():
@@ -361,34 +362,29 @@ def page_html(md: str, partial: bool) -> str:
     return h
 
 
-# ---------- التفكير والمصادر ----------
+# ---------- Thinking and sources ----------
 
-def duration_ar(seconds: float) -> str:
+def duration_text(seconds: float) -> str:
     s = int(round(seconds))
     if s < 1:
-        return "أقل من ثانية"
+        return "less than a second"
 
-    def unit(n: int, one: str, two: str, few: str, many: str) -> str:
-        if n == 1:
-            return one
-        if n == 2:
-            return two
-        return f"{n} {few}" if 3 <= n <= 10 else f"{n} {many}"
+    def unit(n: int, word: str) -> str:
+        return f"{n} {word}" + ("" if n == 1 else "s")
 
     if s < 60:
-        return unit(s, "ثانية", "ثانيتين", "ثوانٍ", "ثانية")
+        return unit(s, "second")
     m, rem = divmod(s, 60)
-    text = unit(m, "دقيقة", "دقيقتين", "دقائق", "دقيقة")
-    return text + (f" و{unit(rem, 'ثانية', 'ثانيتين', 'ثوانٍ', 'ثانية')}" if rem else "")
+    return unit(m, "minute") + (f" {unit(rem, 'second')}" if rem else "")
 
 
 def thinking_html(parts: list[list[str]], final: bool, seconds: float, limit: int = 3000) -> tuple[str, bool]:
-    """رسالة التفكير. parts = [["r", نص تفكير] أو ["s", خطوة بحث]]. يرجع (html، هل انقص)."""
+    """The thinking message. parts = [["r", reasoning], ["s", a step] or ["n", lead narration]]. Returns (html, truncated)."""
     items: list[tuple[str, str]] = []
     for kind, text in parts:
         if kind == "s":
             items.append(("s", text))
-        elif kind == "n":  # كلام القائد بين الخطوات (وضع الوكلاء)
+        elif kind == "n":  # the lead's remarks between steps (coding mode)
             lines_n = [ln.strip() for ln in text.strip().split("\n") if ln.strip()]
             for i, line in enumerate(lines_n):
                 items.append(("n", ("💬 " if i == 0 else "") + re.sub(r"^#+\s*", "", line)))
@@ -400,7 +396,7 @@ def thinking_html(parts: list[list[str]], final: bool, seconds: float, limit: in
     truncated = False
     total = 0
     kept: list[tuple[str, str]] = []
-    for kind, text in reversed(items):  # نعرض آخر جزء لو التفكير طويل
+    for kind, text in reversed(items):  # show the latest part if the thinking is long
         if total + len(text) > limit:
             room = limit - total
             if room > 80 and kind == "r":
@@ -421,12 +417,11 @@ def thinking_html(parts: list[list[str]], final: bool, seconds: float, limit: in
             bullet = _UL.match(text)
             body = ("• " + inline(bullet.group(2))) if bullet else inline(text)
             lines.append(mark(body, text, rtl))
-    title = f"💭 <b>فكّر لمدة {duration_ar(seconds)}</b>" if final else "💭 <b>يفكر…</b>"
-    title = RLM + title
+    title = f"💭 <b>Thought for {duration_text(seconds)}</b>" if final else "💭 <b>Thinking…</b>"
     if not lines:
         return title, False
     if truncated:
-        lines.insert(0, RLM + "<i>…(جزء من التفكير)</i>")
+        lines.insert(0, "<i>…(part of the thinking)</i>")
     tag = "blockquote expandable" if final else "blockquote"
     return f"{title}\n<{tag}>" + "\n".join(lines) + "</blockquote>", truncated
 
@@ -443,13 +438,13 @@ def sources_html(sources: list[dict], limit: int = 6) -> str:
         if len(title) > 70:
             title = title[:67] + "…"
         link = f'<a href="{html.escape(s["url"], quote=True)}">{esc(title)}</a>'
-        items.append(mark(f"{n}. {link} <i>· {esc(domain(s['url']))}</i>", title, True))
-    return f"<blockquote expandable>{RLM}🔗 <b>المصادر</b>\n" + "\n".join(items) + "</blockquote>"
+        items.append(mark(f"{n}. {link} <i>· {esc(domain(s['url']))}</i>", title, False))
+    return "<blockquote expandable>🔗 <b>Sources</b>\n" + "\n".join(items) + "</blockquote>"
 
 
-# ================= تحويل لصفحة Telegra.ph (للردود الطويلة) =================
-# Telegra.ph ينفتح داخل تليجرام بـ Instant View: صفحة مرتبة بلا حد حروف وبلا تقسيم.
-# الوسوم المسموحة في Telegra.ph (نحوّل # و ## لـ h3/h4، والجداول لقوائم).
+# ================= Conversion to a Telegra.ph page (for long replies) =================
+# Telegra.ph opens inside Telegram with Instant View: a tidy page with no character limit and no splitting.
+# Tags allowed by Telegra.ph (# and ## become h3/h4, and tables become lists).
 
 from html.parser import HTMLParser as _HTMLParser
 
@@ -458,7 +453,7 @@ _INLINE_TAG = {"b": "b", "strong": "b", "i": "i", "em": "i", "u": "u", "s": "s",
 
 
 class _NodeParser(_HTMLParser):
-    """يحوّل HTML تليجرام المبسّط (من inline()) إلى عُقد Telegra.ph."""
+    """Turns the simple Telegram HTML (from inline()) into Telegra.ph nodes."""
 
     def __init__(self):
         super().__init__(convert_charrefs=True)
@@ -499,7 +494,7 @@ def _inline_nodes(text: str, rtl: bool) -> list:
     p.close()
     children = p.root
     if rtl and _AR.search(text):
-        children = [RLM, *children]  # نجبر اتجاه الفقرة لليمين
+        children = [RLM, *children]  # force the paragraph to lay out right-to-left
     return children or [""]
 
 
@@ -521,7 +516,7 @@ def _table_nodes(rows: list[str], rtl: bool) -> list:
 
 
 def to_telegraph_nodes(md: str) -> list:
-    """Markdown ← عُقد Telegra.ph."""
+    """Markdown → Telegra.ph nodes."""
     md = strip_split(md.replace("\r\n", "\n")).strip("\n")
     rtl = is_rtl(md)
     lines = md.split("\n")
@@ -609,7 +604,7 @@ def to_telegraph_nodes(md: str) -> list:
 
 
 def telegraph_title(md: str, limit: int = 120) -> str:
-    """عنوان الصفحة: أول سطر فيه نص، بدون رموز Markdown."""
+    """The page title: the first line with text, without Markdown symbols."""
     for line in strip_split(md).splitlines():
         t = line.strip()
         t = re.sub(r"^\s{0,3}#{1,6}\s*", "", t)
@@ -618,11 +613,11 @@ def telegraph_title(md: str, limit: int = 120) -> str:
         t = re.sub(r"[*_`~#]", "", t).replace(RLM, "").replace(LRM, "").strip()
         if t:
             return t[:limit].rstrip() + ("…" if len(t) > limit else "")
-    return "رد"
+    return "Reply"
 
 
 def live_tail_html(md: str, limit: int = 3400) -> str:
-    """معاينة حيّة للرد وهو يُكتب: النص كامل لو قصير، وإلا آخر جزء منه بصيغة نصية آمنة."""
+    """A live preview of the reply while it's written: the full text if short, otherwise its latest part as safe text."""
     md = strip_split(md.replace("\r\n", "\n"), partial=True).strip("\n")
     if not md:
         return ""

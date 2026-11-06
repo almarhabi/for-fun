@@ -1,6 +1,6 @@
-"""عميل Telegra.ph: ينشئ صفحة مرتبة للردود الطويلة تنفتح داخل تليجرام بـ Instant View.
+"""Telegra.ph client: creates a tidy page for long replies that opens inside Telegram with Instant View.
 
-بلا حد حروف وبلا تقسيم الرد لأجزاء. الـ access_token ينحفظ عشان الصفحات تبقى تحت حساب واحد.
+No character limit and no splitting the reply into parts. The access_token is saved so pages stay under one account.
 """
 
 import asyncio
@@ -14,7 +14,7 @@ import httpx
 log = logging.getLogger("persona-bot.telegraph")
 
 API_BASE = os.getenv("TELEGRAPH_API_BASE", "https://api.telegra.ph").rstrip("/")
-CONTENT_LIMIT = 63_000  # حد حقل المحتوى في Telegra.ph تقريباً 64KB
+CONTENT_LIMIT = 63_000  # Telegra.ph's content field limit is roughly 64KB
 
 
 class TelegraphError(RuntimeError):
@@ -64,20 +64,20 @@ class Telegraph:
             return self._token
 
     async def create_page(self, title: str, nodes: list) -> str:
-        """ينشئ صفحة ويرجع رابطها. يرمي TelegraphError لو فشل."""
+        """Creates a page and returns its URL. Raises TelegraphError on failure."""
         content = json.dumps(nodes, ensure_ascii=False)
         if len(content.encode("utf-8")) > CONTENT_LIMIT:
             raise TelegraphError("too_long")
         async with httpx.AsyncClient(timeout=25) as http:
             token = await self._ensure_token(http)
-            data = {"access_token": token, "title": (title or "رد")[:256],
+            data = {"access_token": token, "title": (title or "Reply")[:256],
                     "content": content, "return_content": "false"}
             if self.author_name:
                 data["author_name"] = self.author_name
             try:
                 res = await self._post(http, "createPage", data)
             except TelegraphError as e:
-                if "TOKEN" in str(e).upper():  # توكن قديم/غير صالح: ننشئ حساب جديد مرة وحدة
+                if "TOKEN" in str(e).upper():  # old/invalid token: create a new account once
                     self._token = None
                     try:
                         self.token_file.unlink()
