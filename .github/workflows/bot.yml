@@ -122,7 +122,6 @@ jobs:
           key: bot-data-${{ github.run_id }}-${{ github.run_attempt }}
 
       # Delete the old data copies so wiped conversations are gone for good
-      # (and the leftover caches of the removed second bot)
       - name: Delete old data
         if: always()
         continue-on-error: true
@@ -130,9 +129,6 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           KEEP: bot-data-${{ github.run_id }}-${{ github.run_attempt }}
         run: |
-          gh cache list --key bot2-data- --limit 100 --json key --jq '.[].key' | while read -r k; do
-            [ -n "$k" ] && gh cache delete "$k" || true
-          done
           keys=$(gh cache list --key bot-data- --limit 100 --json key --jq '.[].key')
           # If no new copy was saved, delete nothing (so the persona is never lost)
           echo "$keys" | grep -qx "$KEEP" || { echo "no new save, skipping"; exit 0; }

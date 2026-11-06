@@ -197,6 +197,18 @@ memory, projects) is kept between runs.
 > ⚠️ Running a permanent service on GitHub Actions goes against GitHub's terms; a real server is recommended.
 > Don't run the bot locally and on GitHub at the same time — Telegram accepts one copy only.
 
+## A second bot on GLM-5.3 (bot 2)
+
+`.github/workflows/bot2.yml` runs a second, fully independent bot with **the same code and every feature**
+(Chat + Coding), on `z-ai/glm-5.3` via `baidu/fp8` — in Coding mode GLM is both the lead and the agents.
+It has its own token, persona, rules, memory and projects (cache `bot2-data-`).
+
+- Required: the secret `TELEGRAM_BOT_TOKEN_2` (a different bot from @BotFather).
+- Shared with bot 1 by default: `OPENROUTER_API_KEY`, `OWNER_ID`, `GH_PAT` (override with `_2` secrets).
+- Optional: `PERSONA_KEY_2`; variables `OPENROUTER_MODEL_2`, `OPENROUTER_PROVIDER_2`, `AGENT_MODEL_2`,
+  `AGENT_PROVIDER_2`, `USE_TOR_2`.
+- Start it: **Actions → Telegram bot 2 (GLM) 24h → Run workflow** (it also starts on every push).
+
 ## Running locally
 
 ```bash

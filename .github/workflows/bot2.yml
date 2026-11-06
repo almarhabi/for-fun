@@ -1,0 +1,147 @@
+name: Telegram bot 2 (GLM) 24h
+
+# A second, fully independent bot running the same code (Chat + Coding, every feature) on GLM-5.3.
+# Its own token, model, provider and data (cache bot2-data-). The OpenRouter key and owner id are shared
+# with bot 1 unless the _2 secrets are set.
+
+# GitHub stops any run after 6 hours, so the bot runs ~5h40m,
+# then saves its data and restarts itself. The schedule is a backup in case it stops for any reason.
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "17,47 * * * *"
+  push:
+    branches: [telegram-persona-bot]
+    paths:
+      - "telegram-persona-bot/**"
+      - ".github/workflows/bot2.yml"
+
+# Only one copy runs at a time (Telegram doesn't accept two)
+# When new code is pushed, the old copy stops and the new one starts right away
+concurrency:
+  group: telegram-bot-2
+  cancel-in-progress: ${{ github.event_name == 'push' }}
+
+permissions:
+  contents: read
+  actions: write
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 355
+    defaults:
+      run:
+        working-directory: telegram-persona-bot
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: telegram-persona-bot/requirements.txt
+
+      - name: Check secrets
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN_2 }}
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY_2 || secrets.OPENROUTER_API_KEY }}
+          OWNER_ID: ${{ secrets.OWNER_ID_2 || secrets.OWNER_ID }}
+        run: |
+          missing=0
+          for n in TELEGRAM_BOT_TOKEN OPENROUTER_API_KEY OWNER_ID; do
+            if [ -z "${!n}" ]; then echo "::error::Secret $n is missing (for bot 2: TELEGRAM_BOT_TOKEN_2) — add it in Settings > Secrets and variables > Actions > Secrets"; missing=1;
+            else echo "$n: OK"; fi
+          done
+          [ "$missing" = 0 ] || exit 1
+          # Make sure OpenRouter accepts the key before starting (without printing the key)
+          key=$(printf '%s' "$OPENROUTER_API_KEY" | tr -d '\r\n' | sed -E 's/^[[:space:]"'"'"']+//; s/[[:space:]"'"'"']+$//; s/^[Bb]earer[[:space:]]+//')
+          case "$key" in
+            sk-or-*) ;;
+            *) echo "::warning::OPENROUTER_API_KEY doesn't start with sk-or- — it's probably copied wrong or not an OpenRouter key" ;;
+          esac
+          code=$(curl -s -o /tmp/key.json -w '%{http_code}' -H "Authorization: Bearer $key" https://openrouter.ai/api/v1/key)
+          if [ "$code" = "404" ]; then  # the older path
+            code=$(curl -s -o /tmp/key.json -w '%{http_code}' -H "Authorization: Bearer $key" https://openrouter.ai/api/v1/auth/key)
+          fi
+          if [ "$code" != "200" ]; then
+            echo "::error::OpenRouter rejected the key (HTTP $code): $(head -c 300 /tmp/key.json) — copy a new key from openrouter.ai/keys and update the OPENROUTER_API_KEY secret"
+            exit 1
+          fi
+          echo "OpenRouter key OK: $(jq -c '.data | {limit, limit_remaining, usage, is_free_tier}' /tmp/key.json)"
+
+      - run: pip install -r requirements.txt
+
+      # Optional: run Tor inside the runner so the bot searches/reads through it.
+      # Enable it by adding a variable (Variables) named USE_TOR with the value true.
+      - name: Start Tor (optional)
+        if: vars.USE_TOR_2 == 'true'
+        run: |
+          sudo apt-get update && sudo apt-get install -y tor
+          sudo service tor start || (tor &)
+          echo "TOR_PROXY=socks5h://127.0.0.1:9050" >> "$GITHUB_ENV"
+          for i in $(seq 1 60); do (echo > /dev/tcp/127.0.0.1/9050) >/dev/null 2>&1 && break; sleep 1; done
+          echo "Tor SOCKS is ready on 9050"
+
+      # Restore the persona, conversation memory and coding projects from the previous run
+      - uses: actions/cache/restore@v4
+        with:
+          path: telegram-persona-bot/data
+          key: bot2-data-${{ github.run_id }}
+          restore-keys: bot2-data-
+
+      - name: Run bot
+        id: bot
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN_2 }}
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY_2 || secrets.OPENROUTER_API_KEY }}
+          OWNER_ID: ${{ secrets.OWNER_ID_2 || secrets.OWNER_ID }}
+          OPENROUTER_MODEL: ${{ vars.OPENROUTER_MODEL_2 || 'z-ai/glm-5.3' }}
+          OPENROUTER_PROVIDER: ${{ vars.OPENROUTER_PROVIDER_2 || 'baidu/fp8' }}
+          AGENT_MODEL: ${{ vars.AGENT_MODEL_2 }}         # optional: the coding agents' model (default z-ai/glm-5.3)
+          AGENT_PROVIDER: ${{ vars.AGENT_PROVIDER_2 }}   # optional: the agents' provider (default baidu/fp8)
+          GH_PAT: ${{ secrets.GH_PAT_2 || secrets.GH_PAT }}   # optional: lets the bot write/edit on GitHub and watch CI (owner only)
+          TOR_PROXY: ${{ env.TOR_PROXY }}   # filled automatically when USE_TOR=true
+          PERSONA_KEY: ${{ secrets.PERSONA_KEY_2 }}   # optional: the key that encrypts the persona and lock rules
+        run: |
+          mkdir -p data
+          start=$(date +%s)
+          timeout --signal=SIGINT 340m python bot.py || true
+          # If it crashed quickly (e.g. a wrong key) don't restart right away — the schedule retries in 30 minutes
+          if [ $(( $(date +%s) - start )) -gt 300 ]; then echo "restart=true" >> "$GITHUB_OUTPUT"; fi
+
+      # Coding projects are saved too, without heavy dependency folders (they reinstall on demand)
+      - name: Save data
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            telegram-persona-bot/data
+            !telegram-persona-bot/data/workspaces/**/node_modules
+            !telegram-persona-bot/data/workspaces/**/.venv
+            !telegram-persona-bot/data/workspaces/**/venv
+            !telegram-persona-bot/data/workspaces/**/__pycache__
+            !telegram-persona-bot/data/workspaces/**/.next
+            !telegram-persona-bot/data/workspaces/**/target
+          key: bot2-data-${{ github.run_id }}-${{ github.run_attempt }}
+
+      # Delete the old data copies so wiped conversations are gone for good
+      - name: Delete old data
+        if: always()
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          KEEP: bot2-data-${{ github.run_id }}-${{ github.run_attempt }}
+        run: |
+          keys=$(gh cache list --key bot2-data- --limit 100 --json key --jq '.[].key')
+          # If no new copy was saved, delete nothing (so the persona is never lost)
+          echo "$keys" | grep -qx "$KEEP" || { echo "no new save, skipping"; exit 0; }
+          echo "$keys" | while read -r k; do
+            [ "$k" != "$KEEP" ] && gh cache delete "$k" || true
+          done
+
+      - name: Restart
+        if: steps.bot.outputs.restart == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run bot2.yml --ref "${{ github.ref_name }}"
