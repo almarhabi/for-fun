@@ -1865,31 +1865,35 @@ async def backend_scenario(app):
     saved_pool = bot.nvidia_pool
     bot.nvidia_pool, log, made = make_pool()
     made["k2"].fail = [401]
-    user_msg("/free")
+    user_msg("/settings")
     await wait_idle()
-    check("/free: switches to NVIDIA", bot.cfg("backend") == "nvidia" and "NVIDIA (free" in last_bot()["text"]
-          and "3 key" in last_bot()["text"], last_bot()["text"][:300])
-    check("/backend: shown in both settings panels", "set:backend:nvidia" in str(bot.settings_keyboard("chat").inline_keyboard)
+    panel = last_bot()
+    check("settings: backend buttons in the panel", cb_of(panel, "set:backend:nvidia") and cb_of(panel, "set:backend:openrouter"))
+    press("set:backend:nvidia", panel["message_id"])
+    await wait_idle()
+    check("settings button: switches to NVIDIA (no command needed)", bot.cfg("backend") == "nvidia"
+          and "NVIDIA (free" in S["msgs"][panel["message_id"]]["text"] and "3 key" in S["msgs"][panel["message_id"]]["text"],
+          S["msgs"][panel["message_id"]]["text"][:300])
+    check("settings: backend row in both panels", "set:backend:nvidia" in str(bot.settings_keyboard("chat").inline_keyboard)
           and "cset:backend:openrouter" in str(bot.settings_keyboard("agent").inline_keyboard))
-    user_msg("/ping")
+    user_msg("/doctor")
     await wait_idle(timeout=40)
     t = last_bot()["text"]
-    check("/ping: tests every key", "key 1 — answers" in t and "key 2 — key rejected (401)" in t
+    check("/doctor: pings every key", "key 1 — answers" in t and "key 2 — key rejected (401)" in t
           and "key 3 — answers" in t and "OpenRouter" in t, t)
-    check("/ping: shows the load per key", "/40" in t, t)
-    press("set:backend:openrouter", last_bot()["message_id"])
-    await wait_idle()
-    check("settings button: back to OpenRouter", bot.cfg("backend") == "openrouter")
-    user_msg("/backend free")
-    await wait_idle()
+    check("/doctor: shows the load per key", "/40" in t, t)
+    user_msg("/ping")
+    await wait_idle(timeout=40)
+    check("/ping: same as /doctor", "Doctor" in last_bot()["text"] and "key 1 — answers" in last_bot()["text"])
     user_msg("/status")
     await wait_idle()
     check("/status: shows the backend", "Backend:</b> 🆓 NVIDIA" in last_bot()["text"], last_bot()["text"][:400])
-    user_msg("/paid")
+    press("set:backend:openrouter", panel["message_id"])
     await wait_idle()
-    check("/paid: back to OpenRouter", bot.cfg("backend") == "openrouter" and "OpenRouter (paid)" in last_bot()["text"])
+    check("settings button: back to OpenRouter", bot.cfg("backend") == "openrouter")
     menu = [c.command for c in bot._menu_commands("owner")]
-    check("menu: /backend and /ping listed", "backend" in menu and "ping" in menu, menu)
+    check("menu: no backend commands, /ping folded into /doctor", "backend" not in menu and "doctor" in menu
+          and "ping" not in menu and "free" not in menu, menu)
     bot.nvidia_pool = saved_pool
 
 

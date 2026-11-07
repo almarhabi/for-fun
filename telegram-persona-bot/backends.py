@@ -1,7 +1,7 @@
 """Two model backends with the same models: 💳 OpenRouter (paid) and 🆓 NVIDIA NIM (free), switched by hand.
 
 - ModelRouter looks like an OpenAI client (client.chat.completions.create) and sends every request to the backend
-  the owner picked, so chat, the coding lead and the agents all follow the switch.
+  the owner picked in ⚙️ Settings, so chat, the coding lead and the agents all follow the switch.
 - KeyPool spreads NVIDIA requests over several API keys instead of hammering one:
   * each request goes to the key with the fewest requests in the last minute (ties: the one used longest ago),
   * a key never goes over its per-minute limit (rpm_per_key) — if every key is full, the request waits for the
@@ -113,7 +113,7 @@ class KeyPool:
                 raise NoKeyAvailable("Every NVIDIA key was rejected (401/403) — check or replace the keys.")
             if self.clock() + wait > deadline:
                 raise NoKeyAvailable("All NVIDIA keys are at their rate limit right now — try again in a minute, "
-                                     "or switch to 💳 OpenRouter.")
+                                     "or switch to 💳 OpenRouter in ⚙️ Settings.")
             await asyncio.sleep(min(max(wait, 0.05), 5.0))
 
     async def create(self, **kw):
@@ -215,6 +215,6 @@ class ModelRouter:
         if self.backend() == "nvidia":
             if not self.pool or not len(self.pool):
                 raise NoKeyAvailable("🆓 NVIDIA is selected but no NVIDIA keys are set — add the NVIDIA_KEY_1..3 "
-                                     "secrets, or switch back to 💳 OpenRouter.")
+                                     "secrets, or switch back to 💳 OpenRouter in ⚙️ Settings.")
             return await self.pool.create(**to_nvidia(kw, self.models, self.model_extra))
         return await self.openrouter.chat.completions.create(**kw)

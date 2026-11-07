@@ -207,8 +207,8 @@ replies as a page, txt file after each reply.
 
 ## Two backends: 💳 paid (OpenRouter) / 🆓 free (NVIDIA)
 
-The same models run on either backend, switched by hand: `/backend` (buttons), `/free`, `/paid`, or the
-**🔀 Backend** row in both settings panels. Everything follows the switch — Chat, the Coding lead and the agents.
+The same models run on either backend, switched by hand with the **🔀 Backend** buttons in ⚙️ Settings
+(both the Chat and the Coding panels) — no command needed. Everything follows the switch — Chat, the Coding lead and the agents.
 
 - **💳 OpenRouter:** each model on its fixed provider (above).
 - **🆓 NVIDIA NIM** (`integrate.api.nvidia.com`): `deepseek-ai/deepseek-v4.1-flash` and `z-ai/glm-5.3-flash`
@@ -217,8 +217,8 @@ The same models run on either backend, switched by hand: `/backend` (buttons), `
   requests in the last minute; no key goes over `rpm_per_key` (default 40) — when all are full the request waits for
   the first free slot (up to `max_wait_seconds`); a 429 rests that key and the request moves to another one at once;
   a 401/403 takes the key out; a bad request (400) isn't retried.
-- **`/ping`** checks every key for real (a 1-token request each, in parallel) plus the OpenRouter key, and shows
-  each NVIDIA key's load. `/doctor` and `/status` show the backend too.
+- **`/doctor`** (also `/ping`) checks every key for real (a 1-token request each, in parallel) plus the
+  OpenRouter key, and shows each NVIDIA key's load. `/status` shows the backend too.
 - Secrets: `NVIDIA_KEY_1`, `NVIDIA_KEY_2`, `NVIDIA_KEY_3` (bot 2 uses `NVIDIA_KEY_2_1..3` if set, otherwise the same
   three). Never paste keys into code or chat.
 

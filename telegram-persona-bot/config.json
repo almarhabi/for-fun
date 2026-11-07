@@ -148,29 +148,12 @@
     },
     {
       "names": [
-        "doctor"
+        "doctor",
+        "ping"
       ],
       "action": "doctor",
       "menu": "owner_all",
-      "menu_label": "🩺 Health check: keys, GitHub, tools"
-    },
-    {
-      "names": [
-        "backend",
-        "free",
-        "paid"
-      ],
-      "action": "backend",
-      "menu": "owner_all",
-      "menu_label": "🔀 Switch backend: 💳 paid / 🆓 free"
-    },
-    {
-      "names": [
-        "ping"
-      ],
-      "action": "ping",
-      "menu": "owner_all",
-      "menu_label": "📡 Ping every API key"
+      "menu_label": "🩺 Health check: pings every API key, GitHub, tools"
     },
     {
       "names": [
@@ -499,7 +482,7 @@
     },
     "backend": {
       "type": "str",
-      "label": "🔀 Backend (openrouter = 💳 paid · nvidia = 🆓 free)",
+      "label": "🔀 Backend (💳 paid OpenRouter · 🆓 free NVIDIA) — switch with the buttons",
       "modes": [
         "global"
       ]

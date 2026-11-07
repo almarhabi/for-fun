@@ -828,7 +828,7 @@ async def stream_round(ui: ResponseUI, messages: list, kw: dict, tool_kwargs: di
 
 def error_hint(e: Exception) -> str:
     if isinstance(e, backends.NoKeyAvailable):
-        return str(e) + " /ping checks every key."
+        return str(e) + " /doctor checks every key."
     code = getattr(e, "status_code", None)
     msg = str(e).lower()
     if code == 401:
@@ -2148,7 +2148,7 @@ def settings_html(mode: str = "chat") -> str:
         return f"<code>{esc(str(v))}</code>"
 
     title = "💻 <b>Coding mode settings</b>" if mode == "agent" else "⚙️ <b>Settings</b>"
-    rows = [title, ""]
+    rows = [title, "", f"• <b>🔀 Backend:</b> {esc(backend_label())} <i>(same models — switch with the buttons)</i>"]
     rows += [f"• <b>{param_label(k, mode)}:</b> {show(k)}" for k in mode_params(mode)]
     rows += [f"• <b>GitHub:</b> {'✅ connected' if github_tools.enabled() else '❌ not connected (add GH_PAT)'}"]
     if mode == "agent":
@@ -2284,7 +2284,7 @@ def code_welcome_html() -> str:
     return lines_html(
         "💻 <b>Coding mode</b>",
         f"🧠 Lead: <code>{esc(str(cfg('model', 'agent')))}</code> · reasoning {esc(str(cfg('effort', 'agent')))}",
-        f"🔀 Backend: {esc(backend_label())} — /backend to switch",
+        f"🔀 Backend: {esc(backend_label())} — switch it in ⚙️ Coding settings",
         f"👷 Agents: <code>{esc(str(cfg('worker_model', 'agent')))}</code> — up to {_max_agents()} in parallel",
         f"📁 Project: <code>{esc(ws.name)}</code> ({n} files · {human(size)}) — /project to switch",
         "",
@@ -2952,35 +2952,6 @@ async def cmd_agents(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     await send_html(context.bot, chat_id, "\n".join(rows))
 
 
-async def cmd_backend(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """/backend [paid|free] — the same models, on 💳 OpenRouter (paid) or 🆓 NVIDIA (free). /free and /paid too."""
-    if (chat_id := await _owner_cmd(update, context)) is None:
-        return
-    word = (update.message.text or "").split()[0].lstrip("/").split("@")[0].lower() if update.message else ""
-    arg = "nvidia" if word == "free" else "openrouter" if word == "paid" else " ".join(context.args or [])
-    if arg:
-        try:
-            save_setting("backend", parse_value("backend", arg))
-        except ValueError as e:
-            await send_html(context.bot, chat_id, "⚠️ " + esc(str(e)))
-            return
-    be = backend_name()
-    rows = [f"🔀 <b>Backend:</b> {esc(backend_label())}", ""]
-    if be == "nvidia":
-        rows.append(f"Same models on NVIDIA's free API. Requests are spread over {len(nvidia_pool)} key(s), each kept "
-                    f"under {nvidia_pool.rpm} requests a minute.")
-        if not len(nvidia_pool):
-            rows.append("⚠️ No NVIDIA keys are set yet — add the secrets NVIDIA_KEY_1, NVIDIA_KEY_2, NVIDIA_KEY_3.")
-    else:
-        rows.append("Same models on OpenRouter (paid), each on its fixed provider.")
-    rows += ["", "<code>/backend free</code> · <code>/backend paid</code> · /ping checks every key"]
-    kb = InlineKeyboardMarkup([[InlineKeyboardButton(("● " if be == "openrouter" else "") + "💳 Paid (OpenRouter)",
-                                                     callback_data="set:backend:openrouter"),
-                                InlineKeyboardButton(("● " if be == "nvidia" else "") + "🆓 Free (NVIDIA)",
-                                                     callback_data="set:backend:nvidia")]])
-    await send_html(context.bot, chat_id, lines_html(*rows), kb)
-
-
 async def ping_rows() -> list[str]:
     """Checks every API key for real (a 1-token request each, all at the same time)."""
     rows = []
@@ -3003,19 +2974,6 @@ async def ping_rows() -> list[str]:
     return rows
 
 
-async def cmd_ping(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if (chat_id := await _owner_cmd(update, context)) is None:
-        return
-    await context.bot.send_chat_action(chat_id, ChatAction.TYPING)
-    rows = ["📡 <b>Ping</b> — does every API key answer?", "", *await ping_rows()]
-    if len(nvidia_pool):
-        rows += ["", "<b>NVIDIA load</b> (requests in the last minute / limit):"]
-        rows += [f"• {esc(s['name'])}: {s['last_minute']}/{nvidia_pool.rpm} · {esc(s['state'])} · "
-                 f"{s['total']} total, {s['failures']} failed" for s in nvidia_pool.status()]
-    rows += ["", f"<i>Now using: {esc(backend_label())}</i>"]
-    await send_html(context.bot, chat_id, "\n".join(rows))
-
-
 async def cmd_doctor(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Health check of everything the bot depends on."""
     if (chat_id := await _owner_cmd(update, context)) is None:
@@ -3026,12 +2984,12 @@ async def cmd_doctor(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     def line(ok: bool | None, text: str) -> None:
         rows.append(f"{'✅' if ok else '⚠️' if ok is None else '❌'} {text}")
 
-    try:
-        async with httpx.AsyncClient(timeout=15) as http:
-            r = await http.get(f"{OPENROUTER_BASE_URL}/key", headers={"Authorization": f"Bearer {OPENROUTER_API_KEY}"})
-        line(r.status_code == 200, f"OpenRouter key (HTTP {r.status_code})")
-    except Exception as e:
-        line(False, f"OpenRouter unreachable: {esc(str(e)[:120])}")
+    # 📡 every API key, checked for real (a 1-token request per NVIDIA key, all at the same time)
+    rows += ["📡 <b>API keys</b>", *await ping_rows()]
+    if len(nvidia_pool):
+        rows += [f"   NVIDIA load (last minute / limit): " + " · ".join(
+            f"{esc(x['name'])} {x['last_minute']}/{nvidia_pool.rpm}" for x in nvidia_pool.status())]
+    rows += ["", "🧩 <b>Everything else</b>"]
     if github_tools.enabled():
         try:
             line(True, f"GitHub token — signed in as <code>{esc(await github_tools.login())}</code>")
@@ -3044,8 +3002,6 @@ async def cmd_doctor(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         m = cfg(key, mode)
         line(True, f"{label}: <code>{esc(str(m))}</code> on {esc(provider_text(m))} (fixed, no fallbacks)")
     line(True, f"Backend: {esc(backend_label())}")
-    line(bool(len(nvidia_pool)) or None, f"NVIDIA keys: {len(nvidia_pool)} set" + ("" if len(nvidia_pool) else
-         " — add NVIDIA_KEY_1..3 for the free backend") + " · /ping tests them")
     line(vault.enabled() or None, "PERSONA_KEY set — persona and rules encrypted" if vault.enabled()
          else "PERSONA_KEY missing — persona and rules stored unencrypted")
     for tool in ("git", "python3", "node", "npm"):
@@ -3396,8 +3352,6 @@ def _actions() -> dict:
         "export": cmd_export,
         "agents": cmd_agents,
         "doctor": cmd_doctor,
-        "backend": cmd_backend,
-        "ping": cmd_ping,
         "set": cmd_set,
         "effort": shortcut("effort", lambda c: (c.args or ["default"])[0]),
         "thinking": shortcut("show_thinking", lambda c: "off" if cfg("show_thinking", owner_mode()) else "on"),
