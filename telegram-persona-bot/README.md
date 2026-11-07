@@ -228,6 +228,18 @@ All web requests (search + opening pages) can go through Tor or any SOCKS proxy:
 `USE_TOR=true` on GitHub (installs and starts Tor on the runner), or set `TOR_PROXY`/`WEB_PROXY`
 (e.g. `socks5h://127.0.0.1:9050`) or `web_proxy` in `config.json`.
 
+## The persona never gets lost (durable copy)
+
+The Actions cache can come back empty (a new run can start before the previous run's save is visible), so the
+important files — persona, lock rules, Coding identities, settings, title, snippets — are also mirrored into the
+repository's **Actions variables** (`BOT1_*` / `BOT2_*`), encrypted with `PERSONA_KEY`. Variables are private (only
+repo admins can read them). Every change is uploaded a couple of seconds later; on start, the newer of the local file
+and the stored copy wins. Needs `GH_PAT` with the `repo` scope; `/doctor` shows its state. Long texts are split into
+40 KB chunks (GitHub's limit is 48 KB per variable). The workflows also keep the 3 newest cache copies instead of one.
+
+`PERSONA_KEY` can be any passphrase: a value that isn't a Fernet key is turned into one with SHA-256 (it used to
+switch encryption off).
+
 ## Running 24/7 on GitHub Actions
 
 The bot runs on GitHub Actions; every ~6 hours it restarts itself (about a minute), and its data (persona,

@@ -132,6 +132,25 @@ def gh_api(method, path, query, body):
             return 201, {"number": len(GH["prs"]), "html_url": f"https://github.com/{full}/pull/{len(GH['prs'])}"}
         if sub[:1] == ["commits"] and len(sub) == 2 and method == "GET":
             return 200, {"sha": GH.setdefault("head_sha", {}).get(full, "0" * 40)}
+        if sub[:2] == ["actions", "variables"]:
+            vars_ = GH.setdefault("vars", {})
+            if len(sub) == 2 and method == "GET":
+                names = sorted(vars_)
+                page, per = int(query.get("page", 1)), int(query.get("per_page", 30))
+                chunk = names[(page - 1) * per: page * per]
+                return 200, {"total_count": len(names), "variables": [{"name": n, "value": vars_[n]} for n in chunk]}
+            if len(sub) == 2 and method == "POST":
+                vars_[body["name"]] = body["value"]
+                return 201, {}
+            name = sub[2]
+            if method == "PATCH":
+                if name not in vars_:
+                    return 404, {"message": "Not Found"}
+                vars_[name] = body["value"]
+                return 204, {}
+            if method == "DELETE":
+                vars_.pop(name, None)
+                return 204, {}
         if sub[:1] == ["actions"]:
             return gh_actions_api(full, method, sub[1:], query)
     return 404, {"message": "Not Found"}
@@ -198,7 +217,7 @@ class H(BaseHTTPRequestHandler):
 
     def _gh(self, http_method):
         path = urlparse(self.path).path.split("/gh", 1)[1]
-        body = self._body() if http_method in ("PUT", "POST", "DELETE") else {}
+        body = self._body() if http_method in ("PUT", "POST", "DELETE", "PATCH") else {}
         with S["lock"]:
             code, obj = gh_api(http_method, path, self._q(), body)
         if isinstance(obj, str):  # Actions logs are text, not JSON
@@ -230,6 +249,9 @@ class H(BaseHTTPRequestHandler):
 
     def do_DELETE(self):
         return self._gh("DELETE")
+
+    def do_PATCH(self):
+        return self._gh("PATCH")
 
     def do_POST(self):
         if "/gh/" in self.path:
@@ -1919,6 +1941,73 @@ async def backend_scenario(app):
     bot.nvidia_pool = saved_pool
 
 
+async def state_scenario(app):
+    """The persona, rules and settings survive an empty cache: a durable copy in the repo's Actions variables."""
+    import statestore as SS, subprocess
+    print("\n— 💾 Durable state —")
+    store = SS.StateStore(repo="owner/site", token="ghp_test", prefix="BOT1",
+                          api_base=f"http://127.0.0.1:{PORT}/gh", delay=0.05)
+    saved = bot.state_store
+    bot.state_store = store
+    GH["vars"] = {}
+    user_msg("/setpersona You are Layla, warm and witty. " + "x" * 50)
+    await wait_idle()
+    user_msg("/setrules Always answer in short paragraphs.")
+    await wait_idle()
+    await asyncio.sleep(0.5)
+    names = sorted(GH["vars"])
+    check("state: persona and rules copied to repo variables", "BOT1_PERSONA_0" in names and "BOT1_RULES_0" in names, names)
+    check("state: the copy isn't readable without the key", not bot.vault.enabled() or
+          all("Layla" not in v for v in GH["vars"].values()), list(GH["vars"].values())[:1])
+    # The cache comes back empty: everything returns from the durable copy
+    for f in ("persona.json", "rules.json"):
+        (DATA / f).unlink()
+    check("state: files gone (simulated empty cache)", bot.load_persona() == bot.DEFAULT_PERSONA)
+    restored = SS.StateStore(repo="owner/site", token="ghp_test", prefix="BOT1",
+                             api_base=f"http://127.0.0.1:{PORT}/gh").restore(DATA)
+    check("state: restored after an empty cache", set(restored) >= {"persona.json", "rules.json"}
+          and bot.load_persona().startswith("You are Layla") and bot.load_lock() == "Always answer in short paragraphs.",
+          (restored, bot.load_persona()[:40]))
+    # a newer local file isn't overwritten by an older copy
+    (DATA / "rules.json").write_text(json.dumps({"lock": "local newer"}))
+    again = SS.StateStore(repo="owner/site", token="ghp_test", prefix="BOT1",
+                          api_base=f"http://127.0.0.1:{PORT}/gh").restore(DATA)
+    check("state: a newer local file wins", "rules.json" not in again and bot.load_lock() == "local newer", again)
+    # long texts are split into chunks (GitHub's 48 KB limit per variable), and leftovers are removed when shorter
+    big = "long persona " * 4500
+    user_msg(None, document={"file_id": "bigp", "file_unique_id": "bigp", "file_name": "p.txt", "mime_type": "text/plain"},
+             caption="/setpersona")
+    FILES["bigp"] = big.encode()
+    await wait_idle()
+    await asyncio.sleep(0.5)
+    chunks = sorted(n for n in GH["vars"] if n.startswith("BOT1_PERSONA_"))
+    check("state: a long persona is split into chunks", len(chunks) >= 2
+          and all(len(GH["vars"][n]) <= 40_100 for n in chunks), [(n, len(GH["vars"][n])) for n in chunks])
+    (DATA / "persona.json").unlink()
+    SS.StateStore(repo="owner/site", token="ghp_test", prefix="BOT1", api_base=f"http://127.0.0.1:{PORT}/gh").restore(DATA)
+    got = bot.load_persona()
+    check("state: a chunked persona comes back exactly", got == big,
+          (len(got), len(big), got[:30], (DATA / "persona.json").exists(), sorted(GH["vars"])))
+    user_msg("/setpersona short again")
+    await wait_idle()
+    await asyncio.sleep(0.5)
+    check("state: leftover chunks removed", sorted(n for n in GH["vars"] if n.startswith("BOT1_PERSONA_")) == ["BOT1_PERSONA_0"],
+          sorted(GH["vars"]))
+    user_msg("/doctor")
+    await wait_idle(timeout=40)
+    check("/doctor: shows the durable copy", "Durable copy" in last_bot()["text"] and "on" in last_bot()["text"])
+    off = SS.StateStore(repo="", token="", prefix="X")
+    check("state: off without GH_PAT/repo (no crash)", not off.enabled and off.restore(DATA) == [] and "off" in off.status())
+    bot.state_store = saved
+    # any PERSONA_KEY works: a non-Fernet passphrase turns into a real key instead of switching encryption off
+    code = ("import vault; e = vault.encrypt('secret'); "
+            "print(vault.enabled(), e.startswith('enc:'), vault.decrypt(e) == 'secret')")
+    out = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True,
+                         cwd=str(pathlib.Path(bot.__file__).parent),
+                         env={**os.environ, "PERSONA_KEY": "my own passphrase 123"}).stdout.strip()
+    check("vault: a passphrase PERSONA_KEY still encrypts", out == "True True True", out)
+
+
 async def main():
     srv = ThreadingHTTPServer(("127.0.0.1", PORT), H)
     threading.Thread(target=srv.serve_forever, daemon=True).start()
@@ -1933,6 +2022,7 @@ async def main():
             await asyncio.wait_for(agent_scenario(app), 300)
             await asyncio.wait_for(speed_scenario(app), 120)
             await asyncio.wait_for(backend_scenario(app), 120)
+            await asyncio.wait_for(state_scenario(app), 120)
         finally:
             await app.updater.stop()
             await app.stop()

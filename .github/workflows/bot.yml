@@ -119,6 +119,9 @@ jobs:
           NVIDIA_API_KEYS: ${{ secrets.NVIDIA_KEY_1 }},${{ secrets.NVIDIA_KEY_2 }},${{ secrets.NVIDIA_KEY_3 }}
           GH_PAT: ${{ secrets.GH_PAT }}   # optional: lets the bot write/edit on GitHub and watch CI (owner only)
           TOR_PROXY: ${{ env.TOR_PROXY }}   # filled automatically when USE_TOR=true
+          # A durable copy of the persona, rules and settings in this repo's Actions variables (BOT1_*),
+          # so they survive even when the cache comes back empty. Needs GH_PAT with the repo scope.
+          BOT_STATE_PREFIX: BOT1
           PERSONA_KEY: ${{ secrets.PERSONA_KEY }}   # optional: the key that encrypts the persona and lock rules
         run: |
           mkdir -p data
@@ -142,7 +145,8 @@ jobs:
             !telegram-persona-bot/data/workspaces/**/target
           key: bot-data-${{ github.run_id }}-${{ github.run_attempt }}
 
-      # Delete the old data copies so wiped conversations are gone for good
+      # Keep the 3 newest data copies (a brand-new save isn't always visible right away, so the next run
+      # can still fall back to the previous one); delete the older ones so wiped conversations go away
       - name: Delete old data
         if: always()
         continue-on-error: true
@@ -150,11 +154,11 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           KEEP: bot-data-${{ github.run_id }}-${{ github.run_attempt }}
         run: |
-          keys=$(gh cache list --key bot-data- --limit 100 --json key --jq '.[].key')
+          keys=$(gh cache list --key bot-data- --limit 100 --sort created_at --order desc --json key --jq '.[].key')
           # If no new copy was saved, delete nothing (so the persona is never lost)
           echo "$keys" | grep -qx "$KEEP" || { echo "no new save, skipping"; exit 0; }
-          echo "$keys" | while read -r k; do
-            [ "$k" != "$KEEP" ] && gh cache delete "$k" || true
+          echo "$keys" | tail -n +4 | while read -r k; do
+            [ -n "$k" ] && [ "$k" != "$KEEP" ] && gh cache delete "$k" || true
           done
 
       - name: Restart

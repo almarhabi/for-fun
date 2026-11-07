@@ -3,7 +3,8 @@
 The key comes from the PERSONA_KEY environment variable (a GitHub secret). Without it encryption is off (plain
 text, compatible with older data). Encrypted text is stored with an "enc:" prefix. Anyone with access to the
 repository sees only ciphertext — neither the persona nor the rules.
-Generate a key:  python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
+Any passphrase works (a non-Fernet value is turned into a key with SHA-256); a generated one is best:
+python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
 """
 
 import logging
@@ -15,12 +16,16 @@ _PREFIX = "enc:"
 _key = (os.getenv("PERSONA_KEY", "") or "").strip().strip('"\'')
 _fernet = None
 if _key:
+    from cryptography.fernet import Fernet
     try:
-        from cryptography.fernet import Fernet
         _fernet = Fernet(_key.encode())
-    except Exception as e:  # invalid key — continue without encryption, with a warning
-        log.error("PERSONA_KEY is invalid — encryption is off: %s", e)
-        _fernet = None
+    except Exception:
+        # Not a Fernet key (any passphrase works): derive a proper one from it with SHA-256,
+        # so encryption is never silently off just because of the key's format.
+        import base64
+        import hashlib
+        _fernet = Fernet(base64.urlsafe_b64encode(hashlib.sha256(_key.encode("utf-8")).digest()))
+        log.info("PERSONA_KEY isn't a Fernet key — using a key derived from it (encryption is on)")
 
 
 def enabled() -> bool:

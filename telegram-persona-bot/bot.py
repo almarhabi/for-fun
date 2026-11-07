@@ -44,6 +44,7 @@ from telegram.ext import (
 
 import agent
 import backends
+import statestore
 import config
 import github_tools
 import llm
@@ -130,11 +131,18 @@ def _read_json(path: Path, default):
         return default
 
 
+# A durable copy of the important files (persona, rules, identities, settings…) outside the Actions cache
+state_store = statestore.StateStore()
+
+
 def _write_json(path: Path, data) -> None:
     DATA_DIR.mkdir(exist_ok=True)
+    text = json.dumps(data, ensure_ascii=False)
     tmp = path.with_suffix(".tmp")
-    tmp.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+    tmp.write_text(text, encoding="utf-8")
     tmp.replace(path)
+    if path.parent == DATA_DIR:
+        state_store.schedule(path.name, text)
 
 
 # Conversation memory per chat
@@ -3003,6 +3011,8 @@ async def cmd_doctor(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         m = cfg(key, mode)
         line(True, f"{label}: <code>{esc(str(m))}</code> on {esc(provider_text(m))} (fixed, no fallbacks)")
     line(True, f"Backend: {esc(backend_label())}")
+    line(state_store.enabled and not state_store.last_error or None,
+         f"Durable copy of persona/rules/settings (repo variables): {esc(state_store.status())}")
     line(vault.enabled() or None, "PERSONA_KEY set — persona and rules encrypted" if vault.enabled()
          else "PERSONA_KEY missing — persona and rules stored unencrypted")
     for tool in ("git", "python3", "node", "npm"):
@@ -3385,6 +3395,7 @@ async def post_init(app: Application) -> None:
 
 
 async def post_shutdown(app: Application) -> None:
+    state_store.flush()  # a change made just before stopping still reaches the durable copy
     task = app.bot_data.get("watch_task")
     if task:
         task.cancel()
@@ -3440,6 +3451,8 @@ def build_app() -> Application:
 def main() -> None:
     if OWNER_ID == 0:
         log.warning("OWNER_ID is not set — owner commands won't work for anyone.")
+    # the Actions cache can come back empty — bring the persona, rules and settings back from the durable copy
+    state_store.restore(DATA_DIR)
     load_state()
     log.info("Bot running via OpenRouter with model %s on %s", cfg("model"), provider_text(cfg("model")))
     build_app().run_polling(allowed_updates=Update.ALL_TYPES)
