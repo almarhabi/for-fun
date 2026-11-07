@@ -85,6 +85,8 @@ def gh_api(method, path, query, body):
             return 200, [{"full_name": f} for f in GH["repos"]]
         if method == "POST":
             name = body["name"]; full = f"{GH['login']}/{name}"
+            if GH.get("on_create"):
+                GH["on_create"](full)
             GH["repos"][full] = {"default_branch": "main", "private": body.get("private", True),
                                  "files": {"README.md": "# " + name} if body.get("auto_init", True) else {},
                                  "branches": {"main"}}
@@ -1233,6 +1235,21 @@ async def agent_scenario(app):
     log = subprocess.run(["git", "--git-dir", str(remotes / "owner" / "site.git"), "log", "--oneline", "main"],
                          capture_output=True, text=True).stdout
     check("git: push ok", '"ok": true' in res and "first push" in log, (res[:200], log))
+    # /push to a repository that doesn't exist yet → it's created (private) and pushed
+    GH["on_create"] = lambda full: subprocess.run(["git", "init", "--bare", "-q", "-b", "main",
+                                                   str(remotes / (full + ".git"))], check=True)
+    user_msg("/push newapp main first version")
+    await wait_idle()
+    log = subprocess.run(["git", "--git-dir", str(remotes / "owner" / "newapp.git"), "log", "--oneline", "main"],
+                         capture_output=True, text=True).stdout
+    check("push: creates a missing repo (private) and pushes", "Created the private repository" in last_bot()["text"]
+          and log.strip() and GH["repos"]["owner/newapp"]["private"] is True, (last_bot()["text"][:200], log))
+    n_created = len(GH["repos"])
+    user_msg("/push site main")   # an existing repository: pushed normally, nothing created
+    await wait_idle()
+    check("push: existing repo isn't recreated", "Pushed" in last_bot()["text"] and "Created" not in last_bot()["text"]
+          and len(GH["repos"]) == n_created, last_bot()["text"][:200])
+    GH.pop("on_create")
     user_msg("/clone owner/site")
     await wait_idle()
     check("git: clone → new project", bot.current_project() == "site" and (ws("site").root / "main.py").exists(),

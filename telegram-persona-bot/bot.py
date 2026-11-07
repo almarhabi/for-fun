@@ -2563,8 +2563,21 @@ async def cmd_push(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             repo = f"{await github_tools.login()}/{repo}"
         branch = args[1] if len(args) > 1 else "main"
         message = " ".join(args[2:]) or "Update from Telegram"
-        res = await ws.push(repo, branch, message, github_tools.token())
+        created = False
+        try:
+            res = await ws.push(repo, branch, message, github_tools.token())
+        except WorkspaceError as e:
+            # the first push of a new project: create the repository (private) and push again
+            if "doesn't exist" not in str(e) or repo.split("/")[0].lower() != (await github_tools.login()).lower():
+                raise
+            out = await github_tools.run_github("gh_create_repo", json.dumps(
+                {"name": repo.split("/")[-1], "private": True, "auto_init": False}))
+            if "fail" in out.lower() or "error" in out.lower():
+                raise WorkspaceError(f"Couldn't create {repo}: {out[:300]}") from None
+            created = True
+            res = await ws.push(repo, branch, message, github_tools.token())
         await send_html(context.bot, chat_id, lines_html(
+            *([f"➕ Created the private repository <code>{esc(repo)}</code>"] if created else []),
             f"⬆️ <b>Pushed</b> to <code>{esc(repo)}</code> · 🌿 {esc(branch)} · <code>{res['commit']}</code>",
             f'<a href="{esc(res["url"])}">Open on GitHub</a>' if res["url"].startswith("http") else ""))
     except WorkspaceError as e:

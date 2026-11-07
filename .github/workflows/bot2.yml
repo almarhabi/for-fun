@@ -16,18 +16,37 @@ on:
       - "telegram-persona-bot/**"
       - ".github/workflows/bot2.yml"
 
-# Only one copy runs at a time (Telegram doesn't accept two)
-# When new code is pushed, the old copy stops and the new one starts right away
-concurrency:
-  group: telegram-bot-2
-  cancel-in-progress: ${{ github.event_name == 'push' }}
-
 permissions:
   contents: read
   actions: write
 
 jobs:
+  # When new code is pushed, the running copy is stopped first. It saves its data (persona, rules, memory,
+  # projects) on the way out, and only then does the new copy start and restore that fresh save.
+  # (Starting the new copy right away used to restore an older save and lose anything set since then.)
+  stop-old:
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Stop the running copy (it saves its data before exiting)
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          ids=$(gh run list --workflow bot2.yml --limit 30 --json databaseId,status \
+                --jq '.[] | select(.status != "completed") | .databaseId')
+          for id in $ids; do
+            if [ "$id" != "${{ github.run_id }}" ]; then echo "stopping run $id"; gh run cancel "$id" || true; fi
+          done
+
   run:
+    needs: stop-old
+    if: ${{ !cancelled() }}
+    # Only one copy runs at a time (Telegram doesn't accept two). A new copy waits here until the old one
+    # has finished saving its data — never cancel-in-progress, which would skip that save.
+    concurrency:
+      group: telegram-bot-2
+      cancel-in-progress: false
     runs-on: ubuntu-latest
     timeout-minutes: 355
     defaults:
