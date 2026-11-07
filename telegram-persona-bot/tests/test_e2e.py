@@ -1738,6 +1738,161 @@ async def speed_scenario(app):
     bot.save_setting("agent_mode", False)
 
 
+async def backend_scenario(app):
+    """💳 OpenRouter / 🆓 NVIDIA: the key pool spreads the load, survives 429/401, and the router follows the switch."""
+    import backends as B
+    import httpx, openai
+    print("\n— 🔀 Backends —")
+
+    def status_error(code):
+        resp = httpx.Response(code, request=httpx.Request("POST", "https://nim.test/v1/chat/completions"),
+                              headers={"retry-after": "30"} if code == 429 else {})
+        cls = {429: openai.RateLimitError, 401: openai.AuthenticationError}.get(code, openai.APIStatusError)
+        return cls(f"HTTP {code}", response=resp, body=None)
+
+    class FakeNim:
+        def __init__(self, name, log):
+            self.name, self.log, self.fail = name, log, []
+            self.chat = type("C", (), {})()
+            self.chat.completions = type("CC", (), {})()
+            self.chat.completions.create = self.create
+
+        async def create(self, **kw):
+            self.log.append((self.name, kw))
+            if self.fail:
+                raise status_error(self.fail.pop(0))
+            return "stream-from-" + self.name
+
+    def make_pool(rpm=40, max_wait=0.05):
+        log, made = [], {}
+
+        def factory(key):
+            made[key] = FakeNim(key, log)
+            return made[key]
+        return B.KeyPool(["k1", "k2", "k3", "k2", ""], "https://nim.test/v1", rpm, max_wait, factory), log, made
+
+    pool, log, made = make_pool()
+    check("pool: duplicate/empty keys dropped", len(pool) == 3, len(pool))
+    for _ in range(9):
+        await pool.create(model="m", messages=[])
+    counts = {k: sum(1 for n, _ in log if n == k) for k in ("k1", "k2", "k3")}
+    check("pool: load spread evenly over the keys", counts == {"k1": 3, "k2": 3, "k3": 3}, counts)
+
+    pool, log, made = make_pool()
+    made["k1"].fail = [429]
+    res = await pool.create(model="m", messages=[])
+    check("pool: 429 moves the request to another key", res.startswith("stream-from-k") and res != "stream-from-k1"
+          and [n for n, _ in log][:2][0] == "k1", (res, log))
+    for _ in range(4):
+        await pool.create(model="m", messages=[])
+    check("pool: a rate-limited key rests (cooldown)", all(n != "k1" for n, _ in log[2:]),
+          [n for n, _ in log])
+    check("pool: status shows the cooldown", pool.status()[0]["state"].startswith("cooling"), pool.status()[0])
+
+    pool, log, made = make_pool()
+    made["k2"].fail = [401]
+    for _ in range(4):
+        await pool.create(model="m", messages=[])
+    check("pool: a rejected key (401) is taken out", pool.status()[1]["state"] == "rejected"
+          and sum(1 for n, _ in log if n == "k2") == 1, pool.status())
+    made["k1"].fail = [400]
+    try:
+        await pool.create(model="m", messages=[])
+        bad_request_raised = False
+    except openai.APIStatusError:
+        bad_request_raised = True
+    check("pool: a bad request (400) isn't retried on every key", bad_request_raised)
+
+    pool, log, made = make_pool(rpm=1, max_wait=0.05)
+    for _ in range(3):
+        await pool.create(model="m", messages=[])
+    try:
+        await pool.create(model="m", messages=[])
+        full = False
+    except B.NoKeyAvailable as e:
+        full = "rate limit" in str(e)
+    check("pool: never exceeds the per-minute limit of any key", full and len(log) == 3, log)
+    empty = B.KeyPool([], "https://nim.test/v1")
+    try:
+        await empty.create(model="m", messages=[])
+        msg = ""
+    except B.NoKeyAvailable as e:
+        msg = str(e)
+    check("pool: no keys → a clear message", "NVIDIA_KEY_1" in msg, msg)
+
+    kw = {"model": "deepseek/deepseek-v4.1-flash-1017", "extra_headers": {"X-Title": "t"}, "tools": [{"x": 1}],
+          "extra_body": {"provider": {"only": ["deepinfra/fp8"]}, "reasoning": {"enabled": True}, "usage": {"include": True}},
+          "messages": [{"role": "user", "content": "hi"},
+                       {"role": "assistant", "content": "", "reasoning_details": [{"t": 1}]}]}
+    out = B.to_nvidia(kw, bot.config.NVIDIA_MODELS, {})
+    check("nvidia request: NIM model id, no OpenRouter-only fields",
+          out["model"] == "deepseek-ai/deepseek-v4.1-flash" and "extra_body" not in out and "extra_headers" not in out
+          and out["tools"] == [{"x": 1}] and "reasoning_details" not in out["messages"][1]
+          and "reasoning_details" in kw["messages"][1], out)
+    out = B.to_nvidia({"model": "z-ai/glm-5.3-flash", "messages": []}, bot.config.NVIDIA_MODELS,
+                      {"z-ai/glm-5.3-flash": {"chat_template_kwargs": {"enable_thinking": True}}})
+    check("nvidia request: per-model extra fields from config", out["model"] == "z-ai/glm-5.3-flash"
+          and out["extra_body"] == {"chat_template_kwargs": {"enable_thinking": True}}, out)
+
+    choice = {"b": "openrouter"}
+    paid_calls = []
+
+    class FakeOR:
+        def __init__(self):
+            self.chat = type("C", (), {})()
+            self.chat.completions = type("CC", (), {})()
+
+            async def create(**kw):
+                paid_calls.append(kw)
+                return "paid"
+            self.chat.completions.create = create
+    pool, log, made = make_pool()
+    router = B.ModelRouter(FakeOR(), pool, lambda: choice["b"], bot.config.NVIDIA_MODELS)
+    r1 = await router.chat.completions.create(model="z-ai/glm-5.3-flash", messages=[], extra_body={"provider": {}})
+    choice["b"] = "nvidia"
+    r2 = await router.chat.completions.create(model="z-ai/glm-5.3-flash", messages=[], extra_body={"provider": {}})
+    check("router: follows the switch (paid → free)", r1 == "paid" and r2.startswith("stream-from-")
+          and len(paid_calls) == 1 and "extra_body" not in log[-1][1], (r1, r2))
+    router_empty = B.ModelRouter(FakeOR(), B.KeyPool([], "x"), lambda: "nvidia", {})
+    try:
+        await router_empty.chat.completions.create(model="m", messages=[])
+        msg = ""
+    except B.NoKeyAvailable as e:
+        msg = str(e)
+    check("router: free backend without keys says what to do", "NVIDIA_KEY_1" in msg and "OpenRouter" in msg, msg)
+
+    # In Telegram: /backend, /free, /paid, the settings button, and /ping
+    saved_pool = bot.nvidia_pool
+    bot.nvidia_pool, log, made = make_pool()
+    made["k2"].fail = [401]
+    user_msg("/free")
+    await wait_idle()
+    check("/free: switches to NVIDIA", bot.cfg("backend") == "nvidia" and "NVIDIA (free" in last_bot()["text"]
+          and "3 key" in last_bot()["text"], last_bot()["text"][:300])
+    check("/backend: shown in both settings panels", "set:backend:nvidia" in str(bot.settings_keyboard("chat").inline_keyboard)
+          and "cset:backend:openrouter" in str(bot.settings_keyboard("agent").inline_keyboard))
+    user_msg("/ping")
+    await wait_idle(timeout=40)
+    t = last_bot()["text"]
+    check("/ping: tests every key", "key 1 — answers" in t and "key 2 — key rejected (401)" in t
+          and "key 3 — answers" in t and "OpenRouter" in t, t)
+    check("/ping: shows the load per key", "/40" in t, t)
+    press("set:backend:openrouter", last_bot()["message_id"])
+    await wait_idle()
+    check("settings button: back to OpenRouter", bot.cfg("backend") == "openrouter")
+    user_msg("/backend free")
+    await wait_idle()
+    user_msg("/status")
+    await wait_idle()
+    check("/status: shows the backend", "Backend:</b> 🆓 NVIDIA" in last_bot()["text"], last_bot()["text"][:400])
+    user_msg("/paid")
+    await wait_idle()
+    check("/paid: back to OpenRouter", bot.cfg("backend") == "openrouter" and "OpenRouter (paid)" in last_bot()["text"])
+    menu = [c.command for c in bot._menu_commands("owner")]
+    check("menu: /backend and /ping listed", "backend" in menu and "ping" in menu, menu)
+    bot.nvidia_pool = saved_pool
+
+
 async def main():
     srv = ThreadingHTTPServer(("127.0.0.1", PORT), H)
     threading.Thread(target=srv.serve_forever, daemon=True).start()
@@ -1751,6 +1906,7 @@ async def main():
             await asyncio.wait_for(scenario(), 240)
             await asyncio.wait_for(agent_scenario(app), 300)
             await asyncio.wait_for(speed_scenario(app), 120)
+            await asyncio.wait_for(backend_scenario(app), 120)
         finally:
             await app.updater.stop()
             await app.stop()

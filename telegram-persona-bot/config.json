@@ -16,6 +16,17 @@
     "moonshotai/kimi-k3.1-pro": "deepseek/deepseek-v4.1-flash-1017",
     "z-ai/glm-5.3": "z-ai/glm-5.3-flash"
   },
+  "nvidia": {
+    "_note": "🆓 The free backend (NVIDIA NIM). Same models, mapped to their NVIDIA ids. Keys come from the NVIDIA_KEY_1..3 secrets (NVIDIA_API_KEYS in the bot's environment); requests are spread over them and each key stays under rpm_per_key. model_extra: optional extra request fields per model (e.g. chat_template_kwargs).",
+    "base_url": "https://integrate.api.nvidia.com/v1",
+    "rpm_per_key": 40,
+    "max_wait_seconds": 45,
+    "models": {
+      "deepseek/deepseek-v4.1-flash-1017": "deepseek-ai/deepseek-v4.1-flash",
+      "z-ai/glm-5.3-flash": "z-ai/glm-5.3-flash"
+    },
+    "model_extra": {}
+  },
   "efforts": [
     "default",
     "low",
@@ -142,6 +153,24 @@
       "action": "doctor",
       "menu": "owner_all",
       "menu_label": "🩺 Health check: keys, GitHub, tools"
+    },
+    {
+      "names": [
+        "backend",
+        "free",
+        "paid"
+      ],
+      "action": "backend",
+      "menu": "owner_all",
+      "menu_label": "🔀 Switch backend: 💳 paid / 🆓 free"
+    },
+    {
+      "names": [
+        "ping"
+      ],
+      "action": "ping",
+      "menu": "owner_all",
+      "menu_label": "📡 Ping every API key"
     },
     {
       "names": [
@@ -467,6 +496,13 @@
       "modes": [
         "code"
       ]
+    },
+    "backend": {
+      "type": "str",
+      "label": "🔀 Backend (openrouter = 💳 paid · nvidia = 🆓 free)",
+      "modes": [
+        "global"
+      ]
     }
   },
   "defaults": {
@@ -485,7 +521,8 @@
     "worker_model": "z-ai/glm-5.3-flash",
     "max_agents": 6,
     "project": "main",
-    "persona_voice": true
+    "persona_voice": true,
+    "backend": "openrouter"
   },
   "code_defaults": {
     "effort": "high",

@@ -43,6 +43,7 @@ from telegram.ext import (
 )
 
 import agent
+import backends
 import config
 import github_tools
 import llm
@@ -108,7 +109,13 @@ for noisy in ("httpx", "primp", "ddgs"):
     logging.getLogger(noisy).setLevel(logging.WARNING)
 
 # X-Title isn't written here: it's set from Telegram (/settitle), stored encrypted, and sent with every request
-client = AsyncOpenAI(api_key=OPENROUTER_API_KEY, base_url=OPENROUTER_BASE_URL)
+openrouter_client = AsyncOpenAI(api_key=OPENROUTER_API_KEY, base_url=OPENROUTER_BASE_URL)
+# 🆓 NVIDIA NIM: several keys, the load spread over them (backends.KeyPool)
+nvidia_pool = backends.KeyPool(config.nvidia_keys(), config.NVIDIA["base_url"],
+                               int(config.NVIDIA.get("rpm_per_key", 40)), float(config.NVIDIA.get("max_wait_seconds", 45)))
+# Every request (chat, the coding lead, the agents) goes through the router to the backend the owner picked
+client = backends.ModelRouter(openrouter_client, nvidia_pool, lambda: cfg("backend"), config.NVIDIA_MODELS,
+                              config.NVIDIA.get("model_extra") or {})
 NO_PREVIEW = LinkPreviewOptions(is_disabled=True)
 PREVIEW = LinkPreviewOptions(is_disabled=False, prefer_large_media=False)
 tph = telegraph.Telegraph(TELEGRAPH_FILE, short_name="PersonaBot")
@@ -292,8 +299,20 @@ def cfg(key: str, mode: str = "chat"):
     return value
 
 
+def backend_name() -> str:
+    return "nvidia" if cfg("backend") == "nvidia" else "openrouter"
+
+
+def backend_label() -> str:
+    if backend_name() == "nvidia":
+        return f"🆓 NVIDIA (free · {len(nvidia_pool)} key{'s' if len(nvidia_pool) != 1 else ''})"
+    return "💳 OpenRouter (paid)"
+
+
 def provider_text(model) -> str:
-    """The fixed provider of a model, for display."""
+    """Where a model runs right now, for display: its fixed OpenRouter provider, or NVIDIA."""
+    if backend_name() == "nvidia":
+        return f"NVIDIA {config.NVIDIA_MODELS.get(config.current_model(model) or '', model)}"
     prov = config.provider_for(model)
     return ", ".join(prov["only"]) if prov else "auto"
 
@@ -326,6 +345,12 @@ def parse_value(key: str, raw: str):
         if key == "effort":
             return "default"
         return DEFAULTS[key] if key in ("model", "worker_model", "max_agents") else None
+    if key == "backend":
+        if low in ("nvidia", "free", "nim"):
+            return "nvidia"
+        if low in ("openrouter", "paid", "or"):
+            return "openrouter"
+        raise ValueError("values: openrouter (paid) / nvidia (free)")
     if key == "permissions":
         if low not in ("auto", "ask"):
             raise ValueError("values: auto / ask")
@@ -802,6 +827,8 @@ async def stream_round(ui: ResponseUI, messages: list, kw: dict, tool_kwargs: di
 
 
 def error_hint(e: Exception) -> str:
+    if isinstance(e, backends.NoKeyAvailable):
+        return str(e) + " /ping checks every key."
     code = getattr(e, "status_code", None)
     msg = str(e).lower()
     if code == 401:
@@ -2116,6 +2143,8 @@ def settings_html(mode: str = "chat") -> str:
             return "✅" if v else "❌"
         if k in ("model", "worker_model"):
             return f"<code>{esc(str(v))}</code> · <i>{esc(provider_text(v))}</i>"
+        if k == "backend":
+            return esc(backend_label())
         return f"<code>{esc(str(v))}</code>"
 
     title = "💻 <b>Coding mode settings</b>" if mode == "agent" else "⚙️ <b>Settings</b>"
@@ -2142,9 +2171,12 @@ def settings_keyboard(mode: str = "chat") -> InlineKeyboardMarkup:
     def head(text):
         return [InlineKeyboardButton(text, callback_data="noop")]
 
-    e = cfg("effort", mode)
+    e, be = cfg("effort", mode), backend_name()
+    backend_row = [btn("💳 Paid (OpenRouter)", "backend", "openrouter", be), btn("🆓 Free (NVIDIA)", "backend", "nvidia", be)]
     if mode != "agent":
         return InlineKeyboardMarkup([
+            head("🔀 Backend (same models):"),
+            backend_row,
             head("🧠 Reasoning effort:"),
             [btn({"default": "default"}.get(x, x), "effort", x, e) for x in EFFORTS],
             [toggle("Thinking", "show_thinking"), toggle("Web search", "web_search")],
@@ -2153,6 +2185,8 @@ def settings_keyboard(mode: str = "chat") -> InlineKeyboardMarkup:
             [InlineKeyboardButton("💻 Switch to Coding mode", callback_data="set:agent_mode:on")],
         ])
     return InlineKeyboardMarkup([
+        head("🔀 Backend (same models):"),
+        backend_row,
         head("🧠 Lead reasoning:"),
         [btn({"default": "default"}.get(x, x), "effort", x, e) for x in EFFORTS],
         head("👷 Parallel agents:"),
@@ -2250,6 +2284,7 @@ def code_welcome_html() -> str:
     return lines_html(
         "💻 <b>Coding mode</b>",
         f"🧠 Lead: <code>{esc(str(cfg('model', 'agent')))}</code> · reasoning {esc(str(cfg('effort', 'agent')))}",
+        f"🔀 Backend: {esc(backend_label())} — /backend to switch",
         f"👷 Agents: <code>{esc(str(cfg('worker_model', 'agent')))}</code> — up to {_max_agents()} in parallel",
         f"📁 Project: <code>{esc(ws.name)}</code> ({n} files · {human(size)}) — /project to switch",
         "",
@@ -2824,6 +2859,7 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         "📊 <b>Status</b> — what's set up right now",
         "",
         f"• <b>Version:</b> {'💻 Coding' if cfg('agent_mode') else '💬 Chat'}",
+        f"• <b>Backend:</b> {esc(backend_label())}",
         f"• <b>Lead:</b> <code>{esc(str(cfg('model', 'agent')))}</code> · {esc(provider_text(cfg('model', 'agent')))} · "
         f"effort {esc(str(cfg('effort', 'agent')))}",
         f"• <b>Agents:</b> <code>{esc(str(cfg('worker_model', 'agent')))}</code> · {esc(provider_text(cfg('worker_model', 'agent')))} · "
@@ -2916,6 +2952,70 @@ async def cmd_agents(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     await send_html(context.bot, chat_id, "\n".join(rows))
 
 
+async def cmd_backend(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/backend [paid|free] — the same models, on 💳 OpenRouter (paid) or 🆓 NVIDIA (free). /free and /paid too."""
+    if (chat_id := await _owner_cmd(update, context)) is None:
+        return
+    word = (update.message.text or "").split()[0].lstrip("/").split("@")[0].lower() if update.message else ""
+    arg = "nvidia" if word == "free" else "openrouter" if word == "paid" else " ".join(context.args or [])
+    if arg:
+        try:
+            save_setting("backend", parse_value("backend", arg))
+        except ValueError as e:
+            await send_html(context.bot, chat_id, "⚠️ " + esc(str(e)))
+            return
+    be = backend_name()
+    rows = [f"🔀 <b>Backend:</b> {esc(backend_label())}", ""]
+    if be == "nvidia":
+        rows.append(f"Same models on NVIDIA's free API. Requests are spread over {len(nvidia_pool)} key(s), each kept "
+                    f"under {nvidia_pool.rpm} requests a minute.")
+        if not len(nvidia_pool):
+            rows.append("⚠️ No NVIDIA keys are set yet — add the secrets NVIDIA_KEY_1, NVIDIA_KEY_2, NVIDIA_KEY_3.")
+    else:
+        rows.append("Same models on OpenRouter (paid), each on its fixed provider.")
+    rows += ["", "<code>/backend free</code> · <code>/backend paid</code> · /ping checks every key"]
+    kb = InlineKeyboardMarkup([[InlineKeyboardButton(("● " if be == "openrouter" else "") + "💳 Paid (OpenRouter)",
+                                                     callback_data="set:backend:openrouter"),
+                                InlineKeyboardButton(("● " if be == "nvidia" else "") + "🆓 Free (NVIDIA)",
+                                                     callback_data="set:backend:nvidia")]])
+    await send_html(context.bot, chat_id, lines_html(*rows), kb)
+
+
+async def ping_rows() -> list[str]:
+    """Checks every API key for real (a 1-token request each, all at the same time)."""
+    rows = []
+    try:
+        async with httpx.AsyncClient(timeout=15) as http:
+            t0 = time.monotonic()
+            r = await http.get(f"{OPENROUTER_BASE_URL}/key", headers={"Authorization": f"Bearer {OPENROUTER_API_KEY}"})
+        ok = r.status_code == 200
+        rows.append(f"{'✅' if ok else '❌'} 💳 OpenRouter — {'answers' if ok else f'HTTP {r.status_code}'} "
+                    f"({time.monotonic() - t0:.1f}s)")
+    except Exception as e:
+        rows.append(f"❌ 💳 OpenRouter — unreachable: {esc(type(e).__name__)}")
+    if not len(nvidia_pool):
+        rows.append("⚠️ 🆓 NVIDIA — no keys set (secrets NVIDIA_KEY_1..3)")
+        return rows
+    model = config.NVIDIA_MODELS.get(config.WORKER_MODEL, config.WORKER_MODEL)
+    results = await asyncio.gather(*(nvidia_pool.ping(s, model) for s in nvidia_pool.slots))
+    for slot, (ok, what, secs) in zip(nvidia_pool.slots, results):
+        rows.append(f"{'✅' if ok else '❌'} 🆓 NVIDIA {esc(slot.name)} — {esc(what)} ({secs:.1f}s)")
+    return rows
+
+
+async def cmd_ping(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if (chat_id := await _owner_cmd(update, context)) is None:
+        return
+    await context.bot.send_chat_action(chat_id, ChatAction.TYPING)
+    rows = ["📡 <b>Ping</b> — does every API key answer?", "", *await ping_rows()]
+    if len(nvidia_pool):
+        rows += ["", "<b>NVIDIA load</b> (requests in the last minute / limit):"]
+        rows += [f"• {esc(s['name'])}: {s['last_minute']}/{nvidia_pool.rpm} · {esc(s['state'])} · "
+                 f"{s['total']} total, {s['failures']} failed" for s in nvidia_pool.status()]
+    rows += ["", f"<i>Now using: {esc(backend_label())}</i>"]
+    await send_html(context.bot, chat_id, "\n".join(rows))
+
+
 async def cmd_doctor(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Health check of everything the bot depends on."""
     if (chat_id := await _owner_cmd(update, context)) is None:
@@ -2943,6 +3043,9 @@ async def cmd_doctor(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
                              ("Coding agents", "agent", "worker_model")):
         m = cfg(key, mode)
         line(True, f"{label}: <code>{esc(str(m))}</code> on {esc(provider_text(m))} (fixed, no fallbacks)")
+    line(True, f"Backend: {esc(backend_label())}")
+    line(bool(len(nvidia_pool)) or None, f"NVIDIA keys: {len(nvidia_pool)} set" + ("" if len(nvidia_pool) else
+         " — add NVIDIA_KEY_1..3 for the free backend") + " · /ping tests them")
     line(vault.enabled() or None, "PERSONA_KEY set — persona and rules encrypted" if vault.enabled()
          else "PERSONA_KEY missing — persona and rules stored unencrypted")
     for tool in ("git", "python3", "node", "npm"):
@@ -3293,6 +3396,8 @@ def _actions() -> dict:
         "export": cmd_export,
         "agents": cmd_agents,
         "doctor": cmd_doctor,
+        "backend": cmd_backend,
+        "ping": cmd_ping,
         "set": cmd_set,
         "effort": shortcut("effort", lambda c: (c.args or ["default"])[0]),
         "thinking": shortcut("show_thinking", lambda c: "off" if cfg("show_thinking", owner_mode()) else "on"),

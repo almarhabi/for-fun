@@ -115,6 +115,20 @@ MODEL_PROVIDERS: dict = {k: list(v) for k, v in (_data.get("model_providers") or
 LEGACY_MODELS: dict = {k: v for k, v in (_data.get("legacy_models") or {}).items() if not k.startswith("_")}
 
 
+# 🆓 The free backend (NVIDIA NIM): the same models under their NVIDIA ids, and a pool of keys
+NVIDIA: dict = {"base_url": "https://integrate.api.nvidia.com/v1", "rpm_per_key": 40, "max_wait_seconds": 45,
+                "models": {}, "model_extra": {}, **(_data.get("nvidia") or {})}
+NVIDIA_MODELS: dict = {k: v for k, v in (NVIDIA.get("models") or {}).items() if not k.startswith("_")}
+
+
+def nvidia_keys() -> list[str]:
+    """Every NVIDIA key from the environment: NVIDIA_API_KEYS (comma-separated), NVIDIA_API_KEY, NVIDIA_KEY_1..9."""
+    raw = [os.getenv("NVIDIA_API_KEYS", ""), os.getenv("NVIDIA_API_KEY", "")]
+    raw += [os.getenv(f"NVIDIA_KEY_{i}", "") for i in range(1, 10)]
+    keys = [k.strip().strip("\"'") for chunk in raw for k in chunk.replace("\n", ",").split(",")]
+    return list(dict.fromkeys(k for k in keys if k))
+
+
 def current_model(name: str | None) -> str | None:
     """The model to actually use for a name (an old name becomes its replacement)."""
     name = (name or "").strip()

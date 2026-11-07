@@ -115,6 +115,8 @@ jobs:
           # Each model always runs on its own fixed provider (set in config.json), with no fallbacks.
           OPENROUTER_MODEL: ${{ vars.OPENROUTER_MODEL }}   # optional override of the main model
           AGENT_MODEL: ${{ vars.AGENT_MODEL }}             # optional override of the coding agents' model
+          # 🆓 the free backend (NVIDIA NIM): up to three keys, the load is spread over them (/backend to switch)
+          NVIDIA_API_KEYS: ${{ secrets.NVIDIA_KEY_1 }},${{ secrets.NVIDIA_KEY_2 }},${{ secrets.NVIDIA_KEY_3 }}
           GH_PAT: ${{ secrets.GH_PAT }}   # optional: lets the bot write/edit on GitHub and watch CI (owner only)
           TOR_PROXY: ${{ env.TOR_PROXY }}   # filled automatically when USE_TOR=true
           PERSONA_KEY: ${{ secrets.PERSONA_KEY }}   # optional: the key that encrypts the persona and lock rules
