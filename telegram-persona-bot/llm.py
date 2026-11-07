@@ -1,4 +1,4 @@
-"""Streaming from OpenRouter — shared by normal chat, the lead (Kimi) and the agents (GLM).
+"""Streaming from OpenRouter — shared by normal chat, the Coding lead and its agents.
 
 From the stream it collects: the reply text, the reasoning, the reasoning_details (so they can be
 sent back to the model unchanged), tool calls, and usage (when OpenRouter sends it).

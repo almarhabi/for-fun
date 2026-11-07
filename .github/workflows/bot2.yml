@@ -1,7 +1,7 @@
-name: Telegram bot 2 (GLM) 24h
+name: Telegram bot 2 (GLM Flash) 24h
 
-# A second, fully independent bot running the same code (Chat + Coding, every feature) on GLM-5.3.
-# Its own token, model, provider and data (cache bot2-data-). The OpenRouter key and owner id are shared
+# A second, fully independent bot running the same code (Chat + Coding, every feature) on GLM-5.3 Flash.
+# Its own token, model and data (cache bot2-data-). The OpenRouter key and owner id are shared
 # with bot 1 unless the _2 secrets are set.
 
 # GitHub stops any run after 6 hours, so the bot runs ~5h40m,
@@ -96,10 +96,9 @@ jobs:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN_2 }}
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY_2 || secrets.OPENROUTER_API_KEY }}
           OWNER_ID: ${{ secrets.OWNER_ID_2 || secrets.OWNER_ID }}
-          OPENROUTER_MODEL: ${{ vars.OPENROUTER_MODEL_2 || 'z-ai/glm-5.3' }}
-          OPENROUTER_PROVIDER: ${{ vars.OPENROUTER_PROVIDER_2 || 'baidu/fp8' }}
-          AGENT_MODEL: ${{ vars.AGENT_MODEL_2 }}         # optional: the coding agents' model (default z-ai/glm-5.3)
-          AGENT_PROVIDER: ${{ vars.AGENT_PROVIDER_2 }}   # optional: the agents' provider (default baidu/fp8)
+          # GLM-5.3 Flash (relace/fp4) is both the lead and the coding agents. Fixed provider, no fallbacks.
+          OPENROUTER_MODEL: ${{ vars.OPENROUTER_MODEL_2 || 'z-ai/glm-5.3-flash' }}
+          AGENT_MODEL: ${{ vars.AGENT_MODEL_2 }}             # optional (default z-ai/glm-5.3-flash)
           GH_PAT: ${{ secrets.GH_PAT_2 || secrets.GH_PAT }}   # optional: lets the bot write/edit on GitHub and watch CI (owner only)
           TOR_PROXY: ${{ env.TOR_PROXY }}   # filled automatically when USE_TOR=true
           PERSONA_KEY: ${{ secrets.PERSONA_KEY_2 }}   # optional: the key that encrypts the persona and lock rules

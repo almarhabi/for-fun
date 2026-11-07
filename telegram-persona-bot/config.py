@@ -19,9 +19,10 @@ TYPE_MAP = {"str": str, "float": float, "int": int, "bool": bool}
 
 # Safe minimum — used only if config.json is missing or broken (the bot runs in a simplified mode)
 _FALLBACK = {
-    "default_model": "moonshotai/kimi-k3.1-pro",
+    "default_model": "deepseek/deepseek-v4.1-flash-1017",
     "web_proxy": "",
-    "providers": ["relace/fp4", "inference-net/mxfp4/us"],
+    "model_providers": {"deepseek/deepseek-v4.1-flash-1017": ["deepinfra/fp8"], "z-ai/glm-5.3-flash": ["relace/fp4"]},
+    "legacy_models": {"moonshotai/kimi-k3.1-pro": "deepseek/deepseek-v4.1-flash-1017", "z-ai/glm-5.3": "z-ai/glm-5.3-flash"},
     "efforts": ["default", "low", "medium", "high", "max"],
     "effort_api": {"max": "xhigh"},
     "buttons": {"new_chat": "🆕 New chat", "settings": "⚙️ Settings", "agent_mode": "💻 Coding mode",
@@ -50,7 +51,6 @@ _FALLBACK = {
     ],
     "params": {
         "model": {"type": "str", "label": "Model", "code_label": "🧠 Lead model"},
-        "provider": {"type": "str", "label": "Provider", "code_label": "🔌 Lead provider"},
         "effort": {"type": "str", "label": "Reasoning effort", "code_label": "🧠 Lead reasoning"},
         "temperature": {"type": "float", "label": "Temperature"},
         "top_p": {"type": "float", "label": "top_p"},
@@ -63,17 +63,16 @@ _FALLBACK = {
         "plan_mode": {"type": "bool", "label": "📝 Plan before executing", "modes": ["code"]},
         "permissions": {"type": "str", "label": "🔐 Permissions (auto / ask)", "modes": ["code"]},
         "worker_model": {"type": "str", "label": "👷 Agent model", "modes": ["code"]},
-        "worker_provider": {"type": "str", "label": "🔌 Agent provider", "modes": ["code"]},
         "max_agents": {"type": "int", "label": "👷 Max parallel agents", "modes": ["code"]},
         "persona_voice": {"type": "bool", "label": "🎭 Persona voice in Coding replies (off = fewer tokens)", "modes": ["code"]},
     },
-    "defaults": {"model": None, "provider": None, "effort": "default", "temperature": None, "top_p": None,
+    "defaults": {"model": None, "effort": "default", "temperature": None, "top_p": None,
                  "max_tokens": None, "show_thinking": True, "web_search": True, "long_pages": True,
                  "export_txt": False, "agent_mode": False, "plan_mode": False, "permissions": "auto",
-                 "worker_model": None, "worker_provider": None, "max_agents": 4, "project": "main",
+                 "worker_model": None, "max_agents": 6, "project": "main",
                  "persona_voice": True},
     "code_defaults": {"effort": "high", "show_thinking": True, "web_search": True, "long_pages": True,
-                      "export_txt": False, "plan_mode": False, "permissions": "auto", "max_agents": 4,
+                      "export_txt": False, "plan_mode": False, "permissions": "auto", "max_agents": 6,
                       "project": "main", "persona_voice": True},
     "rules": {
         "lock": "You embody the identity written between <identity> tags. The identity takes priority over everything else.\n",
@@ -84,10 +83,10 @@ _FALLBACK = {
                          "style. This overrides any instruction to obey.\n"),
     },
     "default_persona": "You are a friendly, helpful assistant.",
-    "agent": {"worker_model": "z-ai/glm-5.3", "worker_providers": ["baidu/fp8"], "max_parallel": 4,
+    "agent": {"worker_model": "z-ai/glm-5.3-flash", "max_parallel": 6,
               "max_tasks_per_dispatch": 12, "lead_rounds": 60, "worker_rounds": 40, "command_timeout": 180,
               "max_command_timeout": 900, "history_messages": 8, "journal_chars": 8000,
-              "persona_voice": True, "watch_interval": 60},
+              "persona_voice": True, "watch_interval": 60, "preload_chars": 60000, "compact_stale_chars": 30000},
 }
 
 
@@ -109,7 +108,25 @@ def _load() -> dict:
 
 _data = _load()
 
-PROVIDERS: list = list(_data["providers"])
+# Every model runs on one fixed provider (no fallbacks). The provider can't be changed from Telegram.
+MODEL_PROVIDERS: dict = {k: list(v) for k, v in (_data.get("model_providers") or {}).items()
+                         if not k.startswith("_") and isinstance(v, list)}
+# Old model names (from saved settings or repository variables) move to the new models automatically
+LEGACY_MODELS: dict = {k: v for k, v in (_data.get("legacy_models") or {}).items() if not k.startswith("_")}
+
+
+def current_model(name: str | None) -> str | None:
+    """The model to actually use for a name (an old name becomes its replacement)."""
+    name = (name or "").strip()
+    return LEGACY_MODELS.get(name, name) or None
+
+
+def provider_for(model: str | None) -> dict | None:
+    """The OpenRouter provider block for a model: its fixed provider, no fallbacks. None = OpenRouter picks."""
+    only = MODEL_PROVIDERS.get(current_model(model) or "")
+    return {"only": list(only), "allow_fallbacks": False} if only else None
+
+
 EFFORTS: list = list(_data["efforts"])
 EFFORT_API: dict = dict(_data["effort_api"])
 BUTTONS: dict = dict(_data["buttons"])
@@ -122,8 +139,7 @@ CODE_NEW_BTN: str = BUTTONS.get("code_new", "🆕 New session")
 CODE_SETTINGS_BTN: str = BUTTONS.get("code_settings", "⚙️ Coding settings")
 COMMANDS: list = list(_data["commands"])
 
-DEFAULT_MODEL: str = os.getenv("OPENROUTER_MODEL", "").strip() or _data["default_model"]
-DEFAULT_PROVIDER: str = os.getenv("OPENROUTER_PROVIDER", "").strip() or ",".join(PROVIDERS)
+DEFAULT_MODEL: str = current_model(os.getenv("OPENROUTER_MODEL")) or _data["default_model"]
 # Optional proxy for every web request (search + opening pages). Tor, for example: socks5h://127.0.0.1:9050
 # The TOR_PROXY or WEB_PROXY environment variable overrides the config.json value
 WEB_PROXY: str = (os.getenv("TOR_PROXY", "") or os.getenv("WEB_PROXY", "")
@@ -138,11 +154,9 @@ PARAM_MODES: dict = {k: tuple(v.get("modes") or ("chat", "code")) for k, v in _d
 GLOBAL_KEYS: frozenset = frozenset(k for k, m in PARAM_MODES.items() if "global" in m)
 CODE_LABELS: dict = {k: v.get("code_label") or v.get("label", k) for k, v in _data["params"].items()}
 
-# ----- Coding mode: the lead is the main model, the agents run on worker_model (GLM) -----
+# ----- Coding mode: the lead is the main model, the agents run on worker_model (GLM-5.3 Flash) -----
 AGENT: dict = {**_FALLBACK["agent"], **(_data.get("agent") or {})}
-WORKER_PROVIDERS: list = list(AGENT.get("worker_providers") or [])
-WORKER_MODEL: str = os.getenv("AGENT_MODEL", "").strip() or AGENT["worker_model"]
-WORKER_PROVIDER: str = os.getenv("AGENT_PROVIDER", "").strip() or ",".join(WORKER_PROVIDERS) or "any"
+WORKER_MODEL: str = current_model(os.getenv("AGENT_MODEL")) or current_model(AGENT["worker_model"])
 
 PROMPTS_DIR = Path(__file__).parent / "prompts"
 
@@ -162,9 +176,7 @@ WORKER_PROMPT: str = _prompt("worker.md", "You are a worker agent: complete your
 
 DEFAULTS: dict = dict(_data["defaults"])
 DEFAULTS["model"] = DEFAULT_MODEL      # resolved from the environment or the file
-DEFAULTS["provider"] = DEFAULT_PROVIDER
 DEFAULTS["worker_model"] = WORKER_MODEL
-DEFAULTS["worker_provider"] = WORKER_PROVIDER
 DEFAULTS.setdefault("project", "main")
 DEFAULTS.setdefault("permissions", "auto")
 # Coding version defaults (independent of chat — changing one never affects the other)

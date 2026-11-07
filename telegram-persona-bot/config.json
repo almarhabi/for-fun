@@ -1,11 +1,21 @@
 {
   "_note": "Bot control file. The bot has two versions: 💬 Chat and 💻 Coding. Everything is shared (persona, snippets, GitHub, keys) but each version has its own settings and look. params.*.modes says where a setting appears; code_defaults are the Coding version's defaults. The real persona and lock rules are set from Telegram (/setpersona and /setrules) and stored encrypted with PERSONA_KEY — not here.",
-  "default_model": "moonshotai/kimi-k3.1-pro",
+  "default_model": "deepseek/deepseek-v4.1-flash-1017",
   "web_proxy": "",
-  "providers": [
-    "relace/fp4",
-    "inference-net/mxfp4/us"
-  ],
+  "model_providers": {
+    "_note": "Each model always runs on its own fixed provider (allow_fallbacks: false). Not changeable from Telegram.",
+    "deepseek/deepseek-v4.1-flash-1017": [
+      "deepinfra/fp8"
+    ],
+    "z-ai/glm-5.3-flash": [
+      "relace/fp4"
+    ]
+  },
+  "legacy_models": {
+    "_note": "Old model names saved in settings or variables are moved to the new models automatically.",
+    "moonshotai/kimi-k3.1-pro": "deepseek/deepseek-v4.1-flash-1017",
+    "z-ai/glm-5.3": "z-ai/glm-5.3-flash"
+  },
   "efforts": [
     "default",
     "low",
@@ -347,11 +357,6 @@
       "label": "Model",
       "code_label": "🧠 Lead model"
     },
-    "provider": {
-      "type": "str",
-      "label": "Provider",
-      "code_label": "🔌 Lead provider"
-    },
     "effort": {
       "type": "str",
       "label": "Reasoning effort",
@@ -413,13 +418,6 @@
         "code"
       ]
     },
-    "worker_provider": {
-      "type": "str",
-      "label": "🔌 Agent provider",
-      "modes": [
-        "code"
-      ]
-    },
     "max_agents": {
       "type": "int",
       "label": "👷 Max parallel agents",
@@ -436,8 +434,7 @@
     }
   },
   "defaults": {
-    "model": "moonshotai/kimi-k3.1-pro",
-    "provider": "relace/fp4,inference-net/mxfp4/us",
+    "model": "deepseek/deepseek-v4.1-flash-1017",
     "effort": "default",
     "temperature": null,
     "top_p": null,
@@ -449,9 +446,8 @@
     "agent_mode": false,
     "plan_mode": false,
     "permissions": "auto",
-    "worker_model": "z-ai/glm-5.3",
-    "worker_provider": "baidu/fp8",
-    "max_agents": 4,
+    "worker_model": "z-ai/glm-5.3-flash",
+    "max_agents": 6,
     "project": "main",
     "persona_voice": true
   },
@@ -463,7 +459,7 @@
     "export_txt": false,
     "plan_mode": false,
     "permissions": "auto",
-    "max_agents": 4,
+    "max_agents": 6,
     "project": "main",
     "persona_voice": true
   },
@@ -475,12 +471,9 @@
   },
   "default_persona": "You are a friendly, helpful assistant.",
   "agent": {
-    "_note": "Coding mode: the lead is the main model (default_model); agents run on worker_model. The prompts live in the prompts/ folder.",
-    "worker_model": "z-ai/glm-5.3",
-    "worker_providers": [
-      "baidu/fp8"
-    ],
-    "max_parallel": 4,
+    "_note": "Coding mode: the lead is the main model (default_model); agents run on worker_model. Providers come from model_providers. The prompts live in the prompts/ folder.",
+    "worker_model": "z-ai/glm-5.3-flash",
+    "max_parallel": 6,
     "max_tasks_per_dispatch": 12,
     "lead_rounds": 60,
     "worker_rounds": 40,
@@ -489,6 +482,8 @@
     "history_messages": 8,
     "journal_chars": 8000,
     "persona_voice": true,
-    "watch_interval": 60
+    "watch_interval": 60,
+    "preload_chars": 60000,
+    "compact_stale_chars": 30000
   }
 }

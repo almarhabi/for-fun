@@ -1,4 +1,4 @@
-"""The coding-mode workspace — the project folder Kimi and its agents work in (like Claude Code).
+"""The coding-mode workspace — the project folder the lead and its agents work in (like Claude Code).
 
 Every project is its own folder under data/workspaces/<name>:
 - File tools (read/write/edit/search) can never reach outside the project folder.
@@ -647,7 +647,7 @@ class Workspace:
             f.write_text(cur.rstrip("\n") + ("\n" if cur.strip() else "") + "\n".join(missing) + "\n", encoding="utf-8")
 
     async def push(self, full: str, branch: str, message: str, token: str,
-                   author: tuple[str, str] = ("Kimi Agent", "agent@users.noreply.github.com"),
+                   author: tuple[str, str] = ("Coding Agent", "agent@users.noreply.github.com"),
                    force: bool = False) -> dict:
         root = self.ensure().real
         if not (root / ".git").exists():
@@ -730,10 +730,14 @@ class Changes:
                 out.append({"path": rel, "kind": "modified", "plus": plus, "minus": minus})
         return out
 
-    def diff(self) -> str:
+    def diff(self, paths: list[str] | None = None) -> str:
+        """A unified diff of this request's changes (only `paths` when given)."""
         parts = []
+        only = set(paths) if paths is not None else None
         for f in self.files():
             rel = f["path"]
+            if only is not None and rel not in only:
+                continue
             orig, cur = self.originals[rel], self._current(rel)
             if orig == _BIG or (orig and is_binary(orig)) or (cur and is_binary(cur)):
                 parts.append(f"Binary/large file changed: {rel}\n")

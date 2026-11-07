@@ -92,10 +92,10 @@ jobs:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
           OWNER_ID: ${{ secrets.OWNER_ID }}
-          OPENROUTER_MODEL: ${{ vars.OPENROUTER_MODEL }}
-          OPENROUTER_PROVIDER: ${{ vars.OPENROUTER_PROVIDER }}
-          AGENT_MODEL: ${{ vars.AGENT_MODEL }}         # optional: the coding agents' model (default z-ai/glm-5.3)
-          AGENT_PROVIDER: ${{ vars.AGENT_PROVIDER }}   # optional: the agents' provider (default baidu/fp8)
+          # Models: DeepSeek V4.1 Flash (deepinfra/fp8) leads; the coding agents are GLM-5.3 Flash (relace/fp4).
+          # Each model always runs on its own fixed provider (set in config.json), with no fallbacks.
+          OPENROUTER_MODEL: ${{ vars.OPENROUTER_MODEL }}   # optional override of the main model
+          AGENT_MODEL: ${{ vars.AGENT_MODEL }}             # optional override of the coding agents' model
           GH_PAT: ${{ secrets.GH_PAT }}   # optional: lets the bot write/edit on GitHub and watch CI (owner only)
           TOR_PROXY: ${{ env.TOR_PROXY }}   # filled automatically when USE_TOR=true
           PERSONA_KEY: ${{ secrets.PERSONA_KEY }}   # optional: the key that encrypts the persona and lock rules

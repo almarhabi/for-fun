@@ -1,10 +1,10 @@
-# Persona Telegram bot — Chat + Coding (Kimi K3.1 Pro via OpenRouter)
+# Persona Telegram bot — Chat + Coding (DeepSeek V4.1 Flash + GLM-5.3 Flash via OpenRouter)
 
 One bot, **two versions**:
 
 - **💬 Chat** — an AI assistant with an owner-defined persona that it follows exactly.
-- **💻 Coding** — a Claude Code–style coding agent: **Kimi K3.1 Pro** leads, plans and reviews, while
-  **GLM-5.3 agents** write and test code **in parallel** inside a real project folder, with full GitHub
+- **💻 Coding** — a Claude Code–style coding agent: **DeepSeek V4.1 Flash** leads, plans and reviews, while
+  **GLM-5.3 Flash agents** write and test code **in parallel** inside a real project folder, with full GitHub
   control and live CI monitoring.
 
 Everything is shared between the two versions (persona, snippets, GitHub, keys, usage), but each has its
@@ -31,12 +31,12 @@ All model-facing text (instructions, tool descriptions, tool results, logs) is E
 
 ### How it works
 
-1. **The lead (Kimi K3.1 Pro)** understands the request, explores the project, writes a live plan
+1. **The lead (DeepSeek V4.1 Flash)** understands the request, explores the project, writes a live plan
    (📋 todo list), and decides what to do itself and what to delegate.
 2. It locks the shared **contracts** (structure, interfaces, signatures) first, then **delegates** with
    `dispatch_agents`: independent tasks run **in parallel**, dependent ones wait (`depends_on`) and receive the
    reports of what they depend on.
-3. **The agents (GLM-5.3)** each get a precise brief, read before writing, implement fully, **run the tests
+3. **The agents (GLM-5.3 Flash)** each get a precise brief (with the files they need pre-loaded), implement fully, **run the tests
    themselves**, and report back.
 4. The lead **reviews, integrates and verifies** (runs the build/tests), fixes what's broken, and replies with a
    short summary.
@@ -100,13 +100,27 @@ again. `/watch owner/repo auto` lets the lead fix and push on its own (at most t
 
 Token scopes: classic `repo` + `workflow`, or fine-grained Contents / Pull requests / Issues / Actions read & write.
 
+### Speed (fewer, fuller rounds — same quality)
+
+Most of a long run's time is round trips to the model, so the bot cuts rounds instead of cutting thinking:
+
+- **Parallel tool calls:** independent read-only calls in one reply (reads, searches, listings, web, GitHub reads)
+  run at the same time; `read_file` also takes `paths` to read several files in one call.
+- **Pre-loaded agents:** `dispatch_agents` tasks take `read_first`; those files plus the agent's own existing files
+  are loaded into its task, so it starts writing in its first round instead of spending rounds reading.
+- **Review from the diff:** every agent's result carries its diff, so the lead reviews without re-reading files.
+- **Instant syntax check** after every edit (Python, JSON, TOML, JS, shell), so a typo is fixed in the same round.
+- Up to **6 agents** in parallel by default; the live panel shows elapsed time, tokens and cost.
+
 ### Token economy (without lowering quality)
 
 - Old code versions are never resent: the lead gets the current file tree, `AGENTS.md`, and a short **project
   journal** (two lines per past request); the conversation memory keeps only the latest exchanges.
 - A file that hasn't changed isn't sent twice in a session.
 - Old tool results are trimmed in large, rare steps (keeps the prompt prefix stable for provider caching).
-- Heavy code volume goes to the cheaper GLM agents; Kimi spends its reasoning on design, contracts and review.
+- **Superseded results are compacted:** an older read of a file that was read again or rewritten, an older run
+  of the same command, and older copies of rewritten files — no information is lost, only duplicates.
+- Heavy code volume goes to the GLM agents; the lead spends its reasoning on design, contracts and review.
 - `/context` shows where the tokens go; `/compact` shrinks the conversation; **🎭 Persona voice** can be turned
   off in Coding settings.
 
@@ -123,7 +137,7 @@ Token scopes: classic `repo` + `workflow`, or fine-grained Contents / Pull reque
 | Method | |
 |---|---|
 | `/setpersona TEXT` / `/setrules TEXT` | saved exactly as written |
-| `/setpersona` or `/setrules` alone | input mode: send one or several messages, then ✅ Save |
+| `/setpersona` or `/setrules` alone | input mode: send one or several messages — after each, a fresh message with a preview and ✅ Save appears at the bottom |
 | a `.txt` file with the caption `/setpersona` or `/setrules` | best for long texts |
 | `/persona` / `/rules` | shows the current text + an exact file copy |
 
@@ -162,21 +176,24 @@ One-message settings (owner): `effort=max web_search=off your question`.
 
 ## Settings
 
-**Chat:** model, provider, reasoning effort, temperature, top_p, max_tokens, show thinking, web search, long
+**Chat:** model, reasoning effort, temperature, top_p, max_tokens, show thinking, web search, long
 replies as a page, txt file after each reply.
 
-**Coding (independent):** lead model, lead provider, lead reasoning (default **high**), agent model
-(`z-ai/glm-5.3`), agent provider (`baidu/fp8`), max parallel agents (default 4), plan first, permissions
+**Coding (independent):** lead model, lead reasoning (default **high**), agent model
+(`z-ai/glm-5.3-flash`), max parallel agents (default 6), plan first, permissions
 (auto / ask), persona voice, show thinking, web search, long replies as a page, txt file.
 
 ## OpenRouter
 
-- Requests send `reasoning: {enabled: true}` (or `effort` when set) and
-  `provider: {only: [...], allow_fallbacks: false}`; Coding also asks for `usage` to track cost.
+- Every model runs on **one fixed provider** with `allow_fallbacks: false` — set in `config.json`
+  (`model_providers`) and not changeable from Telegram:
+  - `deepseek/deepseek-v4.1-flash-1017` → `deepinfra/fp8`
+  - `z-ai/glm-5.3-flash` → `relace/fp4`
+- Old model names (Kimi K3.1 Pro, GLM-5.3) saved in settings or variables move to the new models automatically.
+- Requests send `reasoning: {enabled: true}` (or `effort` when set); Coding also asks for `usage` to track cost.
 - `reasoning_details` is passed back unchanged between tool rounds and across the last 10 chat replies.
 - Effort levels: default · low · medium · high · max (`xhigh` on OpenRouter).
-- If a provider doesn't support tools: Chat continues without search; Coding needs tools — pick
-  **Any provider** in the settings.
+- If a provider doesn't support tools: Chat continues without search; Coding needs tools.
 
 ## Web via Tor / a proxy (optional)
 
@@ -191,23 +208,22 @@ memory, projects) is kept between runs.
 
 1. **Settings → Secrets and variables → Actions → Secrets:** `TELEGRAM_BOT_TOKEN` · `OPENROUTER_API_KEY` ·
    `OWNER_ID` · optional `GH_PAT` · optional `PERSONA_KEY`.
-2. Optional **Variables:** `OPENROUTER_MODEL`, `OPENROUTER_PROVIDER`, `AGENT_MODEL`, `AGENT_PROVIDER`, `USE_TOR`.
+2. Optional **Variables:** `OPENROUTER_MODEL`, `AGENT_MODEL`, `USE_TOR`.
 3. **Actions → Telegram bot 24h → Run workflow.**
 
 > ⚠️ Running a permanent service on GitHub Actions goes against GitHub's terms; a real server is recommended.
 > Don't run the bot locally and on GitHub at the same time — Telegram accepts one copy only.
 
-## A second bot on GLM-5.3 (bot 2)
+## A second bot on GLM-5.3 Flash (bot 2)
 
 `.github/workflows/bot2.yml` runs a second, fully independent bot with **the same code and every feature**
-(Chat + Coding), on `z-ai/glm-5.3` via `baidu/fp8` — in Coding mode GLM is both the lead and the agents.
+(Chat + Coding), on `z-ai/glm-5.3-flash` via `relace/fp4` — in Coding mode it is both the lead and the agents.
 It has its own token, persona, rules, memory and projects (cache `bot2-data-`).
 
 - Required: the secret `TELEGRAM_BOT_TOKEN_2` (a different bot from @BotFather).
 - Shared with bot 1 by default: `OPENROUTER_API_KEY`, `OWNER_ID`, `GH_PAT` (override with `_2` secrets).
-- Optional: `PERSONA_KEY_2`; variables `OPENROUTER_MODEL_2`, `OPENROUTER_PROVIDER_2`, `AGENT_MODEL_2`,
-  `AGENT_PROVIDER_2`, `USE_TOR_2`.
-- Start it: **Actions → Telegram bot 2 (GLM) 24h → Run workflow** (it also starts on every push).
+- Optional: `PERSONA_KEY_2`; variables `OPENROUTER_MODEL_2`, `AGENT_MODEL_2`, `USE_TOR_2`.
+- Start it: **Actions → Telegram bot 2 (GLM Flash) 24h → Run workflow** (it also starts on every push).
 
 ## Running locally
 
@@ -220,7 +236,7 @@ python bot.py
 ## Files
 
 - `bot.py` — the bot: commands, live replies, buttons, persona, both versions.
-- `agent.py` — Coding mode: tools, the GLM agent loop, parallel scheduling, the work panel.
+- `agent.py` — Coding mode: tools, the agent loop, parallel scheduling and tool calls, the work panel.
 - `workspace.py` — project folders: files, commands, background jobs, checkpoints, file claims, git.
 - `llm.py` — streaming from OpenRouter (shared by chat, the lead and the agents).
 - `prompts/orchestrator.md` · `prompts/worker.md` — the lead's and the agents' instructions (editable).

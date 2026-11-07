@@ -1,4 +1,4 @@
-"""A Telegram bot with a fixed, owner-defined persona, running on Kimi K3.1 Pro, that behaves like modern AI apps — plus a Coding version with a lead model and parallel agents (like Claude Code)."""
+"""A Telegram bot with a fixed, owner-defined persona, running on DeepSeek V4.1 Flash (or GLM-5.3 Flash for bot 2), that behaves like modern AI apps — plus a Coding version with a lead model and parallel agents (like Claude Code)."""
 
 import asyncio
 import base64
@@ -67,10 +67,8 @@ def clean_key(key: str) -> str:
 
 OPENROUTER_API_KEY = clean_key(os.environ["OPENROUTER_API_KEY"])
 OPENROUTER_BASE_URL = os.getenv("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1")
-# Model and providers from config.json (environment variables can override them)
+# The model from config.json (OPENROUTER_MODEL can override it). Each model has one fixed provider.
 DEFAULT_MODEL = config.DEFAULT_MODEL
-PROVIDERS = config.PROVIDERS
-DEFAULT_PROVIDER = config.DEFAULT_PROVIDER
 OWNER_ID = int(os.getenv("OWNER_ID", "").strip() or "0")
 MAX_HISTORY = int(os.getenv("MAX_HISTORY", "20"))  # 10 messages per side
 
@@ -263,9 +261,17 @@ def cfg(key: str, mode: str = "chat"):
         value = code.get(key, CODE_DEFAULTS.get(key))
     else:
         value = data.get(key, DEFAULTS.get(key))
-    if key == "model" and "/" not in str(value):  # an old direct-Moonshot model name
-        return DEFAULT_MODEL
+    if key in ("model", "worker_model"):
+        if key == "model" and "/" not in str(value):  # an old direct-Moonshot model name
+            return DEFAULT_MODEL
+        return config.current_model(value) or DEFAULTS.get(key)  # an old model name moves to its replacement
     return value
+
+
+def provider_text(model) -> str:
+    """The fixed provider of a model, for display."""
+    prov = config.provider_for(model)
+    return ", ".join(prov["only"]) if prov else "auto"
 
 
 def save_setting(key: str, value, mode: str = "chat") -> None:
@@ -292,12 +298,10 @@ def parse_value(key: str, raw: str):
         if low in ("off", "false", "0", "no"):
             return False
         raise ValueError("use on or off")
-    if key in ("provider", "worker_provider") and low in ("any", "all"):
-        return "any"
     if low in ("off", "none", "default"):
         if key == "effort":
             return "default"
-        return DEFAULTS[key] if key in ("model", "provider", "worker_model", "worker_provider", "max_agents") else None
+        return DEFAULTS[key] if key in ("model", "worker_model", "max_agents") else None
     if key == "permissions":
         if low not in ("auto", "ask"):
             raise ValueError("values: auto / ask")
@@ -320,10 +324,10 @@ def request_kwargs(overrides: dict | None = None, mode: str = "chat") -> dict:
 
     effort = get("effort")
     extra = {"reasoning": {"enabled": True} if effort == "default" else {"effort": EFFORT_API.get(effort, effort)}}
-    provider = get("provider")
-    if provider and provider != "any":
-        extra["provider"] = {"only": [p.strip() for p in provider.split(",") if p.strip()], "allow_fallbacks": False}
-    kw = {"model": get("model"), "extra_body": extra}
+    model = config.current_model(get("model")) or DEFAULT_MODEL
+    if provider := config.provider_for(model):   # always the model's own provider, never a fallback
+        extra["provider"] = provider
+    kw = {"model": model, "extra_body": extra}
     for k in ("temperature", "top_p", "max_tokens"):
         if get(k) is not None:
             kw[k] = get(k)
@@ -784,9 +788,9 @@ def error_hint(e: Exception) -> str:
     if code == 429:
         return "The provider is overloaded — try again in a moment."
     if "tool" in msg and ("support" in msg or "endpoint" in msg):
-        return "The selected provider doesn't support tools (Coding mode needs them) — try ⚙️ Settings: \"Any provider\"."
+        return "This model's provider doesn't accept tools right now (Coding mode needs them) — try again in a moment."
     if code == 404 or "no endpoints" in msg or "provider" in msg:
-        return "The selected provider isn't available right now — try ⚙️ Settings: \"Any provider\"."
+        return "This model's provider isn't available right now — try again in a moment."
     return ""
 
 
@@ -1035,10 +1039,10 @@ def lead_kwargs(overrides: dict) -> dict:
 
 def worker_kwargs() -> dict:
     extra = {"reasoning": {"enabled": True}, "usage": {"include": True}}
-    prov = cfg("worker_provider", "agent")
-    if prov and prov != "any":
-        extra["provider"] = {"only": [p.strip() for p in str(prov).split(",") if p.strip()], "allow_fallbacks": False}
-    return {"model": cfg("worker_model", "agent") or config.WORKER_MODEL, "extra_body": extra}
+    model = cfg("worker_model", "agent") or config.WORKER_MODEL
+    if provider := config.provider_for(model):
+        extra["provider"] = provider
+    return {"model": model, "extra_body": extra}
 
 
 def make_env(ws: Workspace, changes: Changes, board: "agent.Board", web_on: bool) -> "agent.Env":
@@ -1051,6 +1055,8 @@ def make_env(ws: Workspace, changes: Changes, board: "agent.Board", web_on: bool
         client=client, ws=ws, changes=changes, board=board, worker_kw=worker_kwargs(),
         max_parallel=max(1, min(parallel, 8)), max_tasks=int(AGENT_CFG["max_tasks_per_dispatch"]),
         worker_rounds=int(AGENT_CFG["worker_rounds"]), cmd_timeout=int(AGENT_CFG["command_timeout"]),
+        preload_chars=int(AGENT_CFG.get("preload_chars", 60_000)),
+        compact_chars=int(AGENT_CFG.get("compact_stale_chars", 30_000)),
         max_timeout=int(AGENT_CFG["max_command_timeout"]),
         web=(lambda n, a: run_tool(n, a)) if web_on else None, web_tools=list(TOOLS) if web_on else [],
         gh=(lambda n, a, progress=None: github_tools.run_github(n, a, progress)) if gh_on else None,
@@ -1076,7 +1082,7 @@ def _btn(text: str, data: str) -> InlineKeyboardButton:
 
 
 async def _generate_agent(bot, chat_id: int, turn: Turn) -> None:
-    """Coding mode: Kimi leads (plans, reads, writes, runs, delegates to GLM, reviews), and the reply summarizes the work."""
+    """Coding mode: the lead plans, reads, writes, runs, delegates to the agents and reviews; the reply summarizes the work."""
     overrides = turn.overrides
     show_thinking = overrides.get("show_thinking", cfg("show_thinking", "agent"))
     long_pages = overrides.get("long_pages", cfg("long_pages", "agent"))
@@ -1117,6 +1123,8 @@ async def _generate_agent(bot, chat_id: int, turn: Turn) -> None:
                 ui.add_step("📨 Your note: " + " ".join(note.split())[:80])
             if agent.trim_context(messages):
                 ctx.seen_reads.clear()
+            else:
+                agent.compact_stale(messages, env.compact_chars)
             tool_kwargs = {"tools": tools} if round_no < max_rounds else {"tools": tools, "tool_choice": "none"}
             ui.begin_round()
             content, reasoning, details, calls = await lead_round(ui, messages, kw, tool_kwargs)
@@ -1128,17 +1136,22 @@ async def _generate_agent(bot, chat_id: int, turn: Turn) -> None:
             if content.strip():
                 last_text = content
             messages.append(llm.assistant_message(content, calls, details))
-            for c in calls:
+
+            async def one(c: dict):
                 board.tool_calls += 1
                 ui.add_step(agent.describe(c["name"], c["args"]) or describe_tool(c["name"], c["args"]))
                 if c["name"] in agent.TERMINAL:
+                    return "Shown to the owner.", []
+                return await agent.execute_lead(env, ctx, c["name"], c["args"])
+
+            # independent read-only calls in one reply run at the same time (fewer, shorter rounds)
+            outs = await agent.run_batch(calls, one)
+            for c, (result, sources) in zip(calls, outs):
+                if c["name"] in agent.TERMINAL and not terminal:
                     terminal = (c["name"], llm.parse_args(c["args"]) or {}, content)
-                    messages.append({"role": "tool", "tool_call_id": c["id"], "content": "Shown to the owner."})
-                    continue
-                result, sources = await agent.execute_lead(env, ctx, c["name"], c["args"])
                 ui.add_sources(sources)
                 messages.append({"role": "tool", "tool_call_id": c["id"], "content": result})
-                ui.status = ""
+            ui.status = ""
             if terminal:
                 break
     except asyncio.CancelledError:
@@ -1685,6 +1698,9 @@ async def store_control(bot, chat_id: int, text: str, target: str) -> None:
     ))
 
 
+CAPTURE_REFRESH = 0.8   # seconds: parts that arrive together (Telegram splits long texts) get a single new status message
+
+
 async def start_capture(bot, chat_id: int, parts: list[str], target: str, note: str = "") -> None:
     prompt = await send_html(bot, chat_id, capture_text(parts, target, note), PERSONA_KB)
     capture[chat_id] = {"parts": parts, "prompt": prompt, "target": target}
@@ -1699,9 +1715,40 @@ def capture_text(parts: list[str], target: str, note: str = "") -> str:
         "Every character is saved exactly as is. For very long texts a <code>.txt</code> file is best.",
         "",
         f"📥 Received: <b>{len(parts)}</b> parts · <b>{chars:,}</b> characters",
-        "When you're done, tap ✅ Save (or send /done).",
     ]
+    if parts:  # a short preview of the start and the end, to confirm it's the right text before saving
+        text = "\n".join(parts)
+        head = " ".join(text[:160].split())
+        tail = " ".join(text[-160:].split()) if len(text) > 320 else ""
+        preview = esc(head) + (" …" if len(text) > 160 else "") + (f"\n…\n{esc(tail)}" if tail else "")
+        lines += [f"<blockquote expandable>{preview}</blockquote>"]
+    lines += ["Send more parts, or tap ✅ Save to confirm (or send /done)."]
     return lines_html(*lines)
+
+
+async def refresh_capture(bot, chat_id: int) -> None:
+    """A fresh status message with ✅ Save at the bottom of the chat (the previous one is removed),
+    so there's never a need to scroll up to save."""
+    await asyncio.sleep(CAPTURE_REFRESH)
+    state = capture.get(chat_id)
+    if not state:
+        return
+    old = state.get("prompt")
+    state["prompt"] = await send_html(bot, chat_id, capture_text(state["parts"], state.get("target", "persona")),
+                                      PERSONA_KB)
+    if old:
+        with contextlib.suppress(TelegramError):
+            await bot.delete_message(chat_id, old.message_id)
+        untrack(chat_id, [old.message_id])
+
+
+def schedule_capture_refresh(bot, chat_id: int) -> None:
+    state = capture.get(chat_id)
+    if not state:
+        return
+    if (t := state.get("refresh")) and not t.done():
+        t.cancel()
+    state["refresh"] = asyncio.create_task(refresh_capture(bot, chat_id))
 
 
 async def set_control(update: Update, context: ContextTypes.DEFAULT_TYPE, target: str) -> None:
@@ -1742,6 +1789,8 @@ async def finish_capture(bot, chat_id: int, save: bool) -> None:
     state = capture.pop(chat_id, None)
     if not state:
         return
+    if (t := state.get("refresh")) and not t.done():
+        t.cancel()
     target = state.get("target", "persona")
     label = TARGET_LABEL[target]
     if state.get("prompt"):
@@ -1770,7 +1819,8 @@ async def capture_messages(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         raise ApplicationHandlerStop
     if text in (NEW_CHAT_BTN, SETTINGS_BTN, AGENT_BTN, CHAT_BTN, PROJECT_BTN, CODE_NEW_BTN, CODE_SETTINGS_BTN) or \
             (text or "").startswith(("/setpersona", "/setrules")):
-        capture.pop(msg.chat_id, None)
+        if (t := capture.pop(msg.chat_id, {}).get("refresh")) and not t.done():
+            t.cancel()
         return
     state = capture[msg.chat_id]
     try:
@@ -1787,11 +1837,7 @@ async def capture_messages(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         await send_html(context.bot, msg.chat_id, "⚠️ " + esc(str(e)))
         raise ApplicationHandlerStop from None
     state["parts"].append(part)
-    if state.get("prompt"):
-        with contextlib.suppress(TelegramError):
-            await state["prompt"].edit_text(capture_text(state["parts"], state.get("target", "persona")),
-                                            parse_mode=ParseMode.HTML,
-                                            reply_markup=PERSONA_KB)
+    schedule_capture_refresh(context.bot, msg.chat_id)
     raise ApplicationHandlerStop
 
 
@@ -1996,8 +2042,8 @@ def settings_html(mode: str = "chat") -> str:
             return "<i>default</i>"
         if isinstance(v, bool):
             return "✅" if v else "❌"
-        if k in ("provider", "worker_provider") and v == "any":
-            return "<i>any provider (with automatic fallback)</i>"
+        if k in ("model", "worker_model"):
+            return f"<code>{esc(str(v))}</code> · <i>{esc(provider_text(v))}</i>"
         return f"<code>{esc(str(v))}</code>"
 
     title = "💻 <b>Coding mode settings</b>" if mode == "agent" else "⚙️ <b>Settings</b>"
@@ -2024,31 +2070,21 @@ def settings_keyboard(mode: str = "chat") -> InlineKeyboardMarkup:
     def head(text):
         return [InlineKeyboardButton(text, callback_data="noop")]
 
-    e, prov = cfg("effort", mode), cfg("provider", mode)
+    e = cfg("effort", mode)
     if mode != "agent":
         return InlineKeyboardMarkup([
             head("🧠 Reasoning effort:"),
             [btn({"default": "default"}.get(x, x), "effort", x, e) for x in EFFORTS],
-            head("🔌 Provider:"),
-            [btn(p.split("/")[0], "provider", p, prov) for p in PROVIDERS],
-            [btn("Both", "provider", ",".join(PROVIDERS), prov), btn("Any provider", "provider", "any", prov)],
             [toggle("Thinking", "show_thinking"), toggle("Web search", "web_search")],
             [toggle("Long replies as a page", "long_pages")],
             [toggle("txt file after each reply", "export_txt")],
             [InlineKeyboardButton("💻 Switch to Coding mode", callback_data="set:agent_mode:on")],
         ])
-    wp = cfg("worker_provider", mode)
     return InlineKeyboardMarkup([
         head("🧠 Lead reasoning:"),
         [btn({"default": "default"}.get(x, x), "effort", x, e) for x in EFFORTS],
-        head("🔌 Lead provider:"),
-        [btn(p.split("/")[0], "provider", p, prov) for p in PROVIDERS],
-        [btn("Both", "provider", ",".join(PROVIDERS), prov), btn("Any provider", "provider", "any", prov)],
         head("👷 Parallel agents:"),
         [btn(str(n), "max_agents", n, cfg("max_agents", mode)) for n in (2, 3, 4, 6, 8)],
-        head("🔌 Agent provider:"),
-        [btn(p.split("/")[0], "worker_provider", p, wp) for p in config.WORKER_PROVIDERS[:3]]
-        + [btn("Any provider", "worker_provider", "any", wp)],
         [toggle("📝 Plan first", "plan_mode"), toggle("Thinking", "show_thinking")],
         [toggle("Web search", "web_search"), toggle("Long as a page", "long_pages")],
         [toggle("🎭 Persona voice", "persona_voice"), toggle("txt after each reply", "export_txt")],
@@ -2702,9 +2738,9 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         "📊 <b>Status</b>",
         "",
         f"• <b>Version:</b> {'💻 Coding' if cfg('agent_mode') else '💬 Chat'}",
-        f"• <b>Lead:</b> <code>{esc(str(cfg('model', 'agent')))}</code> · {esc(str(cfg('provider', 'agent')))} · "
+        f"• <b>Lead:</b> <code>{esc(str(cfg('model', 'agent')))}</code> · {esc(provider_text(cfg('model', 'agent')))} · "
         f"effort {esc(str(cfg('effort', 'agent')))}",
-        f"• <b>Agents:</b> <code>{esc(str(cfg('worker_model', 'agent')))}</code> · {esc(str(cfg('worker_provider', 'agent')))} · "
+        f"• <b>Agents:</b> <code>{esc(str(cfg('worker_model', 'agent')))}</code> · {esc(provider_text(cfg('worker_model', 'agent')))} · "
         f"up to {_max_agents()} in parallel",
         f"• <b>Project:</b> <code>{esc(ws.name)}</code> — {n} files · {human(size)} · git: {git}",
         f"• <b>Plan mode:</b> {'on' if cfg('plan_mode', 'agent') else 'off'} · "
@@ -2815,6 +2851,10 @@ async def cmd_doctor(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
             line(False, f"GitHub token rejected: {esc(str(e)[:120])}")
     else:
         line(None, "GitHub not connected (add the GH_PAT secret)")
+    for label, mode, key in (("Chat", "chat", "model"), ("Coding lead", "agent", "model"),
+                             ("Coding agents", "agent", "worker_model")):
+        m = cfg(key, mode)
+        line(True, f"{label}: <code>{esc(str(m))}</code> on {esc(provider_text(m))} (fixed, no fallbacks)")
     line(vault.enabled() or None, "PERSONA_KEY set — persona and rules encrypted" if vault.enabled()
          else "PERSONA_KEY missing — persona and rules stored unencrypted")
     for tool in ("git", "python3", "node", "npm"):
@@ -3249,7 +3289,7 @@ def main() -> None:
     if OWNER_ID == 0:
         log.warning("OWNER_ID is not set — owner commands won't work for anyone.")
     load_state()
-    log.info("Bot running via OpenRouter with model %s and provider %s", cfg("model"), cfg("provider"))
+    log.info("Bot running via OpenRouter with model %s on %s", cfg("model"), provider_text(cfg("model")))
     build_app().run_polling(allowed_updates=Update.ALL_TYPES)
 
 

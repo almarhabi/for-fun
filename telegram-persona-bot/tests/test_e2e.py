@@ -30,6 +30,7 @@ bot.TELEGRAPH_FILE = DATA / "telegraph.json"
 bot.tph = telegraph.Telegraph(bot.TELEGRAPH_FILE, short_name="TestBot")
 bot.EDIT_INTERVAL = 0.15
 bot.GROUP_WAIT = 0.4
+bot.CAPTURE_REFRESH = 0.15
 
 # ---------------- Fake Telegram server ----------------
 S = {"lock": threading.Lock(), "updates": [], "uid": 1, "mid": 1000, "msgs": {}, "calls": [], "flaky": False}
@@ -510,8 +511,9 @@ async def scenario():
     check("openrouter: reasoning_details passed back in tool round",
           MODEL_CALLS[-1]["messages"][-2].get("reasoning_details") == [{"type": "reasoning.text", "text": "The user asks about Kimi, I need to search.", "index": 0, "format": "unknown"}],
           MODEL_CALLS[-1]["messages"][-2])
-    check("openrouter: provider + reasoning sent", MODEL_CALLS[0]["model"] == "moonshotai/kimi-k3.1-pro" and
-          MODEL_CALLS[0]["extra_body"] == {"reasoning": {"enabled": True}, "provider": {"only": ["relace/fp4", "inference-net/mxfp4/us"], "allow_fallbacks": False}},
+    check("openrouter: DeepSeek on its fixed provider + reasoning",
+          MODEL_CALLS[0]["model"] == "deepseek/deepseek-v4.1-flash-1017" and
+          MODEL_CALLS[0]["extra_body"] == {"reasoning": {"enabled": True}, "provider": {"only": ["deepinfra/fp8"], "allow_fallbacks": False}},
           MODEL_CALLS[0].get("extra_body"))
 
     # 2b) Right-to-left content still displays correctly (display only — never sent to the model).
@@ -578,19 +580,34 @@ async def scenario():
     SCRIPT["no_tools"] = False
     bot.no_tools.clear()
 
-    # 5d) Reasoning effort and provider from the settings
+    # 5d) Reasoning effort from the settings; the provider is fixed per model (old saved values are ignored)
     bot.save_setting("effort", "max")
-    bot.save_setting("provider", "any")
+    bot.save_setting("provider", "any")                       # a value saved by an older version
     SCRIPT["rounds"] = [text_deltas("OK")]
     user_msg("settings test")
     await wait_idle()
-    check("settings: effort max -> xhigh, provider any", MODEL_CALLS[-1]["extra_body"] == {"reasoning": {"effort": "xhigh"}}, MODEL_CALLS[-1]["extra_body"])
-    bot.save_setting("provider", "inference-net/mxfp4/us")
-    user_msg("single provider")
+    check("settings: effort max -> xhigh, provider stays fixed", MODEL_CALLS[-1]["extra_body"] == {
+        "reasoning": {"effort": "xhigh"}, "provider": {"only": ["deepinfra/fp8"], "allow_fallbacks": False}},
+          MODEL_CALLS[-1]["extra_body"])
+    bot.save_setting("model", "moonshotai/kimi-k3.1-pro")     # an old model name saved in the settings
+    user_msg("old model")
     await wait_idle()
-    check("settings: single provider", MODEL_CALLS[-1]["extra_body"]["provider"] == {"only": ["inference-net/mxfp4/us"], "allow_fallbacks": False}, MODEL_CALLS[-1]["extra_body"])
+    check("settings: old Kimi setting moves to DeepSeek", MODEL_CALLS[-1]["model"] == "deepseek/deepseek-v4.1-flash-1017"
+          and MODEL_CALLS[-1]["extra_body"]["provider"] == {"only": ["deepinfra/fp8"], "allow_fallbacks": False},
+          (MODEL_CALLS[-1]["model"], MODEL_CALLS[-1]["extra_body"]))
+    bot.save_setting("model", "z-ai/glm-5.3-flash")
+    user_msg("glm model")
+    await wait_idle()
+    check("settings: GLM Flash gets relace", MODEL_CALLS[-1]["model"] == "z-ai/glm-5.3-flash"
+          and MODEL_CALLS[-1]["extra_body"]["provider"] == {"only": ["relace/fp4"], "allow_fallbacks": False},
+          MODEL_CALLS[-1]["extra_body"])
+    kb_cbs = [str(b.callback_data or "") for m in ("chat", "agent")
+              for row in bot.settings_keyboard(m).inline_keyboard for b in row]
+    check("settings: no provider buttons", not any("provider" in c for c in kb_cbs), kb_cbs)
+    check("settings: provider not a /set option", "provider" not in bot.mode_params("chat")
+          and "worker_provider" not in bot.mode_params("agent"))
     bot.save_setting("effort", "default")
-    bot.save_setting("provider", bot.DEFAULT_PROVIDER)
+    bot.save_setting("model", None)
 
     # 6) A very long reply → one Telegra.ph page (no splitting, nothing lost)
     long_md = "\n\n".join(f"## Section {i}\n**Important point** number {i}: " + "some long text " * 40 for i in range(12))
@@ -693,11 +710,19 @@ async def scenario():
     # multi-message input mode
     user_msg("/setpersona")
     await wait_idle()
+    first_prompt = [m for m in bot_msgs() if "Persona input mode" in (m.get("text") or "")][-1]
     user_msg("/part one starts with a slash")
     user_msg("part two")
     await wait_idle()
-    prompt = [m for m in bot_msgs() if "Persona input mode" in (m.get("text") or "")][-1]
-    check("persona capture: counter updated", "2" in strip(prompt["text"]), prompt["text"])
+    await asyncio.sleep(0.4)
+    prompts = [m for m in bot_msgs() if "Persona input mode" in (m.get("text") or "")]
+    prompt = prompts[-1] if prompts else {}
+    check("persona capture: counter updated", "2</b> parts" in prompt.get("text", ""), prompt.get("text"))
+    check("persona capture: Save button is the newest message", last_bot().get("message_id") == prompt.get("message_id")
+          and cb_of(prompt, "persona:save"), last_bot().get("text"))
+    check("persona capture: old prompt removed", first_prompt["message_id"] not in S["msgs"] and len(prompts) == 1,
+          [m["message_id"] for m in prompts])
+    check("persona capture: preview shown", "part two" in prompt.get("text", ""), prompt.get("text"))
     press("persona:save", prompt["message_id"])
     await wait_idle()
     check("persona capture: exact join", bot.load_persona() == "/part one starts with a slash\npart two", repr(bot.load_persona()))
@@ -1079,8 +1104,8 @@ async def agent_scenario(app):
     check("team: lead request (kimi, high effort, usage)", lc["extra_body"]["reasoning"] == {"effort": "high"}
           and lc["extra_body"]["usage"] == {"include": True} and "dispatch_agents" in tool_names(lc), lc["extra_body"])
     wc = worker_calls("api")[0]
-    check("team: worker = GLM via baidu", wc["model"] == "z-ai/glm-5.3"
-          and wc["extra_body"]["provider"] == {"only": ["baidu/fp8"], "allow_fallbacks": False}, wc["extra_body"])
+    check("team: worker = GLM-5.3 Flash via relace", wc["model"] == "z-ai/glm-5.3-flash"
+          and wc["extra_body"]["provider"] == {"only": ["relace/fp4"], "allow_fallbacks": False}, wc["extra_body"])
     check("team: worker can't dispatch", "dispatch_agents" not in tool_names(wc) and "write_file" in tool_names(wc))
     msgs = bot_msgs()
     reply = last_bot()
@@ -1533,6 +1558,113 @@ async def agent_scenario(app):
     check("no invalid/raw html (code)", not PROBLEMS, PROBLEMS[:5])
 
 
+async def speed_scenario(app):
+    """The speed features: parallel tool calls, pre-loaded agents, diffs for the lead, instant syntax checks,
+    compaction of superseded results, and the live timer."""
+    import agent as A
+    print("\n— ⚡ Speed —")
+    # run_batch: consecutive read-only calls run together; results keep their order; writes stay sequential
+    starts = {}
+
+    async def run_one(c):
+        starts[c["id"]] = time.monotonic()
+        await asyncio.sleep(0.2)
+        return c["id"]
+    calls = [{"id": "a", "name": "read_file", "args": "{}"}, {"id": "b", "name": "grep", "args": "{}"},
+             {"id": "c", "name": "write_file", "args": "{}"}, {"id": "d", "name": "read_file", "args": "{}"}]
+    t0 = time.monotonic()
+    out = await A.run_batch(calls, run_one)
+    took = time.monotonic() - t0
+    check("speed: batch keeps order", out == ["a", "b", "c", "d"], out)
+    check("speed: reads run in parallel", abs(starts["a"] - starts["b"]) < 0.1 and starts["c"] - starts["a"] >= 0.19
+          and took < 0.75, (starts, took))
+    check("speed: parallel_safe", A.parallel_safe("read_file", "{}") and A.parallel_safe("gh_pr", '{"action":"get"}')
+          and not A.parallel_safe("gh_pr", '{"action":"merge"}') and not A.parallel_safe("run", "{}")
+          and not A.parallel_safe("gh_actions", '{"action":"watch"}') and not A.parallel_safe("job", '{"action":"kill"}'))
+
+    # compact_stale: an older read of the same file / run of the same command is replaced, the newest stays
+    big = "x" * 5000
+
+    def call(cid, name, args):
+        return {"role": "assistant", "content": "", "tool_calls": [
+            {"id": cid, "type": "function", "function": {"name": name, "arguments": json.dumps(args)}}]}
+    msgs = [{"role": "system", "content": "s"}, {"role": "user", "content": "u"},
+            call("1", "read_file", {"path": "a.py"}), {"role": "tool", "tool_call_id": "1", "content": "OLD" + big},
+            call("2", "run", {"command": "pytest"}), {"role": "tool", "tool_call_id": "2", "content": "RUN1" + big},
+            call("3", "read_file", {"path": "b.py"}), {"role": "tool", "tool_call_id": "3", "content": "B" + big},
+            call("4", "write_file", {"path": "b.py", "content": "W1" + big}), {"role": "tool", "tool_call_id": "4", "content": "ok"},
+            call("5", "read_file", {"path": "a.py"}), {"role": "tool", "tool_call_id": "5", "content": "NEW" + big},
+            call("6", "run", {"command": "pytest"}), {"role": "tool", "tool_call_id": "6", "content": "RUN2" + big},
+            call("7", "write_file", {"path": "b.py", "content": "W2" + big}), {"role": "tool", "tool_call_id": "7", "content": "ok"}]
+    check("speed: compaction waits for enough stale text", not A.compact_stale(msgs, 10**6))
+    check("speed: compaction fires", A.compact_stale(msgs, 1000))
+    tool = {m["tool_call_id"]: m["content"] for m in msgs if m["role"] == "tool"}
+    check("speed: superseded results compacted", tool["1"].startswith(A.STUB) and tool["2"].startswith(A.STUB)
+          and tool["3"].startswith(A.STUB), {k: v[:20] for k, v in tool.items()})
+    check("speed: newest results kept in full", tool["5"] == "NEW" + big and tool["6"] == "RUN2" + big)
+    wargs = [json.loads(m["tool_calls"][0]["function"]["arguments"]) for m in msgs if m.get("tool_calls")
+             and m["tool_calls"][0]["function"]["name"] == "write_file"]
+    check("speed: older rewrite content compacted, newest kept", len(wargs[0]["content"]) < 300
+          and wargs[1]["content"] == "W2" + big)
+    check("speed: compaction is idempotent", not A.compact_stale(msgs, 1000))
+
+    # quick_check: real syntax errors only
+    w = bot.Workspace(bot.ws_base(), "speedcheck").ensure()
+    for name, text in (("ok.py", "x = 1\n"), ("bad.py", "def f(:\n  pass\n"), ("bad.json", '{"a": }'),
+                       ("tsconfig.json", '{ // comments are fine here\n}'), ("bad.toml", "a = = 1"),
+                       ("ok.json", '{"a": 1}')):
+        (w.root / name).write_text(text)
+    res = {n: await A.quick_check(w, w.root / n, n) for n in ("ok.py", "bad.py", "bad.json", "tsconfig.json",
+                                                              "bad.toml", "ok.json")}
+    check("speed: syntax check catches errors", "bad.py:1" in res["bad.py"] and "invalid JSON" in res["bad.json"]
+          and "invalid TOML" in res["bad.toml"], res)
+    check("speed: syntax check stays quiet on valid files", not res["ok.py"] and not res["ok.json"]
+          and not res["tsconfig.json"], res)
+
+    # End to end in the Coding version: a pre-loaded agent edits without reading, the lead gets the diff
+    bot.save_setting("agent_mode", True)
+    ws = bot.get_ws()
+    (ws.root / "spec.md").write_text("SPEC: greet() returns 'hi'\n")
+    (ws.root / "mod.py").write_text("def greet():\n    return 'hello'\n")
+    WORKERS.clear()
+    WORKERS["mod"] = [tc(("edit_file", {"path": "mod.py", "old_string": "'hello'", "new_string": "'hi'"}),
+                         ("write_file", {"path": "broken.py", "content": "def x(:\n"})),
+                      text_deltas("✅ done")]
+    SCRIPT["rounds"] = [
+        tc(("read_file", {"paths": ["spec.md", "mod.py"]}), ("grep", {"pattern": "greet"})),
+        tc(("dispatch_agents", {"tasks": [{"id": "mod", "title": "greet", "instructions": "make greet return hi",
+                                            "files": ["mod.py", "broken.py"], "read_first": ["spec.md"]}]})),
+        text_deltas("## Done\ngreet now returns hi."),
+    ]
+    n0 = len(MODEL_CALLS)
+    user_msg("make greet return hi")
+    await wait_idle(timeout=40)
+    lead = [c for c in MODEL_CALLS[n0:] if c.get("model") == bot.cfg("model", "agent")]
+    multi = next((r for c in lead for r in tool_results(c) if "spec.md" in r and "mod.py" in r and "SPEC" in r), "")
+    check("speed: read_file paths reads several files", "SPEC" in multi and "return 'hello'" in multi, multi[:200])
+    wc = [c for c in MODEL_CALLS[n0:] if c.get("model") == bot.cfg("worker_model", "agent")
+          and "Task id: mod" in str(c["messages"][1]["content"])]
+    brief = str(wc[0]["messages"][1]["content"]) if wc else ""
+    check("speed: agent gets files pre-loaded", "Files pre-loaded for you" in brief and "SPEC: greet()" in brief
+          and "return 'hello'" in brief, brief[-400:])
+    results_ = tool_results(wc[-1]) if wc else []
+    check("speed: pre-loaded file is editable without a read round",
+          any("mod.py" in r and "⛔" not in r for r in results_) and (ws.root / "mod.py").read_text().count("'hi'") == 1,
+          results_)
+    check("speed: syntax error reported in the same round", any("Syntax check failed" in r and "broken.py" in r
+                                                                 for r in results_), results_)
+    disp = next((json.loads(r) for c in lead for r in tool_results(c) if r.startswith('{"results"')), {})
+    d = (disp.get("results") or [{}])[0].get("diff", "")
+    check("speed: lead gets the agent's diff", "-    return 'hello'" in d and "+    return 'hi'" in d, d[:300])
+    work = next((x for x in reversed(bot_msgs()) if "Done after" in (x.get("text") or "")), {})
+    check("speed: final panel shows tokens line or stats", "Done after" in work.get("text", ""), work.get("text", "")[:200])
+    board = A.Board("p")
+    board.usage.add("m", {"prompt": 1500, "completion": 500, "cost": 0.01})
+    live = A.board_html(board, False)
+    check("speed: live panel shows elapsed time and tokens", "⏱ 0:0" in live and "2k tokens" in live and "$0.010" in live, live)
+    bot.save_setting("agent_mode", False)
+
+
 async def main():
     srv = ThreadingHTTPServer(("127.0.0.1", PORT), H)
     threading.Thread(target=srv.serve_forever, daemon=True).start()
@@ -1545,6 +1677,7 @@ async def main():
         try:
             await asyncio.wait_for(scenario(), 240)
             await asyncio.wait_for(agent_scenario(app), 300)
+            await asyncio.wait_for(speed_scenario(app), 120)
         finally:
             await app.updater.stop()
             await app.stop()

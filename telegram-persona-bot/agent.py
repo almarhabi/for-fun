@@ -1,6 +1,9 @@
-"""Coding mode: Kimi leads (plans and delegates), GLM agents execute in parallel inside a real workspace.
+"""Coding mode: the lead model plans and delegates, worker agents execute in parallel inside a real workspace.
 
 - Project tools (read/write/edit/search/commands) are shared by the lead and the agents.
+- Speed without losing quality: independent tool calls in one reply run at the same time, agents get the files
+  they need pre-loaded (no reading rounds), every edit gets an instant syntax check, the lead gets each agent's
+  diff (no re-reading rounds), and results that were superseded later are compacted.
 - dispatch_agents: schedules tasks in parallel with dependencies (depends_on) and a parallelism limit.
 - Each agent has a file scope and can't write inside another agent's scope (Claims), and can't overwrite a file
   it hasn't read or that changed since it read it — so parallel work never steps on itself.
@@ -36,10 +39,13 @@ def _fn(name: str, desc: str, props: dict, required: list[str] | None = None) ->
     return {"type": "function", "function": {"name": name, "description": desc, "parameters": params}}
 
 
-T_READ = _fn("read_file", "Read a project file (line numbers are for display only). For long files use offset/limit.",
+T_READ = _fn("read_file", "Read a project file (line numbers are for display only). For long files use offset/limit. "
+             "To read several files at once, send paths instead of path.",
              {"path": {"type": "string", "description": "Path relative to the project root"},
+              "paths": {"type": "array", "items": {"type": "string"},
+                        "description": "Several files to read in one call (whole files, up to 12)"},
               "offset": {"type": "integer", "description": "First line (1-based)"},
-              "limit": {"type": "integer", "description": "Number of lines (default 2000)"}}, ["path"])
+              "limit": {"type": "integer", "description": "Number of lines (default 2000)"}})
 T_WRITE = _fn("write_file", "Write a whole file (creates it and its folders if missing). For an existing file: read it "
               "first. For huge files write the first part, then continue with append=true.",
               {"path": {"type": "string"}, "content": {"type": "string", "description": "The full content"},
@@ -88,6 +94,9 @@ T_DISPATCH = _fn(
                   "description": "Files/folders/patterns this agent owns and may write"},
         "depends_on": {"type": "array", "items": {"type": "string"},
                        "description": "Task ids that must finish first (their reports are passed along)"},
+        "read_first": {"type": "array", "items": {"type": "string"},
+                       "description": "Existing files the agent needs (contracts, examples, files it edits): they are "
+                                      "loaded into its task up front, so it starts working right away"},
         "readonly": {"type": "boolean", "description": "Read/search/review only, no file edits"},
         "agent": {"type": "string", "description": "Agent type: coder (default) · explorer · reviewer · tester · "
                                                    "or a custom agent defined in the project (.agents/)"}},
@@ -283,6 +292,8 @@ class Env:
     max_parallel: int = 4
     max_tasks: int = 12
     worker_rounds: int = 40
+    preload_chars: int = 60_000      # files pre-loaded into an agent's task (read_first + its own files)
+    compact_chars: int = 30_000      # superseded results are compacted once they add up to this much
     cmd_timeout: int = 180
     max_timeout: int = 900
     web: WebFn | None = None
@@ -291,7 +302,7 @@ class Env:
     gh_token: str = ""
     on_status: Callable[[str], None] | None = None   # the live status line (e.g. while watching CI)
     gh_login: Callable[[], Awaitable[str]] | None = None
-    author: tuple = ("Kimi Agent", "agent@users.noreply.github.com")
+    author: tuple = ("Coding Agent", "agent@users.noreply.github.com")
     headers: dict = field(default_factory=dict)
     worker_prompt: str = ""
     # permission mode "ask": returns True if the owner approved (None = automatic, never asks)
@@ -354,25 +365,120 @@ def _fmt_run(command: str, r: dict, timeout: float) -> str:
     return f"$ {command}\n{clip(r['output']) or '(no output)'}\n[{status} · {r['seconds']:.1f}s]"
 
 
+def _read_one(ctx: "ToolCtx", path, offset, limit) -> str:
+    ws = ctx.env.ws
+    full = ws.resolve(path)
+    if full.is_file():
+        rel, h = ws.rel(full), ws.file_hash(full)
+        key = (rel, int(offset), int(limit))
+        if ctx.seen_reads.get(key) == h:
+            ctx.read_hashes[rel] = h
+            return (f"[{rel}: same content you already read in this session and it hasn't changed — "
+                    "refer to that earlier result instead of re-reading]")
+    out = ws.read(path, offset, limit)
+    if full.is_file():
+        ctx.read_hashes[rel] = h
+        ctx.seen_reads[key] = h
+    return out
+
+
+_JSONC = re.compile(r"(^|/)(tsconfig[^/]*|jsconfig[^/]*|\.eslintrc|devcontainer|settings|launch|tasks|extensions)\.json$")
+_ESM = re.compile(r"^\s*(import|export)\s", re.M)
+
+
+async def quick_check(ws: Workspace, full, rel: str) -> str:
+    """An instant syntax check of the file that was just written, so a typo is caught in the same round
+    instead of costing a run → error → fix round trip later. Only real errors are reported."""
+    try:
+        if not full.is_file() or full.stat().st_size > 2_000_000:
+            return ""
+        suffix = full.suffix.lower()
+        if suffix not in (".py", ".json", ".toml", ".js", ".mjs", ".cjs", ".sh"):
+            return ""
+        text = full.read_text(encoding="utf-8", errors="replace")
+        err = ""
+        if suffix == ".py":
+            try:
+                compile(text, rel, "exec", dont_inherit=True)
+            except SyntaxError as e:
+                err = f"{rel}:{e.lineno}:{e.offset or 0}: {e.msg}" + (f"\n    {e.text.rstrip()}" if e.text else "")
+        elif suffix == ".json" and not _JSONC.search(rel) and text.strip():
+            try:
+                json.loads(text)
+            except json.JSONDecodeError as e:
+                err = f"{rel}:{e.lineno}:{e.colno}: invalid JSON — {e.msg}"
+        elif suffix == ".toml":
+            import tomllib
+            try:
+                tomllib.loads(text)
+            except tomllib.TOMLDecodeError as e:
+                err = f"{rel}: invalid TOML — {e}"
+        else:
+            import shlex
+            if suffix == ".sh":
+                cmd = f"bash -n {shlex.quote(rel)}"
+            elif shutil.which("node") and (suffix != ".js" or not _ESM.search(text)):
+                cmd = f"node --check {shlex.quote(rel)}"
+            else:
+                return ""
+            r = await ws.run(cmd, 15)
+            if not r["timed_out"] and r["code"]:
+                err = clip(r["output"].strip(), 1500)
+        return f"\n⚠️ Syntax check failed — fix it now:\n{err}" if err else ""
+    except Exception:  # the check is a bonus — it never breaks an edit
+        return ""
+
+
+def parallel_safe(name: str, raw_args) -> bool:
+    """Tool calls that only read can run at the same time as each other."""
+    if name in ("read_file", "list_files", "grep", "web_search", "open_url", "gh_list_repos", "gh_read_file",
+                "gh_list_dir"):
+        return True
+    args = llm.parse_args(raw_args) if isinstance(raw_args, str) else (raw_args or {})
+    if name == "job":
+        return (args or {}).get("action") in (None, "output", "list")
+    if name in ("gh_repo", "gh_pr", "gh_issue", "gh_actions"):
+        return args is not None and not is_gh_write(name, args) and args.get("action") != "watch"
+    return False
+
+
+async def run_batch(calls: list, run_one, safe=None) -> list:
+    """Runs one reply's tool calls in order, but each run of consecutive read-only calls runs at the same time.
+    Results come back in the original order."""
+    safe = safe or (lambda c: parallel_safe(c["name"], c["args"]))
+    out: list = [None] * len(calls)
+    i = 0
+    while i < len(calls):
+        j = i
+        while j < len(calls) and safe(calls[j]):
+            j += 1
+        if j - i > 1:
+            out[i:j] = await asyncio.gather(*(run_one(c) for c in calls[i:j]))
+            i = j
+        else:
+            out[i] = await run_one(calls[i])
+            i += 1
+    return out
+
+
 async def exec_ws(ctx: ToolCtx, name: str, args: dict) -> str:
     """Runs a project tool and returns text for the model. Expected errors come back as text instead of crashing the agent."""
     env, ws = ctx.env, ctx.env.ws
     try:
         if name == "read_file":
-            full = ws.resolve(args.get("path"))
-            offset, limit = args.get("offset") or 1, args.get("limit") or 2000
-            if full.is_file():
-                rel, h = ws.rel(full), ws.file_hash(full)
-                key = (rel, int(offset), int(limit))
-                if ctx.seen_reads.get(key) == h:
-                    ctx.read_hashes[rel] = h
-                    return (f"[{rel}: same content you already read in this session and it hasn't changed — "
-                            "refer to that earlier result instead of re-reading]")
-            out = ws.read(args.get("path"), offset, limit)
-            if full.is_file():
-                ctx.read_hashes[rel] = h
-                ctx.seen_reads[key] = h
-            return out
+            paths = args.get("paths") if isinstance(args.get("paths"), list) else None
+            if paths:
+                paths = [str(x) for x in paths if str(x).strip()][:12]
+                outs = []
+                for one in paths:
+                    try:
+                        outs.append(_read_one(ctx, one, 1, 2000))
+                    except WorkspaceError as e:
+                        outs.append(f"⛔ {one}: {e}")
+                return "\n\n".join(outs) or "⛔ paths is empty"
+            if not args.get("path"):
+                return "⛔ Send path (or paths for several files)"
+            return _read_one(ctx, args.get("path"), args.get("offset") or 1, args.get("limit") or 2000)
         if name == "list_files":
             return ws.list_files(args.get("pattern") or "**/*", args.get("path") or ".")
         if name == "grep":
@@ -402,6 +508,7 @@ async def exec_ws(ctx: ToolCtx, name: str, args: dict) -> str:
             else:
                 out = ws.edit(args.get("path"), str(args.get("old_string", "")), str(args.get("new_string", "")),
                               bool(args.get("replace_all")))
+            out += await quick_check(ws, full, rel)
             out += await run_hooks(ctx, rel)
             ctx.read_hashes[rel] = ws.file_hash(full)
             if ctx.state is not None:
@@ -490,6 +597,69 @@ def trim_context(messages: list, limit: int = 240_000, target: int = 140_000, ke
     return True
 
 
+STUB = "[superseded — a newer result for this appears later in the conversation; use that one]"
+
+
+def compact_stale(messages: list, min_chars: int = 30_000) -> bool:
+    """Saves tokens with zero information loss: results that a later call made obsolete are replaced by a short note —
+    an earlier read of a file that was read again (same range) or fully rewritten, an earlier run of a command that
+    ran again, a repeated search/listing, and the content of an earlier full write of a file that was rewritten.
+    Like trimming, it only fires in large, rare steps so the conversation's start stays stable for caching."""
+    calls: dict[str, tuple] = {}     # tool_call_id → (name, args, assistant message, call)
+    for m in messages:
+        if m.get("role") == "assistant":
+            for c in m.get("tool_calls") or []:
+                calls[c["id"]] = (c["function"]["name"], llm.parse_args(c["function"]["arguments"]) or {}, c)
+    events = []  # (position, key-kind, key, target) in conversation order
+    for i, m in enumerate(messages):
+        if m.get("role") != "tool" or m.get("tool_call_id") not in calls:
+            continue
+        name, a, c = calls[m["tool_call_id"]]
+        if name == "read_file":
+            if isinstance(a.get("paths"), list):
+                key = ("read", tuple(map(str, a["paths"])), 1, 2000)
+            else:
+                key = ("read", (str(a.get("path", "")).removeprefix("./"),), int(a.get("offset") or 1),
+                       int(a.get("limit") or 2000))
+            events.append((i, key, m))
+        elif name == "write_file" and not a.get("append"):
+            path = str(a.get("path", "")).removeprefix("./")
+            events.append((i, ("wrote", path), c))
+        elif name == "run" and not a.get("background"):
+            events.append((i, ("run", str(a.get("command", "")).strip(), str(a.get("cwd") or ".")), m))
+        elif name in ("grep", "list_files"):
+            events.append((i, (name, json.dumps(a, sort_keys=True)), m))
+    stale, last = [], {}
+    for pos, key, target in reversed(events):  # newest first: anything older than a newer same key is stale
+        if key[0] == "read":
+            newer = last.get(key, -1) > pos or (len(key[1]) == 1 and last.get(("wrote", key[1][0]), -1) > pos)
+        else:
+            newer = last.get(key, -1) > pos
+        if newer:
+            stale.append((key, target))
+        last.setdefault(key, pos)
+
+    def stale_size(key, target) -> int:
+        if key[0] == "wrote":
+            a = llm.parse_args(target["function"]["arguments"]) or {}
+            return len(a.get("content") or "") if len(a.get("content") or "") > 400 else 0
+        content = str(target.get("content") or "")
+        return len(content) if len(content) > 400 and not content.startswith(STUB) else 0
+
+    if sum(stale_size(k, t) for k, t in stale) < min_chars:
+        return False
+    for key, target in stale:
+        if not stale_size(key, target):
+            continue
+        if key[0] == "wrote":
+            a = llm.parse_args(target["function"]["arguments"]) or {}
+            a["content"] = a["content"][:120] + "…[an older version — the file was rewritten later]"
+            target["function"]["arguments"] = json.dumps(a, ensure_ascii=False)
+        else:
+            target["content"] = STUB + "\n" + str(target["content"])[:160]
+    return True
+
+
 _PATH_RE = re.compile(r'"path"\s*:\s*"([^"]{1,200})')
 
 
@@ -534,7 +704,8 @@ def worker_system(env: Env) -> str:
         f"<project_tree>\n{env.ws.tree(150)}\n</project_tree>", project_memory(env.ws)) if x)
 
 
-def worker_brief(st: AgentState, instructions: str, others: list[AgentState], deps: list[AgentState]) -> str:
+def worker_brief(st: AgentState, instructions: str, others: list[AgentState], deps: list[AgentState],
+                 preloaded: str = "") -> str:
     parts = [f"Task id: {st.id}", f"Title: {st.title}"]
     if st.readonly:
         parts.append("⚠️ Read/review-only task: do not modify any file.")
@@ -548,11 +719,45 @@ def worker_brief(st: AgentState, instructions: str, others: list[AgentState], de
         files = ", ".join(sorted(d.files)) or "—"
         parts.append(f"## Result of a task you depend on: {d.id} — {d.title}\n"
                      f"Files it changed: {files}\n{clip(d.report, 3500)}")
+    if preloaded:
+        parts.append("## Files pre-loaded for you\nThese are the current contents — already read, so don't read them "
+                     "again; you can edit them directly.\n\n" + preloaded)
     return "\n\n".join(parts)
 
 
-async def run_worker(env: Env, st: AgentState, brief: str, claims: Claims) -> None:
-    ctx = ToolCtx(env, st.id, st.readonly, claims, st)
+_GLOB_CHARS = set("*?[{")
+
+
+def preload(ctx: "ToolCtx", paths: list, budget: int) -> str:
+    """Reads the files an agent needs before its first round (read_first + the exact files in its scope), so it
+    starts working at once instead of spending rounds reading. They count as read, so it can edit them directly."""
+    ws, out, used, seen = ctx.env.ws, [], 0, set()
+    for raw in paths:
+        p = str(raw).strip()
+        if not p or _GLOB_CHARS & set(p) or p in seen:
+            continue
+        seen.add(p)
+        try:
+            full = ws.resolve(p)
+        except WorkspaceError:
+            continue
+        if not full.is_file() or full.stat().st_size > budget - used:
+            continue
+        try:
+            text = _read_one(ctx, p, 1, 2000)
+        except WorkspaceError:
+            continue
+        if text.startswith("[") and ("binary file" in text or "the file is empty" in text):
+            continue
+        if used + len(text) > budget:
+            break
+        out.append(text)
+        used += len(text)
+    return "\n\n".join(out)
+
+
+async def run_worker(env: Env, st: AgentState, brief: str, claims: Claims, ctx: "ToolCtx | None" = None) -> None:
+    ctx = ctx or ToolCtx(env, st.id, st.readonly, claims, st)
     tools = worker_tools(st.readonly, env.web_tools if env.web else [])
     spec = agent_types(env.ws).get(st.kind) or BUILTIN_AGENTS["coder"]
     system = worker_system(env) + (f"\n\n## Your role in this task ({st.kind})\n{spec['prompt']}" if spec.get("prompt") else "")
@@ -571,6 +776,8 @@ async def run_worker(env: Env, st: AgentState, brief: str, claims: Claims) -> No
             tk = {"tools": tools}
         if trim_context(messages, limit=200_000, target=120_000):
             ctx.seen_reads.clear()  # old results were shortened — the next read must come back in full
+        else:
+            compact_stale(messages, env.compact_chars)
         st.activity = "💭 thinking…"
         res = await call_model(env, messages, kw, tk, on_delta, on_retry)
         st.rounds += 1
@@ -580,19 +787,25 @@ async def run_worker(env: Env, st: AgentState, brief: str, claims: Claims) -> No
             st.activity = ""
             return
         messages.append(llm.assistant_message(res.content, res.calls, res.details))
-        for c in res.calls:
+        web_names = {t["function"]["name"] for t in env.web_tools}
+
+        async def one(c: dict) -> str:
             env.board.tool_calls += 1
             args = llm.parse_args(c["args"])
             st.activity = describe(c["name"], c["args"]) or f"🛠 {c['name']}"
             if args is None:
-                result = ("⛔ The tool arguments aren't valid JSON (probably cut off because they were too long). "
-                          "For a huge file: write a part with write_file, then continue with append=true.")
-            elif c["name"] in WS_NAMES:
-                result = await exec_ws(ctx, c["name"], args)
-            elif env.web and c["name"] in {t["function"]["name"] for t in env.web_tools}:
-                result, _ = await env.web(c["name"], c["args"])
-            else:
-                result = f"⛔ Tool not available to you: {c['name']}"
+                return ("⛔ The tool arguments aren't valid JSON (probably cut off because they were too long). "
+                        "For a huge file: write a part with write_file, then continue with append=true.")
+            if c["name"] in WS_NAMES:
+                return await exec_ws(ctx, c["name"], args)
+            if env.web and c["name"] in web_names:
+                return (await env.web(c["name"], c["args"]))[0]
+            return f"⛔ Tool not available to you: {c['name']}"
+
+        results = await run_batch(res.calls, one)
+        if len(res.calls) > 1:
+            st.activity = f"⚡ {len(res.calls)} tools done"
+        for c, result in zip(res.calls, results):
             messages.append({"role": "tool", "tool_call_id": c["id"], "content": result})
 
 
@@ -617,6 +830,10 @@ def _cycle(graph: dict[str, list[str]]) -> list[str] | None:
         if state.get(n) is None and visit(n):
             return path
     return None
+
+
+DIFF_PER_AGENT = 6_000
+DIFF_BUDGET = 24_000
 
 
 async def dispatch(env: Env, raw_tasks) -> str:
@@ -647,9 +864,10 @@ async def dispatch(env: Env, raw_tasks) -> str:
         if kind not in types:
             return f"⛔ Unknown agent type \"{kind}\". Available: {', '.join(types)}"
         ro = bool(t.get("readonly")) or bool(types[kind].get("readonly"))
-        specs.append((tid, str(t.get("title") or raw_id)[:80], instructions, files, deps, ro, kind))
+        first = [str(f) for f in (t.get("read_first") or []) if isinstance(f, str)][:30]
+        specs.append((tid, str(t.get("title") or raw_id)[:80], instructions, files, deps, ro, kind, first))
     graph = {}
-    for tid, _, _, _, deps, _, _ in specs:
+    for tid, _, _, _, deps, _, _, _ in specs:
         unknown = [d for d in deps if d not in rename]
         if unknown:
             return f"⛔ depends_on has ids that aren't in this batch: {', '.join(unknown)}"
@@ -660,11 +878,13 @@ async def dispatch(env: Env, raw_tasks) -> str:
     board.batches += 1
     states: dict[str, AgentState] = {}
     instr: dict[str, str] = {}
+    to_read: dict[str, list] = {}
     claims = Claims()
-    for tid, title, instructions, files, _, ro, kind in specs:
+    for tid, title, instructions, files, _, ro, kind, first in specs:
         st = AgentState(tid, title, ro, graph[tid], files, kind)
         states[tid] = board.agents[tid] = st
         instr[tid] = instructions
+        to_read[tid] = first + ([] if ro else files)
         if not ro:
             claims.register(tid, files)
     done = {tid: asyncio.Event() for tid in states}
@@ -687,9 +907,12 @@ async def dispatch(env: Env, raw_tasks) -> str:
                 st.status, st.started, st.activity = "running", time.monotonic(), "💭 reading the task…"
                 others = [o for o in states.values() if o is not st and o.status in ("waiting", "running")
                           and st.id not in o.deps and o.id not in st.deps]
-                brief = worker_brief(st, instr[st.id], others, [states[d] for d in st.deps])
+                ctx = ToolCtx(env, st.id, st.readonly, claims, st)
+                # loaded when it starts (after its dependencies), so it sees their latest files
+                pre = preload(ctx, to_read[st.id], env.preload_chars) if env.preload_chars > 0 else ""
+                brief = worker_brief(st, instr[st.id], others, [states[d] for d in st.deps], pre)
                 try:
-                    await run_worker(env, st, brief, claims)
+                    await run_worker(env, st, brief, claims, ctx)
                 except asyncio.CancelledError:
                     st.status, st.activity = "stopped", ""
                     raise
@@ -706,14 +929,22 @@ async def dispatch(env: Env, raw_tasks) -> str:
 
     await asyncio.gather(*(run_one(s) for s in states.values()))
 
-    results = []
+    results, diff_budget = [], DIFF_BUDGET
     for st in states.values():
-        results.append({"id": st.id, "title": st.title, "status": st.status,
-                        "files_changed": sorted(st.files), "rounds": st.rounds,
-                        "seconds": round(st.seconds), "report": clip(st.report, 5000)})
+        r = {"id": st.id, "title": st.title, "status": st.status,
+             "files_changed": sorted(st.files), "rounds": st.rounds,
+             "seconds": round(st.seconds), "report": clip(st.report, 5000)}
+        if st.files and diff_budget > 0:  # the lead reviews the actual change here instead of re-reading every file
+            d = env.changes.diff(sorted(st.files))
+            if d.strip():
+                d = clip(d, min(DIFF_PER_AGENT, diff_budget))
+                diff_budget -= len(d)
+                r["diff"] = d
+        results.append(r)
     ok = sum(r["status"] == "done" for r in results)
-    note = (f"{ok}/{len(results)} succeeded. Review the reports, read the important files, and run verification "
-            "before treating it as done." if ok else
+    note = (f"{ok}/{len(results)} succeeded. Each result carries its diff — review it there (read a file only when "
+            "the diff was cut or you need its surroundings), then run the verification yourself before treating it "
+            "as done." if ok else
             "No task succeeded — look at the reasons and decide: fix it yourself, or re-delegate with clearer instructions.")
     return json.dumps({"results": results, "note": note}, ensure_ascii=False)
 
@@ -834,6 +1065,9 @@ def describe(name: str, raw_args: str) -> str | None:
     a = llm.parse_args(raw_args) or {}
     p = str(a.get("path") or "")
     if name == "read_file":
+        if isinstance(a.get("paths"), list) and a["paths"]:
+            names = ", ".join(str(x) for x in a["paths"][:4]) + ("…" if len(a["paths"]) > 4 else "")
+            return f"📄 Reading {len(a['paths'])} files: {names}"
         return f"📄 Reading {p}"
     if name == "write_file":
         return f"➕ Appending to {p}" if a.get("append") else f"✍️ Writing {p}"
@@ -867,6 +1101,10 @@ def describe(name: str, raw_args: str) -> str | None:
 
 _ICON = {"waiting": "⏳", "running": "🟢", "done": "✅", "failed": "❌", "skipped": "⏭", "stopped": "⏹"}
 _TODO = {"pending": "⬜", "in_progress": "🔄", "completed": "✅"}
+
+
+def short_tokens(n: int) -> str:
+    return f"{n / 1_000_000:.1f}M" if n >= 1_000_000 else f"{n / 1000:.0f}k" if n >= 1000 else str(n)
 
 
 def _mm(seconds: float) -> str:
@@ -917,7 +1155,13 @@ def board_html(board: Board, final: bool, files: list[dict] | None = None, statu
         return _l(head + (f" — {', '.join(extra)}" if extra else ""))
 
     if not final:
-        rows = [_l(f"🛠 <b>Working…</b> · 📁 <code>{esc(board.project)}</code>")]
+        u = board.usage.total()
+        live = [f"⏱ {_mm(time.monotonic() - board.started)}"]
+        if u["prompt"] + u["completion"]:
+            live.append(f"{short_tokens(u['prompt'] + u['completion'])} tokens")
+        if u["cost"]:
+            live.append(f"${u['cost']:.3f}")
+        rows = [_l(f"🛠 <b>Working…</b> · 📁 <code>{esc(board.project)}</code> · " + " · ".join(live))]
         if todo_lines:
             rows += ["", _l("📋 <b>Plan</b>"), *todo_lines]
         if agents:
@@ -939,9 +1183,11 @@ def board_html(board: Board, final: bool, files: list[dict] | None = None, statu
         stats.append(f"📝 {n} file" + ("s" if n != 1 else "") + f" (+{plus} −{minus})")
     if board.commands:
         stats.append(f"▶️ {len(board.commands)} command" + ("s" if len(board.commands) != 1 else ""))
-    cost = board.usage.total()["cost"]
-    if cost:
-        stats.append(f"💰 ${cost:.3f}")
+    u = board.usage.total()
+    if u["prompt"] + u["completion"]:
+        stats.append(f"🔢 {short_tokens(u['prompt'] + u['completion'])} tokens")
+    if u["cost"]:
+        stats.append(f"💰 ${u['cost']:.3f}")
     if stats:
         head.append(_l(" · ".join(stats)))
     body = []
@@ -999,6 +1245,7 @@ def usage_line(u: dict) -> str:
     return f"{u['prompt'] + u['completion']:,} tokens ({u['calls']} requests) · ${u['cost']:.4f}"
 
 
-__all__ = ["Env", "Board", "ToolCtx", "AgentState", "Usage", "dispatch", "execute_lead", "lead_tools",
+__all__ = ["Env", "Board", "ToolCtx", "AgentState", "Usage", "dispatch", "execute_lead", "lead_tools", "run_batch",
+           "parallel_safe", "compact_stale", "quick_check", "preload",
            "worker_tools", "lead_system", "board_html", "work_log", "describe", "trim_context", "TERMINAL",
            "reports_markdown", "usage_line", "files_summary", "human"]
