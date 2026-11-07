@@ -1761,7 +1761,20 @@ async def backend_scenario(app):
             self.log.append((self.name, kw))
             if self.fail:
                 raise status_error(self.fail.pop(0))
+            if kw.get("stream"):
+                return FakeNimStream(getattr(self, "first_token_delay", 0))
             return "stream-from-" + self.name
+
+    class FakeNimStream:
+        def __init__(self, delay):
+            self.delay, self.closed = delay, False
+
+        async def __anext__(self):
+            await asyncio.sleep(self.delay)
+            return "chunk"
+
+        async def close(self):
+            self.closed = True
 
     def make_pool(rpm=40, max_wait=0.05):
         log, made = [], {}
@@ -1882,6 +1895,15 @@ async def backend_scenario(app):
     check("/doctor: pings every key", "key 1 — answers" in t and "key 2 — key rejected (401)" in t
           and "key 3 — answers" in t and "OpenRouter" in t, t)
     check("/doctor: shows the load per key", "/40" in t, t)
+    slow_pool, _, slow_made = make_pool()
+    slow_made["k1"].first_token_delay = 5
+    ok, what, _ = await slow_pool.ping(slow_pool.slots[0], "m", timeout=1.0)
+    check("ping: accepted key + slow model → ⚠️ not ❌", ok is None and "key accepted" in what, (ok, what))
+    ok, what, _ = await slow_pool.ping(slow_pool.slots[1], "m", timeout=1.0)
+    check("ping: working key → first token time", ok is True and "first token" in what, (ok, what))
+    slow_made["k3"].fail = [403]
+    ok, what, _ = await slow_pool.ping(slow_pool.slots[2], "m", timeout=1.0)
+    check("ping: wrong key (403) → rejected", ok is False and "rejected" in what, (ok, what))
     user_msg("/ping")
     await wait_idle(timeout=40)
     check("/ping: same as /doctor", "Doctor" in last_bot()["text"] and "key 1 — answers" in last_bot()["text"])

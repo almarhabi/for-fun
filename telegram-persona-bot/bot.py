@@ -2970,7 +2970,8 @@ async def ping_rows() -> list[str]:
     model = config.NVIDIA_MODELS.get(config.WORKER_MODEL, config.WORKER_MODEL)
     results = await asyncio.gather(*(nvidia_pool.ping(s, model) for s in nvidia_pool.slots))
     for slot, (ok, what, secs) in zip(nvidia_pool.slots, results):
-        rows.append(f"{'✅' if ok else '❌'} 🆓 NVIDIA {esc(slot.name)} — {esc(what)} ({secs:.1f}s)")
+        icon = "✅" if ok else "⚠️" if ok is None else "❌"
+        rows.append(f"{icon} 🆓 NVIDIA {esc(slot.name)} — {esc(what)}" + ("" if ok else f" ({secs:.1f}s)"))
     return rows
 
 

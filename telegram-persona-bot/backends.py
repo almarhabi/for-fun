@@ -146,19 +146,33 @@ class KeyPool:
                 slot.cooldown_until = self.clock() + COOLDOWN_ERROR
         raise last or NoKeyAvailable("No NVIDIA key could take the request")
 
-    async def ping(self, slot: Slot, model: str, timeout: float = 25.0) -> tuple[bool, str, float]:
-        """A 1-token request through this key: (works, short status, seconds)."""
+    async def ping(self, slot: Slot, model: str, timeout: float = 30.0) -> tuple[bool | None, str, float]:
+        """Checks one key in two steps, so a slow model is never mistaken for a bad key:
+        1) the request is accepted (a wrong key is refused within a second: 401/403),
+        2) the first streamed token arrives (the free service may queue requests for a while).
+        Returns (True = works / None = key accepted but the model is slow / False = broken, status, seconds)."""
         start = self.clock()
         slot.recent.append(start)
         slot.total += 1
+        stream = None
         try:
-            await asyncio.wait_for(slot.client.chat.completions.create(
-                model=model, messages=[{"role": "user", "content": "ping"}], max_tokens=1, stream=False), timeout)
+            stream = await asyncio.wait_for(slot.client.chat.completions.create(
+                model=model, messages=[{"role": "user", "content": "ping"}], max_tokens=8, stream=True), timeout)
+            accepted = self.clock() - start
+            try:
+                await asyncio.wait_for(stream.__anext__(), max(5.0, timeout * 2 - accepted))
+            except StopAsyncIteration:
+                pass
+            except asyncio.TimeoutError:
+                slot.last_status = "slow"
+                return None, (f"key accepted ({accepted:.1f}s) · the model is busy — no token yet, "
+                              f"requests may wait in NVIDIA's queue"), self.clock() - start
             slot.last_status = "ok"
-            return True, "answers", self.clock() - start
+            return True, f"answers · first token in {self.clock() - start:.1f}s", self.clock() - start
         except APIStatusError as e:
             slot.last_status = f"HTTP {e.status_code}"
-            meaning = {401: "key rejected (401)", 403: "no access (403)", 429: "rate limited right now (429)",
+            meaning = {401: "key rejected (401)", 403: "key rejected or no access (403)",
+                       429: "rate limited right now (429)",
                        404: "model not found (404)"}.get(e.status_code, f"HTTP {e.status_code}")
             if e.status_code == 429:
                 slot.cooldown_until = self.clock() + (_retry_after(e) or COOLDOWN_429)
@@ -167,10 +181,17 @@ class KeyPool:
             return False, meaning, self.clock() - start
         except asyncio.TimeoutError:
             slot.last_status = "timeout"
-            return False, f"no answer in {timeout:.0f}s", self.clock() - start
+            return False, f"NVIDIA didn't even accept the request in {timeout:.0f}s (network or overload)", \
+                self.clock() - start
         except Exception as e:  # connection errors and the like
             slot.last_status = type(e).__name__
             return False, f"{type(e).__name__}", self.clock() - start
+        finally:
+            if stream is not None and hasattr(stream, "close"):
+                try:
+                    await stream.close()
+                except Exception:
+                    pass
 
     def status(self) -> list[dict]:
         now = self.clock()
