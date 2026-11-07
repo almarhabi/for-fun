@@ -41,6 +41,16 @@ All model-facing text (instructions, tool descriptions, tool results, logs) is E
 4. The lead **reviews, integrates and verifies** (runs the build/tests), fixes what's broken, and replies with a
    short summary.
 
+### Identities for the lead and the agents
+
+- `/setleadpersona` gives the lead its own identity (personality, voice, way of working). It replaces the Chat
+  persona in Coding mode while **🎭 Persona voice** is on; without it the lead speaks in the Chat persona's voice.
+- `/setagentpersona` gives every agent an identity, in every task (keep it short — it's sent every agent round).
+- `/leadpersona` · `/agentpersona` show them; `/setleadpersona off` · `/setagentpersona off` remove them.
+- Same input flow as `/setpersona` (text, several messages, or a `.txt` file), stored encrypted with `PERSONA_KEY`.
+- Fixed rules wrap both (`rules.lead_identity` / `rules.agent_identity` in `config.json`): the identity shapes
+  personality and working style, but never the quality bar, verification, safety, file scope or report format.
+
 ### Smart and safe parallel work
 
 - Each agent owns a **file scope**; the system blocks writing into another running agent's scope.

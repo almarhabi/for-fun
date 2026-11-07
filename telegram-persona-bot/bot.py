@@ -214,6 +214,30 @@ def save_lock(text: str) -> None:
     _write_json(RULES_FILE, {"lock": vault.encrypt(text)})
 
 
+# The Coding version's own identities: the lead's and the agents' (encrypted like the persona). Empty = not set.
+IDENTITY_FILES = {"lead": "lead_persona.json", "agents": "agents_persona.json"}
+
+
+def load_identity(who: str) -> str:
+    return _load_secret(dpath(IDENTITY_FILES[who]), "persona", "")
+
+
+def save_identity(who: str, text: str) -> None:
+    if text.strip():
+        _write_json(dpath(IDENTITY_FILES[who]), {"persona": vault.encrypt(text)})
+    else:
+        dpath(IDENTITY_FILES[who]).unlink(missing_ok=True)
+
+
+def lead_identity() -> tuple[str, str]:
+    """(identity, rules) for the lead: its own identity if set, otherwise the Chat persona as a voice only.
+    Both need 🎭 Persona voice on."""
+    if not (cfg("persona_voice", "agent") and AGENT_CFG.get("persona_voice", True)):
+        return "", ""
+    own = load_identity("lead")
+    return (own, config.LEAD_IDENTITY_RULES) if own.strip() else (load_persona(), "")
+
+
 def load_title() -> str:
     """The X-Title sent to OpenRouter — empty = not sent."""
     return _load_secret(META_FILE, "x_title", "")
@@ -1061,7 +1085,8 @@ def make_env(ws: Workspace, changes: Changes, board: "agent.Board", web_on: bool
         web=(lambda n, a: run_tool(n, a)) if web_on else None, web_tools=list(TOOLS) if web_on else [],
         gh=(lambda n, a, progress=None: github_tools.run_github(n, a, progress)) if gh_on else None,
         gh_token=github_tools.token(), gh_login=github_tools.login if gh_on else None,
-        headers={"X-Title": t} if (t := load_title()) else {}, worker_prompt=config.WORKER_PROMPT)
+        headers={"X-Title": t} if (t := load_title()) else {}, worker_prompt=config.WORKER_PROMPT,
+        agent_persona=load_identity("agents"), agent_identity_rules=config.AGENT_IDENTITY_RULES)
 
 
 async def lead_round(ui: ResponseUI, messages: list, kw: dict, tool_kwargs: dict):
@@ -1097,8 +1122,9 @@ async def _generate_agent(bot, chat_id: int, turn: Turn) -> None:
     gh_on = github_tools.enabled()
     tools = agent.lead_tools(plan, env.web_tools, list(github_tools.GITHUB_TOOLS) if gh_on else [], gh_on)
     history = turn_history(chat_id, turn)
-    persona = load_persona() if cfg("persona_voice", "agent") and AGENT_CFG.get("persona_voice", True) else None
-    system = agent.lead_system(env, config.LEAD_PROMPT, plan, persona, GITHUB_NOTE, journal_text(ws.name))
+    persona, identity_rules = lead_identity()
+    system = agent.lead_system(env, config.LEAD_PROMPT, plan, persona or None, GITHUB_NOTE, journal_text(ws.name),
+                               identity_rules)
     messages = [{"role": "system", "content": system}, *history, {"role": "user", "content": turn.content}]
     await drop_old_buttons(bot, chat_id)
 
@@ -1671,15 +1697,21 @@ async def read_persona_file(doc, bot) -> str:
 
 
 # the edit "target": the persona or the lock rules — both use the same input flow
-TARGET_LABEL = {"persona": "persona", "rules": "lock rules"}
-TARGET_VIEW = {"persona": "/persona", "rules": "/rules"}
+TARGET_LABEL = {"persona": "persona", "rules": "lock rules", "lead": "lead's identity", "agents": "agents' identity"}
+TARGET_VIEW = {"persona": "/persona", "rules": "/rules", "lead": "/leadpersona", "agents": "/agentpersona"}
+SET_COMMANDS = ("/setpersona", "/setrules", "/setleadpersona", "/setagentpersona")
 
 
 def _save_target(target: str, text: str) -> None:
-    (save_persona if target == "persona" else save_lock)(text)
+    if target in IDENTITY_FILES:
+        save_identity(target, text)
+    else:
+        (save_persona if target == "persona" else save_lock)(text)
 
 
 def load_target(target: str) -> str:
+    if target in IDENTITY_FILES:
+        return load_identity(target)
     return load_persona() if target == "persona" else load_lock()
 
 
@@ -1691,10 +1723,22 @@ async def store_control(bot, chat_id: int, text: str, target: str) -> None:
         last_turn.clear()
     label = TARGET_LABEL[target]
     lines = text.count("\n") + 1
+    notes = []
+    if target == "lead":
+        notes.append("🧑‍✈️ The lead uses it in Coding mode (with 🎭 Persona voice on) instead of the Chat persona. "
+                     "Quality and verification rules always come first.")
+    elif target == "agents":
+        notes.append("👷 Every agent gets it in every task. Quality, scope and verification rules always come first.")
+        if len(text) > 2000:
+            notes.append(f"⚠️ It's long (~{len(text) // 4:,} tokens) and is sent with every agent round — a shorter "
+                         "identity costs fewer tokens.")
+    if target in IDENTITY_FILES:
+        notes.append(f"To remove it: <code>{TARGET_VIEW[target].replace('/', '/set', 1)} off</code>")
     await send_html(bot, chat_id, lines_html(
         f"✅ <b>The {label} were saved exactly, character for character</b>" if target == "rules" else f"✅ <b>The {label} was saved exactly, character for character</b>",
         f"📏 {len(text):,} characters · {lines:,} lines",
         f"You can check it with {TARGET_VIEW[target]} (it sends you an exact file copy).",
+        *notes,
     ))
 
 
@@ -1761,6 +1805,12 @@ async def set_control(update: Update, context: ContextTypes.DEFAULT_TYPE, target
     replied = msg.reply_to_message
     doc = msg.document or (replied.document if replied else None)
     label = TARGET_LABEL[target]
+    if target in IDENTITY_FILES and not doc and rest.strip().lower() in ("off", "clear", "remove", "none"):
+        save_identity(target, "")
+        fallback = ("the lead goes back to the Chat persona's voice" if target == "lead"
+                    else "the agents work without an identity")
+        await send_html(bot, chat_id, f"🗑 The {label} was removed — {fallback}.")
+        return
     try:
         if doc:
             await store_control(bot, chat_id, await read_persona_file(doc, bot), target)
@@ -1783,6 +1833,14 @@ async def cmd_setpersona(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
 async def cmd_setrules(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await set_control(update, context, "rules")
+
+
+async def cmd_setleadpersona(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await set_control(update, context, "lead")
+
+
+async def cmd_setagentpersona(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await set_control(update, context, "agents")
 
 
 async def finish_capture(bot, chat_id: int, save: bool) -> None:
@@ -1818,7 +1876,7 @@ async def capture_messages(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         await finish_capture(context.bot, msg.chat_id, False)
         raise ApplicationHandlerStop
     if text in (NEW_CHAT_BTN, SETTINGS_BTN, AGENT_BTN, CHAT_BTN, PROJECT_BTN, CODE_NEW_BTN, CODE_SETTINGS_BTN) or \
-            (text or "").startswith(("/setpersona", "/setrules")):
+            (text or "").startswith(SET_COMMANDS):
         if (t := capture.pop(msg.chat_id, {}).get("refresh")) and not t.done():
             t.cancel()
         return
@@ -1857,6 +1915,11 @@ async def view_control(update: Update, context: ContextTypes.DEFAULT_TYPE, targe
     track(chat_id, update.message.message_id)
     label = TARGET_LABEL[target]
     p = load_target(target)
+    if target in IDENTITY_FILES and not p.strip():
+        fallback = ("The lead uses the Chat persona's voice." if target == "lead" else "The agents work without an identity.")
+        await send_html(bot, chat_id, lines_html(f"📜 <b>No {label} set.</b> {fallback}",
+                                                 f"Set one: <code>{TARGET_VIEW[target].replace('/', '/set', 1)}</code>"))
+        return
     await send_html(bot, chat_id, lines_html(
         f"📜 <b>Current {label}</b>",
         f"📏 {len(p):,} characters · {p.count(chr(10)) + 1:,} lines",
@@ -1865,7 +1928,8 @@ async def view_control(update: Update, context: ContextTypes.DEFAULT_TYPE, targe
         with contextlib.suppress(TelegramError):
             m = await bot.send_message(chat_id, p[i : i + 4000] or "—", link_preview_options=NO_PREVIEW)
             track(chat_id, m.message_id)
-    fname = "persona.txt" if target == "persona" else "rules.txt"
+    fname = {"persona": "persona.txt", "rules": "rules.txt", "lead": "lead_identity.txt",
+             "agents": "agents_identity.txt"}[target]
     m = await bot.send_document(chat_id, InputFile(io.BytesIO(p.encode("utf-8")), filename=fname),
                                 caption=f"📄 An exact copy of the {label}")
     track(chat_id, m.message_id)
@@ -1877,6 +1941,14 @@ async def cmd_persona(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
 async def cmd_rules(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await view_control(update, context, "rules")
+
+
+async def cmd_leadpersona(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await view_control(update, context, "lead")
+
+
+async def cmd_agentpersona(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await view_control(update, context, "agents")
 
 
 async def cmd_settitle(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2186,6 +2258,7 @@ def code_welcome_html() -> str:
         "• Write while it works and your message reaches the lead right away · ⏹ stops · \"think hard\" or ultrathink = maximum reasoning",
         "• /plan plan before executing · /undo undo · /files /zip · <code>$ cmd</code> runs a command · <code># note</code> saves to memory · /watch CI",
         "• /init writes project memory · /review · /security_review · /context /status /cost /doctor",
+        "• /setleadpersona gives the lead its own identity · /setagentpersona gives every agent one",
         "",
         "<i>This is the Coding version: its settings and look are its own — the persona, snippets and GitHub are shared with Chat.</i>",
     )
@@ -2714,14 +2787,14 @@ async def cmd_context(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     env = make_env(ws, Changes(ws), agent.Board(ws.name), web_on)
     tools = agent.lead_tools(bool(cfg("plan_mode", "agent")), env.web_tools,
                              list(github_tools.GITHUB_TOOLS) if gh_on else [], gh_on)
-    persona = load_persona() if cfg("persona_voice", "agent") and AGENT_CFG.get("persona_voice", True) else ""
+    persona, identity_rules = lead_identity()
     hist = agent_histories[agent_key(chat_id, ws.name)]
     parts = [("Lead instructions", len(config.LEAD_PROMPT)),
              ("Project tree", len(ws.tree(200))),
              ("Project memory (AGENTS.md)", len(agent.project_memory(ws))),
              ("Project journal", len(journal_text(ws.name))),
              ("Agent types", len(agent.agent_types_text(ws))),
-             ("Persona (voice)", len(persona or "")),
+             ("Lead identity" if identity_rules else "Persona (voice)", len(persona or "") + len(identity_rules)),
              ("Tool definitions", len(json.dumps(tools, ensure_ascii=False))),
              (f"Conversation ({len(hist)} messages)", sum(len(str(m.get("content"))) for m in hist))]
     total = sum(n for _, n in parts)
@@ -2756,6 +2829,8 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         f"• <b>Agents:</b> <code>{esc(str(cfg('worker_model', 'agent')))}</code> · {esc(provider_text(cfg('worker_model', 'agent')))} · "
         f"up to {_max_agents()} in parallel",
         f"• <b>Project:</b> <code>{esc(ws.name)}</code> — {n} files · {human(size)} · git: {git}",
+        f"• <b>Identities:</b> lead {'✅ own' if load_identity('lead').strip() else '— Chat persona voice'}"
+        f"{'' if cfg('persona_voice', 'agent') else ' (🎭 off)'} · agents {'✅' if load_identity('agents').strip() else '—'}",
         f"• <b>Plan mode:</b> {'on' if cfg('plan_mode', 'agent') else 'off'} · "
         f"<b>Permissions:</b> {esc(str(cfg('permissions', 'agent')))}",
         f"• <b>GitHub:</b> {'connected' if github_tools.enabled() else 'not connected'} · "
@@ -3181,6 +3256,10 @@ def _actions() -> dict:
         "persona": cmd_persona,
         "setrules": cmd_setrules,
         "rules": cmd_rules,
+        "setleadpersona": cmd_setleadpersona,
+        "leadpersona": cmd_leadpersona,
+        "setagentpersona": cmd_setagentpersona,
+        "agentpersona": cmd_agentpersona,
         "settitle": cmd_settitle,
         "title": cmd_title,
         "snip": cmd_snip,

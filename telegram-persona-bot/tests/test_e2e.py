@@ -1546,6 +1546,58 @@ async def agent_scenario(app):
     await wait_idle()
     check("persona voice on: persona is the lead's voice", "PERSONA-MARKER-123" in lead_calls()[-1]["messages"][0]["content"])
 
+    # The Coding identities: the lead's own (replaces the Chat persona) and the agents' (in every agent's prompt)
+    user_msg("/setleadpersona You are Captain Nora, calm and precise.")
+    await wait_idle()
+    check("lead identity: saved", bot.load_identity("lead") == "You are Captain Nora, calm and precise."
+          and "lead's identity was saved" in last_bot()["text"], last_bot()["text"][:200])
+    check("lead identity: stored encrypted on disk", "Captain Nora" not in bot.dpath("lead_persona.json").read_text()
+          if bot.vault.enabled() else True)
+    user_msg("/setagentpersona")
+    await wait_idle()
+    user_msg("You are Rami, a meticulous engineer.")
+    await wait_idle()
+    await asyncio.sleep(0.4)
+    prompt = [m for m in bot_msgs() if "identity input mode" in (m.get("text") or "")][-1]
+    press("persona:save", prompt["message_id"])
+    await wait_idle()
+    check("agents identity: saved via input mode", bot.load_identity("agents") == "You are Rami, a meticulous engineer.",
+          repr(bot.load_identity("agents")))
+    WORKERS.clear()
+    WORKERS["idt"] = [text_deltas("✅ done")]
+    SCRIPT["rounds"] = [tc(("dispatch_agents", {"tasks": [{"id": "idt", "title": "t", "instructions": "check"}]})),
+                        text_deltas("done")]
+    n0 = len(MODEL_CALLS)
+    user_msg("identity test")
+    await wait_idle()
+    lead_sys = [c for c in MODEL_CALLS[n0:] if c.get("model") == LEAD][0]["messages"][0]["content"]
+    wsys = [c for c in MODEL_CALLS[n0:] if c.get("model") == WORKER][0]["messages"][0]["content"]
+    check("lead identity: in the lead prompt with its rules, instead of the Chat persona",
+          "Captain Nora" in lead_sys and "the rules win" in lead_sys and "PERSONA-MARKER-123" not in lead_sys, lead_sys[-600:])
+    check("agents identity: in every agent prompt with its rules", "Rami, a meticulous engineer" in wsys
+          and "they win" in wsys and "Captain Nora" not in wsys, wsys[:900])
+    user_msg("/status")
+    await wait_idle()
+    check("status: shows identities", "lead ✅ own" in last_bot()["text"] and "agents ✅" in last_bot()["text"],
+          last_bot()["text"])
+    user_msg("/leadpersona")
+    await wait_idle()
+    check("lead identity: view sends a file", docs_sent()[-1].get("document") == b"You are Captain Nora, calm and precise.")
+    user_msg("/setleadpersona off")
+    user_msg("/setagentpersona off")
+    await wait_idle()
+    check("identities: off removes them", not bot.load_identity("lead") and not bot.load_identity("agents")
+          and "removed" in last_bot()["text"])
+    SCRIPT["rounds"] = [text_deltas("ok")]
+    n0 = len(MODEL_CALLS)
+    user_msg("after removal")
+    await wait_idle()
+    check("lead identity removed: back to the Chat persona voice",
+          "PERSONA-MARKER-123" in [c for c in MODEL_CALLS[n0:] if c.get("model") == LEAD][0]["messages"][0]["content"])
+    user_msg("/agentpersona")
+    await wait_idle()
+    check("agents identity: view when not set", "No agents' identity set" in last_bot()["text"], last_bot()["text"])
+
     SCRIPT["rounds"] = [tc(("write_file", {"path": "diffme.txt", "content": "one\ntwo\n"})), text_deltas("wrote it")]
     user_msg("write diffme")
     await wait_idle()

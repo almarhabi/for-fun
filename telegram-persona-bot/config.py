@@ -190,4 +190,7 @@ LOCK_RULES: str = _rules.get("lock", "")
 STYLE_RULES: str = _rules.get("style", "")
 GITHUB_NOTE: str = _rules.get("github_note", "")
 CONFIDENTIAL_NOTE: str = _rules.get("confidential", "")
+# Coding identities: how the lead's and the agents' identities (set from Telegram) are applied
+LEAD_IDENTITY_RULES: str = _rules.get("lead_identity", "")
+AGENT_IDENTITY_RULES: str = _rules.get("agent_identity", "")
 DEFAULT_PERSONA: str = _data.get("default_persona", "You are a friendly assistant.")
