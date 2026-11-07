@@ -1955,18 +1955,12 @@ async def view_control(update: Update, context: ContextTypes.DEFAULT_TYPE, targe
         await send_html(bot, chat_id, lines_html(f"📜 <b>No {label} set.</b> {fallback}",
                                                  f"Set one: <code>{TARGET_VIEW[target].replace('/', '/set', 1)}</code>"))
         return
-    await send_html(bot, chat_id, lines_html(
-        f"📜 <b>Current {label}</b>",
-        f"📏 {len(p):,} characters · {p.count(chr(10)) + 1:,} lines",
-    ))
-    for i in range(0, len(p), 4000):  # the text itself, without any formatting
-        with contextlib.suppress(TelegramError):
-            m = await bot.send_message(chat_id, p[i : i + 4000] or "—", link_preview_options=NO_PREVIEW)
-            track(chat_id, m.message_id)
+    # a file only — an exact copy, with the size in the caption (no text messages in the chat)
     fname = {"persona": "persona.txt", "rules": "rules.txt", "lead": "lead_identity.txt",
              "agents": "agents_identity.txt"}[target]
-    m = await bot.send_document(chat_id, InputFile(io.BytesIO(p.encode("utf-8")), filename=fname),
-                                caption=f"📄 An exact copy of the {label}")
+    m = await bot.send_document(
+        chat_id, InputFile(io.BytesIO(p.encode("utf-8")), filename=fname),
+        caption=f"📜 Current {label} — {len(p):,} characters · {p.count(chr(10)) + 1:,} lines")
     track(chat_id, m.message_id)
 
 

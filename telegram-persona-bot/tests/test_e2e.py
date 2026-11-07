@@ -760,6 +760,8 @@ async def scenario():
     await wait_idle()
     docs = [c for c in S["calls"] if c[0] == "sendDocument"]
     check("persona: sends file copy", docs and docs[-1][1].get("document") == "persona from a file\nline 2 **".encode(), docs[-1][1].get("document") if docs else None)
+    check("persona: file only, no text message", "persona from a file" not in (last_bot().get("text") or "")
+          and "characters" in docs[-1][1].get("caption", ""), (last_bot().get("text"), docs[-1][1].get("caption")))
     check("persona: system prompt has exact persona", "<identity>\npersona from a file\nline 2 **\n</identity>" in bot.system_prompt())
 
     # 12) Non-owners can't change the persona
