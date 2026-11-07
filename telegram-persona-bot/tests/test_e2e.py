@@ -1046,6 +1046,10 @@ async def agent_scenario(app):
     names = {c["command"] for c in json.loads(menus[-1]["commands"]) if isinstance(menus[-1]["commands"], str)} \
         if menus and isinstance(menus[-1].get("commands"), str) else {c["command"] for c in (menus[-1].get("commands") or [])}
     check("code: own / menu", "chat" in names and "project" in names and "setpersona" not in names, names)
+    check("menu: /start first in every menu", all(bot._menu_commands(sc)[0].command == "start"
+                                                  for sc in ("default", "owner", "code")),
+          [bot._menu_commands(sc)[0].command for sc in ("default", "owner", "code")])
+    check("code: /start in the Coding menu", "start" in names, names)
     check("code: independent settings", bot.cfg("effort", "agent") == "high" and bot.cfg("effort") == chat_effort,
           (bot.cfg("effort", "agent"), chat_effort))
     user_msg("/set max_agents 3")

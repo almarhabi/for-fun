@@ -38,6 +38,15 @@
   "commands": [
     {
       "names": [
+        "start",
+        "help"
+      ],
+      "action": "start",
+      "menu": "both",
+      "menu_label": "🏠 Start / help"
+    },
+    {
+      "names": [
         "new",
         "reset"
       ],
@@ -310,15 +319,6 @@
         "delsnip"
       ],
       "action": "delsnip"
-    },
-    {
-      "names": [
-        "help",
-        "start"
-      ],
-      "action": "start",
-      "menu": "both",
-      "menu_label": "❓ Help"
     },
     {
       "names": [
