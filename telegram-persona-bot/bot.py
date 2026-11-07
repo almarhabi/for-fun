@@ -2735,7 +2735,7 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     running = jobs.count("running")
     total = session_usage.total()
     rows = [
-        "📊 <b>Status</b>",
+        "📊 <b>Status</b> — what's set up right now",
         "",
         f"• <b>Version:</b> {'💻 Coding' if cfg('agent_mode') else '💬 Chat'}",
         f"• <b>Lead:</b> <code>{esc(str(cfg('model', 'agent')))}</code> · {esc(provider_text(cfg('model', 'agent')))} · "
@@ -2833,7 +2833,7 @@ async def cmd_doctor(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     if (chat_id := await _owner_cmd(update, context)) is None:
         return
     await context.bot.send_chat_action(chat_id, ChatAction.TYPING)
-    rows = ["🩺 <b>Doctor</b>", ""]
+    rows = ["🩺 <b>Doctor</b> — checks everything the bot depends on", "", "✅ OK · ⚠️ optional / worth a look · ❌ broken", ""]
 
     def line(ok: bool | None, text: str) -> None:
         rows.append(f"{'✅' if ok else '⚠️' if ok is None else '❌'} {text}")

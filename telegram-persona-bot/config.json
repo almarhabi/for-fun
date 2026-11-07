@@ -132,8 +132,16 @@
         "status"
       ],
       "action": "status",
-      "menu": "code",
-      "menu_label": "📊 Status"
+      "menu": "owner_all",
+      "menu_label": "📊 Status: models, project, usage"
+    },
+    {
+      "names": [
+        "doctor"
+      ],
+      "action": "doctor",
+      "menu": "owner_all",
+      "menu_label": "🩺 Health check: keys, GitHub, tools"
     },
     {
       "names": [
@@ -194,12 +202,6 @@
         "agents"
       ],
       "action": "agents"
-    },
-    {
-      "names": [
-        "doctor"
-      ],
-      "action": "doctor"
     },
     {
       "names": [
