@@ -25,9 +25,9 @@ _FALLBACK = {
     "legacy_models": {"moonshotai/kimi-k3.1-pro": "deepseek/deepseek-v4.1-flash-1017", "z-ai/glm-5.3": "z-ai/glm-5.3-flash"},
     "efforts": ["default", "low", "medium", "high", "max"],
     "effort_api": {"max": "xhigh"},
-    "buttons": {"new_chat": "🆕 New chat", "settings": "⚙️ Settings", "agent_mode": "💻 Coding mode",
-                "chat_mode": "💬 Chat mode", "project": "📁 Project", "code_new": "🆕 New session",
-                "code_settings": "⚙️ Coding settings"},
+    "buttons": {"new_chat": "New chat", "settings": "Settings", "agent_mode": "Coding mode",
+                "chat_mode": "Chat mode", "project": "Projects", "code_new": "New session",
+                "code_settings": "Settings", "menu": "Menu", "back": "Back"},
     "commands": [
         {"names": ["start", "help"], "action": "start", "menu": "both", "menu_label": "❓ Help"},
         {"names": ["new", "reset"], "action": "new", "menu": "both", "menu_label": "🆕 New chat / session"},
@@ -144,13 +144,17 @@ def provider_for(model: str | None) -> dict | None:
 EFFORTS: list = list(_data["efforts"])
 EFFORT_API: dict = dict(_data["effort_api"])
 BUTTONS: dict = dict(_data["buttons"])
-NEW_CHAT_BTN: str = BUTTONS.get("new_chat", "🆕 New chat")
-SETTINGS_BTN: str = BUTTONS.get("settings", "⚙️ Settings")
-AGENT_BTN: str = BUTTONS.get("agent_mode", "💻 Coding mode")
-CHAT_BTN: str = BUTTONS.get("chat_mode", "💬 Chat mode")
-PROJECT_BTN: str = BUTTONS.get("project", "📁 Project")
-CODE_NEW_BTN: str = BUTTONS.get("code_new", "🆕 New session")
-CODE_SETTINGS_BTN: str = BUTTONS.get("code_settings", "⚙️ Coding settings")
+NEW_CHAT_BTN: str = BUTTONS.get("new_chat", "Chat mode")
+SETTINGS_BTN: str = BUTTONS.get("settings", "Settings")
+AGENT_BTN: str = BUTTONS.get("agent_mode", "Coding mode")
+CHAT_BTN: str = BUTTONS.get("chat_mode", "Chat mode")
+PROJECT_BTN: str = BUTTONS.get("project", "Projects")
+CODE_NEW_BTN: str = BUTTONS.get("code_new", "New session")
+CODE_SETTINGS_BTN: str = BUTTONS.get("code_settings", "Settings")
+MENU_BTN: str = BUTTONS.get("menu", "Menu")
+BACK_BTN: str = BUTTONS.get("back", "Back")
+# old labels (with emojis) keep working until the owner's keyboard is refreshed
+LEGACY_BUTTONS: dict = {k: v for k, v in (_data.get("legacy_buttons") or {}).items() if not k.startswith("_")}
 COMMANDS: list = list(_data["commands"])
 
 DEFAULT_MODEL: str = current_model(os.getenv("OPENROUTER_MODEL")) or _data["default_model"]

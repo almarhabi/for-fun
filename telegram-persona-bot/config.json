@@ -38,13 +38,15 @@
     "max": "xhigh"
   },
   "buttons": {
-    "new_chat": "🆕 New chat",
-    "settings": "⚙️ Settings",
-    "agent_mode": "💻 Coding mode",
-    "chat_mode": "💬 Chat mode",
-    "project": "📁 Project",
-    "code_new": "🆕 New session",
-    "code_settings": "⚙️ Coding settings"
+    "new_chat": "New chat",
+    "settings": "Settings",
+    "agent_mode": "Coding mode",
+    "chat_mode": "Chat mode",
+    "project": "Projects",
+    "code_new": "New session",
+    "code_settings": "Settings",
+    "menu": "Menu",
+    "back": "Back"
   },
   "commands": [
     {
@@ -54,7 +56,15 @@
       ],
       "action": "start",
       "menu": "both",
-      "menu_label": "🏠 Start / help"
+      "menu_label": "Start / help"
+    },
+    {
+      "names": [
+        "menu"
+      ],
+      "action": "menu",
+      "menu": "owner_all",
+      "menu_label": "All commands as buttons"
     },
     {
       "names": [
@@ -63,121 +73,93 @@
       ],
       "action": "new",
       "menu": "both",
-      "menu_label": "🆕 New chat / session"
+      "menu_label": "New chat / session"
     },
     {
       "names": [
         "code",
         "agent"
       ],
-      "action": "agent",
-      "menu": "owner",
-      "menu_label": "💻 Switch to Coding mode"
+      "action": "agent"
     },
     {
       "names": [
         "chat"
       ],
-      "action": "chat",
-      "menu": "code",
-      "menu_label": "💬 Back to Chat mode"
+      "action": "chat"
     },
     {
       "names": [
         "project"
       ],
-      "action": "project",
-      "menu": "code",
-      "menu_label": "📁 Project / switch"
+      "action": "project"
     },
     {
       "names": [
         "files"
       ],
-      "action": "files",
-      "menu": "code",
-      "menu_label": "🗂 Project files"
+      "action": "files"
     },
     {
       "names": [
         "plan"
       ],
-      "action": "plan",
-      "menu": "code",
-      "menu_label": "📝 Plan before executing (on/off)"
+      "action": "plan"
     },
     {
       "names": [
         "undo"
       ],
-      "action": "undo",
-      "menu": "code",
-      "menu_label": "↩️ Undo the last changes"
+      "action": "undo"
     },
     {
       "names": [
         "review"
       ],
-      "action": "review",
-      "menu": "code",
-      "menu_label": "🔎 Review changes or a PR"
+      "action": "review"
     },
     {
       "names": [
         "init"
       ],
-      "action": "init",
-      "menu": "code",
-      "menu_label": "🧠 Write project memory (AGENTS.md)"
+      "action": "init"
     },
     {
       "names": [
         "watch"
       ],
-      "action": "watch",
-      "menu": "code",
-      "menu_label": "👀 Watch CI on GitHub"
+      "action": "watch"
     },
     {
       "names": [
         "status"
       ],
-      "action": "status",
-      "menu": "owner_all",
-      "menu_label": "📊 Status: models, project, usage"
+      "action": "status"
     },
     {
       "names": [
         "doctor",
         "ping"
       ],
-      "action": "doctor",
-      "menu": "owner_all",
-      "menu_label": "🩺 Health check: pings every API key, GitHub, tools"
+      "action": "doctor"
     },
     {
       "names": [
         "context"
       ],
-      "action": "context",
-      "menu": "code",
-      "menu_label": "🧮 Context & token usage"
+      "action": "context"
     },
     {
       "names": [
         "zip"
       ],
-      "action": "zip",
-      "menu": "code",
-      "menu_label": "📦 Download the project"
+      "action": "zip"
     },
     {
       "names": [
         "cost"
       ],
-      "action": "cost",
-      "menu": "owner_all",
-      "menu_label": "💰 Usage & cost"
+      "action": "cost"
     },
     {
       "names": [
@@ -220,34 +202,26 @@
         "setleadpersona"
       ],
       "action": "setleadpersona",
-      "menu": "code",
-      "menu_label": "🧑‍✈️ Set the lead's identity",
       "caption": true
     },
     {
       "names": [
         "leadpersona"
       ],
-      "action": "leadpersona",
-      "menu": "code",
-      "menu_label": "🧑‍✈️ Show the lead's identity"
+      "action": "leadpersona"
     },
     {
       "names": [
         "setagentpersona"
       ],
       "action": "setagentpersona",
-      "menu": "code",
-      "menu_label": "👷 Set the agents' identity",
       "caption": true
     },
     {
       "names": [
         "agentpersona"
       ],
-      "action": "agentpersona",
-      "menu": "code",
-      "menu_label": "👷 Show the agents' identity"
+      "action": "agentpersona"
     },
     {
       "names": [
@@ -297,41 +271,33 @@
       ],
       "action": "settings",
       "menu": "owner_all",
-      "menu_label": "⚙️ Settings"
+      "menu_label": "Settings"
     },
     {
       "names": [
         "setpersona"
       ],
       "action": "setpersona",
-      "menu": "owner",
-      "menu_label": "🎭 Set the persona",
       "caption": true
     },
     {
       "names": [
         "persona"
       ],
-      "action": "persona",
-      "menu": "owner",
-      "menu_label": "📜 Show the persona"
+      "action": "persona"
     },
     {
       "names": [
         "setrules"
       ],
       "action": "setrules",
-      "menu": "owner",
-      "menu_label": "🔒 Edit the lock rules",
       "caption": true
     },
     {
       "names": [
         "rules"
       ],
-      "action": "rules",
-      "menu": "owner",
-      "menu_label": "📜 Show the lock rules"
+      "action": "rules"
     },
     {
       "names": [
@@ -350,17 +316,13 @@
         "snip"
       ],
       "action": "snip",
-      "menu": "owner",
-      "menu_label": "🔖 Save a snippet",
       "caption": true
     },
     {
       "names": [
         "snippets"
       ],
-      "action": "snippets",
-      "menu": "owner",
-      "menu_label": "🔖 Snippets"
+      "action": "snippets"
     },
     {
       "names": [
@@ -543,5 +505,15 @@
     "watch_interval": 60,
     "preload_chars": 60000,
     "compact_stale_chars": 30000
+  },
+  "legacy_buttons": {
+    "_note": "Old button labels (with emojis) still work until the keyboard refreshes.",
+    "🆕 New chat": "new_chat",
+    "⚙️ Settings": "settings",
+    "💻 Coding mode": "agent_mode",
+    "💬 Chat mode": "chat_mode",
+    "📁 Project": "project",
+    "🆕 New session": "code_new",
+    "⚙️ Coding settings": "code_settings"
   }
 }

@@ -27,6 +27,16 @@ All model-facing text (instructions, tool descriptions, tool results, logs) is E
 - 🖼 **Images** (even albums) and 📎 **files** (PDF, text, code). ↩️ Reply to any message to ask about it.
 - 🆕 **New chat**: forgets the conversation; the old messages stay in the chat.
 
+## Buttons instead of commands
+
+The owner never has to type a command: the bottom keyboard has **New chat · Settings · Coding mode · Menu**
+(Coding: **New session · Projects · Menu · Settings · Chat mode**). **Menu** swaps the keyboard for every command as a
+button (persona, rules, snippets, status, health check, usage — and in Coding: files, diff, undo, plan, review, memory,
+GitHub clone/push/watch, identities…); **Back** returns. A command that needs input (a file path, a repo, a shell
+command…) asks for it and takes your next message. Button labels only act as commands while the Menu is open, so typing
+"Status" in a normal conversation is just a message. The "/" list keeps only start, menu, new and settings (every slash
+command still works if typed).
+
 ## 💻 Coding version (like Claude Code)
 
 ### How it works

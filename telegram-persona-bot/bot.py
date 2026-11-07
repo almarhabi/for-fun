@@ -1,6 +1,7 @@
 """A Telegram bot with a fixed, owner-defined persona, running on DeepSeek V4.1 Flash (or GLM-5.3 Flash for bot 2), that behaves like modern AI apps — plus a Coding version with a lead model and parallel agents (like Claude Code)."""
 
 import asyncio
+import contextvars
 import base64
 import contextlib
 import io
@@ -246,7 +247,7 @@ def save_identity(who: str, text: str) -> None:
 
 def lead_identity() -> tuple[str, str]:
     """(identity, rules) for the lead: its own identity if set, otherwise the Chat persona as a voice only.
-    Both need 🎭 Persona voice on."""
+    Both need Persona voice on."""
     if not (cfg("persona_voice", "agent") and AGENT_CFG.get("persona_voice", True)):
         return "", ""
     own = load_identity("lead")
@@ -313,8 +314,8 @@ def backend_name() -> str:
 
 def backend_label() -> str:
     if backend_name() == "nvidia":
-        return f"🆓 NVIDIA (free · {len(nvidia_pool)} key{'s' if len(nvidia_pool) != 1 else ''})"
-    return "💳 OpenRouter (paid)"
+        return f"NVIDIA (free · {len(nvidia_pool)} key{'s' if len(nvidia_pool) != 1 else ''})"
+    return "OpenRouter (paid)"
 
 
 def provider_text(model) -> str:
@@ -412,8 +413,10 @@ CHAT_BTN = config.CHAT_BTN
 PROJECT_BTN = config.PROJECT_BTN
 CODE_NEW_BTN = config.CODE_NEW_BTN
 CODE_SETTINGS_BTN = config.CODE_SETTINGS_BTN
-STOP_KB = InlineKeyboardMarkup([[InlineKeyboardButton("⏹ Stop", callback_data="stop")]])
-REGEN_KB = InlineKeyboardMarkup([[InlineKeyboardButton("🔄 Regenerate", callback_data="regen")]])
+MENU_BTN = config.MENU_BTN
+BACK_BTN = config.BACK_BTN
+STOP_KB = InlineKeyboardMarkup([[InlineKeyboardButton("Stop", callback_data="stop")]])
+REGEN_KB = InlineKeyboardMarkup([[InlineKeyboardButton("Regenerate", callback_data="regen")]])
 
 
 def is_owner_id(user_id: int | None) -> bool:
@@ -428,11 +431,11 @@ def main_keyboard(owner: bool) -> ReplyKeyboardMarkup:
     if not owner:
         return ReplyKeyboardMarkup([[NEW_CHAT_BTN]], resize_keyboard=True, is_persistent=True,
                                    input_field_placeholder="Type your message…")
-    if cfg("agent_mode"):  # 💻 the Coding version: a different look
-        return ReplyKeyboardMarkup([[CODE_NEW_BTN, PROJECT_BTN], [CODE_SETTINGS_BTN, CHAT_BTN]],
+    if cfg("agent_mode"):  # the Coding version
+        return ReplyKeyboardMarkup([[CODE_NEW_BTN, PROJECT_BTN, MENU_BTN], [CODE_SETTINGS_BTN, CHAT_BTN]],
                                    resize_keyboard=True, is_persistent=True,
-                                   input_field_placeholder="💻 Ask for a project or a coding task…")
-    return ReplyKeyboardMarkup([[NEW_CHAT_BTN, SETTINGS_BTN], [AGENT_BTN]], resize_keyboard=True,
+                                   input_field_placeholder="Ask for a project or a coding task…")
+    return ReplyKeyboardMarkup([[NEW_CHAT_BTN, SETTINGS_BTN], [AGENT_BTN, MENU_BTN]], resize_keyboard=True,
                                is_persistent=True, input_field_placeholder="Type your message…")
 
 
@@ -548,7 +551,7 @@ class Panel:
         return [m.message_id for m in self.msgs]
 
 
-think_store: "OrderedDict[str, str]" = OrderedDict()  # the full thinking, for the "📄 Full thinking" button
+think_store: "OrderedDict[str, str]" = OrderedDict()  # the full thinking, for the "Full thinking" button
 
 
 def remember_thinking(text: str) -> str:
@@ -570,7 +573,7 @@ class ResponseUI:
         self.think = Panel(bot, chat_id)
         self.work = Panel(bot, chat_id)        # between the thinking and the reply, in a fixed order
         self.reply = Panel(bot, chat_id)
-        self.extra_rows: list[list[InlineKeyboardButton]] = []  # buttons above 🔄 on the final reply
+        self.extra_rows: list[list[InlineKeyboardButton]] = []  # buttons above on the final reply
         self.inbox: list[str] = []             # the owner's messages during a run (steering)
         self.final_files: list[dict] = []
         self.allow_all = False                 # permission mode "ask": owner tapped "Allow all"
@@ -654,7 +657,7 @@ class ResponseUI:
         elif final and truncated:
             if not self._think_key:
                 self._think_key = remember_thinking(self._full_thinking())
-            markup = InlineKeyboardMarkup([[InlineKeyboardButton("📄 Full thinking", callback_data=f"think:{self._think_key}")]])
+            markup = InlineKeyboardMarkup([[InlineKeyboardButton("Full thinking", callback_data=f"think:{self._think_key}")]])
         return [(text, markup)]
 
     def _full_thinking(self) -> str:
@@ -668,12 +671,12 @@ class ResponseUI:
         return [(html, None)] if html else []
 
     def final_kb(self) -> InlineKeyboardMarkup:
-        return InlineKeyboardMarkup(self.extra_rows + [[InlineKeyboardButton("🔄 Regenerate", callback_data="regen")]])
+        return InlineKeyboardMarkup(self.extra_rows + [[InlineKeyboardButton("Regenerate", callback_data="regen")]])
 
     def _final_extras(self) -> list[str]:
         extras = []
         if self.stopped:
-            extras.append("<i>⏹ Reply stopped</i>")
+            extras.append("<i>Reply stopped</i>")
         if self.error:
             extras.append(self.error)
         return extras
@@ -712,8 +715,8 @@ class ResponseUI:
                                                     "children": [s.get("title") or s["url"]]}]}
                         for s in self.sources if s.get("url")]})
                 url = await tph.create_page(render.telegraph_title(md), nodes)
-                head = lines_html("📄 <b>Full reply</b> — it's long, so I put it on a tidy page that opens inside Telegram:",
-                                  f'<a href="{esc(url)}">📖 Open the full reply</a>')
+                head = lines_html("<b>Full reply</b> — it's long, so I put it on a tidy page that opens inside Telegram:",
+                                  f'<a href="{esc(url)}">Open the full reply</a>')
                 return [(head + tail, self.final_kb(), True)]
             except Exception:
                 log.warning("telegraph failed; splitting instead", exc_info=True)
@@ -854,15 +857,15 @@ def error_hint(e: Exception) -> str:
 
 
 def error_html(e: Exception, owner: bool) -> str:
-    text = "⚠️ <b>An error occurred and I couldn't finish the reply.</b>\nTap 🔄 to try again."
+    text = "⚠️ <b>An error occurred and I couldn't finish the reply.</b>\nTap Regenerate to try again."
     if owner and (hint := error_hint(e)):
-        text += "\n💡 " + esc(hint)
+        text += "\n" + esc(hint)
     if owner:
         text += f"\n<blockquote expandable>{esc(type(e).__name__)}: {esc(str(e)[:700])}</blockquote>"
     return text
 
 
-regen_msg: dict[int, int] = {}  # the message carrying the 🔄 button in each chat
+regen_msg: dict[int, int] = {}  # the message carrying the button in each chat
 
 
 async def drop_old_buttons(bot, chat_id: int) -> None:
@@ -883,7 +886,7 @@ async def send_transcript(bot, chat_id: int, turn: "Turn", ui: "ResponseUI") -> 
     )
     try:
         m = await bot.send_document(chat_id, InputFile(io.BytesIO(text.encode("utf-8")), filename="reply.txt"),
-                                    caption="📄 Reply transcript")
+                                    caption="Reply transcript")
         return m.message_id
     except TelegramError as e:
         log.warning("transcript failed: %s", e)
@@ -974,7 +977,7 @@ async def _generate(bot, chat_id: int, turn: Turn) -> None:
     except asyncio.CancelledError:
         if not ui.stopped:
             raise
-        asyncio.current_task().uncancel()  # the user tapped ⏹ — keep what was written
+        asyncio.current_task().uncancel()  # the user tapped — keep what was written
     except Exception as e:
         log.exception("model API error")
         ui.error = error_html(e, is_owner_id(turn.user_id))
@@ -1003,15 +1006,15 @@ async def _generate(bot, chat_id: int, turn: Turn) -> None:
     if owner and overrides.get("export_txt", cfg("export_txt")) and (reply or ui.parts):
         doc_id = await send_transcript(bot, chat_id, turn, ui)
         if doc_id:
-            turn.response_ids.insert(0, doc_id)  # deleted with the reply on 🔄, and the 🔄 button stays on the reply
+            turn.response_ids.insert(0, doc_id)  # deleted with the reply on , and the button stays on the reply
             track(chat_id, doc_id)
 
 
 # ================= Coding mode =================
 
 session_usage = agent.Usage()          # usage since this process started
-diffs: "OrderedDict[str, str]" = OrderedDict()      # each request's diff (the 📄 Diff button)
-reports: "OrderedDict[str, str]" = OrderedDict()    # the agents' reports (the 🤖 Reports button)
+diffs: "OrderedDict[str, str]" = OrderedDict()      # each request's diff (the Diff button)
+reports: "OrderedDict[str, str]" = OrderedDict()    # the agents' reports (the Reports button)
 asks: "OrderedDict[str, list[str]]" = OrderedDict()  # options of the lead's questions (buttons)
 
 
@@ -1132,7 +1135,7 @@ async def lead_round(ui: ResponseUI, messages: list, kw: dict, tool_kwargs: dict
         except Exception as e:
             if attempt == 2 or not agent._transient(e):
                 raise
-            ui.add_step(f"⏳ Provider busy — retry {attempt + 1}")
+            ui.add_step(f"Provider busy — retry {attempt + 1}")
             ui.begin_round()
             await asyncio.sleep(4 * (attempt + 1) ** 2)
 
@@ -1181,7 +1184,7 @@ async def _generate_agent(bot, chat_id: int, turn: Turn) -> None:
                 ui.inbox.clear()
                 messages.append({"role": "user", "content": f"[Message from the owner during the run]\n{note}"})
                 turn.history_text += f"\n\n[During the run]: {note}"
-                ui.add_step("📨 Your note: " + " ".join(note.split())[:80])
+                ui.add_step("Your note: " + " ".join(note.split())[:80])
             if agent.trim_context(messages):
                 ctx.seen_reads.clear()
             else:
@@ -1218,7 +1221,7 @@ async def _generate_agent(bot, chat_id: int, turn: Turn) -> None:
     except asyncio.CancelledError:
         if not ui.stopped:
             raise
-        asyncio.current_task().uncancel()  # the owner tapped ⏹ — keep what happened
+        asyncio.current_task().uncancel()  # the owner tapped — keep what happened
     except Exception as e:
         log.exception("agent turn failed")
         ui.error = error_html(e, True)
@@ -1234,14 +1237,14 @@ async def _generate_agent(bot, chat_id: int, turn: Turn) -> None:
         if kind == "ask_user":
             q = str(args.get("question") or "").strip() or "I have a question before I continue:"
             opts = [" ".join(str(o).split())[:60] for o in (args.get("options") or []) if str(o).strip()][:5]
-            ui.reply_md = lead_in + "❓ " + q
+            ui.reply_md = lead_in + "" + q
             if opts:
                 _remember(asks, key, opts)
                 ui.extra_rows += [[_btn(o, f"ask:{key}:{i}")] for i, o in enumerate(opts)]
                 ui.reply_md += "\n\n_Pick a button or type your answer._"
         else:
             ui.reply_md = lead_in + (str(args.get("plan") or "").strip() or "(empty plan)")
-            ui.extra_rows.append([_btn("✅ Run the plan", f"plan:go:{ws.name}"[:64]), _btn("✖️ No", "plan:no")])
+            ui.extra_rows.append([_btn("Run the plan", f"plan:go:{ws.name}"[:64]), _btn("No", "plan:no")])
     elif not ui.reply_md.strip() and last_text and not ui.error:
         ui.reply_md = last_text  # the lead finished without a final reply — show its last text instead of an empty reply
 
@@ -1251,11 +1254,11 @@ async def _generate_agent(bot, chat_id: int, turn: Turn) -> None:
         checkpoints().push(ws.name, key, turn.history_text, changes)
         turn.checkpoint = key
         _remember(diffs, key, changes.diff())
-        ui.extra_rows.append([_btn("↩️ Undo", f"undo:{key}"), _btn("📄 Diff", f"diff:{key}"),
-                              _btn("📦 Project", "zip")])
+        ui.extra_rows.append([_btn("Undo", f"undo:{key}"), _btn("Diff", f"diff:{key}"),
+                              _btn("Project", "zip")])
     if board.agents:
         _remember(reports, key, agent.reports_markdown(board))
-        ui.extra_rows.append([_btn(f"🤖 Agent reports ({len(board.agents)})", f"rep:{key}")])
+        ui.extra_rows.append([_btn(f"Agent reports ({len(board.agents)})", f"rep:{key}")])
 
     await ui.finish()
     turn.response_ids = ui.message_ids()
@@ -1312,7 +1315,7 @@ async def redo(bot, chat_id: int, user_msg_id: int | None, replacement: Turn | N
             history.pop()
             history.pop()
             save_turn_history(turn)
-        if turn.mode == "agent" and turn.checkpoint:  # 🔄 in coding mode = restore the files and redo from the same point
+        if turn.mode == "agent" and turn.checkpoint:  # in coding mode = restore the files and redo from the same point
             restore_checkpoint(turn.project, turn.checkpoint)
         await delete_many(bot, chat_id, turn.response_ids)
         untrack(chat_id, turn.response_ids)
@@ -1544,7 +1547,7 @@ async def on_user_message(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         return
     if agent_on and plain and item.text.startswith("# ") and "\n" not in item.text.strip():
         add_memory(item.text[2:])
-        await send_html(context.bot, chat_id, "🧠 Saved to project memory (AGENTS.md).")
+        await send_html(context.bot, chat_id, "Saved to project memory (AGENTS.md).")
         return
 
     # coding mode is working on a request: a text message from the owner = steering for the lead's next step (like Claude Code)
@@ -1552,7 +1555,7 @@ async def on_user_message(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     if (running is not None and running.board is not None and is_owner(update) and not running.finishing
             and item.text and not (item.images or item.files or item.notes) and not entry and not looks_split):
         running.inbox.append(item.text)
-        await send_html(context.bot, chat_id, "📨 <i>Got it — the lead will see it at the next step, without stopping the work.</i>")
+        await send_html(context.bot, chat_id, "<i>Got it — the lead will see it at the next step, without stopping the work.</i>")
         return
     if entry or looks_split:
         if entry:
@@ -1585,7 +1588,7 @@ async def on_stop(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     q = update.callback_query
     ui = active.get(q.message.chat_id) if q.message else None
     if ui and q.message.message_id in ui.message_ids() and ui.stop():
-        await q.answer("⏹ Stopped")
+        await q.answer("Stopped")
     else:
         await q.answer()
 
@@ -1600,7 +1603,7 @@ async def on_regen(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not turn or q.message.message_id not in turn.response_ids:
         await q.answer("I can only regenerate the latest reply")
         return
-    await q.answer("🔄 Regenerating")
+    await q.answer("Regenerating")
     await redo(context.bot, chat_id, turn.user_msg_id)
 
 
@@ -1612,52 +1615,36 @@ async def on_full_thinking(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         return
     await q.answer()
     msg = await context.bot.send_document(q.message.chat_id, InputFile(io.BytesIO(text.encode()), filename="thinking.txt"),
-                                          caption="💭 The full chain of thought")
+                                          caption="The full chain of thought")
     track(q.message.chat_id, msg.message_id)
 
 
 # ================= Commands =================
 
 def welcome_html(owner: bool) -> str:
-    text = lines_html(
-        "✨ <b>Welcome!</b>",
-        "Write anything — I'm here.",
+    rows = [
+        "<b>Hi — write anything.</b>",
         "",
-        "<b>What you can do:</b>",
-        "• Watch my thinking and the reply being written live",
-        "• I search the web for you 🔎 and give you the sources",
-        "• Send me images 🖼 or files 📎 (PDF and text)",
-        "• Stop a reply ⏹ or regenerate it 🔄",
-        "• Edit your message ✏️ and I answer it again",
-        "• Reply to any message to ask me about it",
-        "",
-        f"<b>{NEW_CHAT_BTN}</b> below or /new — starts fresh (old messages stay in the chat).",
-    )
+        "I think out loud, search the web with sources, read images and files (PDF and text),",
+        "and you can stop, regenerate or edit a message to get a new answer.",
+        f"<b>{NEW_CHAT_BTN}</b> starts fresh.",
+    ]
     if owner:
-        gh = ("• 🐙 Connected to GitHub — give me an order and I write/edit/create directly (repos, files, branches, PRs, CI)"
-              if github_tools.enabled() else
-              "• 🐙 GitHub not connected — add the GH_PAT secret so I can write and edit your repositories")
-        text += "\n\n" + lines_html(
-            "👑 <b>Owner commands</b>",
-            "• /setpersona — set the persona · /persona — show it",
-            "• /setrules — edit the lock rules · /rules — show them",
-            "• /snip <code>name text</code> — save a snippet, then write <code>!name</code> in any message · /snippets",
-            "• /settings — the control panel",
-            "• /set <code>setting value</code> — e.g. <code>/set temperature 0.7</code>",
-            "• /resetall — wipe the memory of every chat",
-            "• Settings for one message: <code>effort=max web_search=off your question</code>",
-            gh,
+        rows += [
             "",
-            "💻 <b>Coding mode</b> (like Claude Code) — /code",
-            "The lead plans and splits work across parallel agents, writes, runs and tests inside a real project,",
-            "controls GitHub, watches CI and fixes failures. /project /files /zip /undo /sh /watch /plan /cost",
-        )
-    return text
+            "<b>Owner</b>",
+            f"Every command is under <b>{MENU_BTN}</b> — no need to type anything.",
+            f"<b>{SETTINGS_BTN}</b> holds the model options, <b>{AGENT_BTN}</b> opens the coding agent.",
+            "One-message options: <code>effort=max web_search=off your question</code>",
+        ]
+    return lines_html(*rows)
 
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     chat_id = update.effective_chat.id
     track(chat_id, update.message.message_id)
+    if is_owner(update):
+        _set_menu_open(chat_id, False)
     if is_owner(update) and cfg("agent_mode"):
         await send_html(context.bot, chat_id, code_welcome_html(), main_keyboard(True))
         return
@@ -1672,20 +1659,20 @@ async def cmd_new(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         ui.stop()
     pending.pop(chat_id, None)
     async with chat_locks[chat_id]:
-        await drop_old_buttons(context.bot, chat_id)  # the old 🔄 button no longer belongs to the new chat
+        await drop_old_buttons(context.bot, chat_id)  # the old button no longer belongs to the new chat
         last_turn.pop(chat_id, None)
         if is_owner(update) and cfg("agent_mode"):
             agent_histories.pop(agent_key(chat_id, current_project()), None)
             save_agent_histories()
             await send_html(context.bot, chat_id, lines_html(
-                "✨ <b>New coding session</b>",
+                "<b>New coding session</b>",
                 f"The files of project <code>{esc(current_project())}</code> and its journal are kept — only the conversation starts over.",
             ), main_keyboard(True))
             return
         histories.pop(chat_id, None)
         save_histories()
         await send_html(context.bot, chat_id, lines_html(
-            "✨ <b>New chat</b>",
+            "<b>New chat</b>",
             "Starting fresh — I don't remember anything from the previous conversation.",
         ), main_keyboard(is_owner(update)))
 
@@ -1693,7 +1680,7 @@ async def cmd_new(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 async def owner_only(update: Update, context) -> bool:
     if is_owner(update):
         return True
-    await send_html(context.bot, update.effective_chat.id, "🔒 This command is for the bot owner only.")
+    await send_html(context.bot, update.effective_chat.id, "This command is for the bot owner only.")
     return False
 
 
@@ -1705,14 +1692,25 @@ async def cmd_resetall(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     agent_histories.clear()
     save_agent_histories()
     last_turn.clear()
-    await send_html(context.bot, update.effective_chat.id, "🧹 <b>The memory of every chat was wiped.</b>")
+    await send_html(context.bot, update.effective_chat.id, "<b>The memory of every chat was wiped.</b>")
 
 
 # ----- Persona -----
 
 capture: dict[int, dict] = {}  # persona input mode across several messages
-PERSONA_KB = InlineKeyboardMarkup([[InlineKeyboardButton("✅ Save", callback_data="persona:save"),
-                                    InlineKeyboardButton("✖️ Cancel", callback_data="persona:cancel")]])
+PERSONA_KB = InlineKeyboardMarkup([[InlineKeyboardButton("Save", callback_data="persona:save"),
+                                    InlineKeyboardButton("Cancel", callback_data="persona:cancel")]])
+
+
+# When a command runs from a Menu button, this holds the text it should see after the command
+# ("" for no argument, or what the owner typed when asked) — instead of the button's own label.
+menu_input: contextvars.ContextVar = contextvars.ContextVar("menu_input", default=None)
+
+
+def cmd_text(msg) -> str:
+    """The text after the command, for a typed command or a Menu button alike."""
+    value = menu_input.get()
+    return value if value is not None else after_command(msg.text or msg.caption or "")
 
 
 def after_command(text: str) -> str:
@@ -1760,19 +1758,16 @@ async def store_control(bot, chat_id: int, text: str, target: str) -> None:
     lines = text.count("\n") + 1
     notes = []
     if target == "lead":
-        notes.append("🧑‍✈️ The lead uses it in Coding mode (with 🎭 Persona voice on) instead of the Chat persona. "
-                     "Quality and verification rules always come first.")
+        notes.append("Used by the Coding lead instead of the Chat persona (Lead identity on in Coding settings).")
     elif target == "agents":
-        notes.append("👷 Every agent gets it in every task. Quality, scope and verification rules always come first.")
+        notes.append("Every agent gets it in every task.")
         if len(text) > 2000:
-            notes.append(f"⚠️ It's long (~{len(text) // 4:,} tokens) and is sent with every agent round — a shorter "
-                         "identity costs fewer tokens.")
+            notes.append(f"⚠️ It's long (~{len(text) // 4:,} tokens) and goes with every agent round — shorter is cheaper.")
     if target in IDENTITY_FILES:
         notes.append(f"To remove it: <code>{TARGET_VIEW[target].replace('/', '/set', 1)} off</code>")
     await send_html(bot, chat_id, lines_html(
-        f"✅ <b>The {label} were saved exactly, character for character</b>" if target == "rules" else f"✅ <b>The {label} was saved exactly, character for character</b>",
-        f"📏 {len(text):,} characters · {lines:,} lines",
-        f"You can check it with {TARGET_VIEW[target]} (it sends you an exact file copy).",
+        f"✅ <b>{label.capitalize()} saved</b> — exactly as sent",
+        f"{len(text):,} characters · {lines:,} lines",
         *notes,
     ))
 
@@ -1789,11 +1784,10 @@ def capture_text(parts: list[str], target: str, note: str = "") -> str:
     label = TARGET_LABEL[target]
     chars = sum(len(p) for p in parts)
     lines = [
-        f"📝 <b>{label.capitalize()} input mode</b>",
+        f"<b>{label.capitalize()} input mode</b>",
         note or f"Send the {label} now: one message, several messages, or a <code>.txt</code> file.",
-        "Every character is saved exactly as is. For very long texts a <code>.txt</code> file is best.",
         "",
-        f"📥 Received: <b>{len(parts)}</b> parts · <b>{chars:,}</b> characters",
+        f"Received: <b>{len(parts)}</b> parts · <b>{chars:,}</b> characters",
     ]
     if parts:  # a short preview of the start and the end, to confirm it's the right text before saving
         text = "\n".join(parts)
@@ -1801,12 +1795,12 @@ def capture_text(parts: list[str], target: str, note: str = "") -> str:
         tail = " ".join(text[-160:].split()) if len(text) > 320 else ""
         preview = esc(head) + (" …" if len(text) > 160 else "") + (f"\n…\n{esc(tail)}" if tail else "")
         lines += [f"<blockquote expandable>{preview}</blockquote>"]
-    lines += ["Send more parts, or tap ✅ Save to confirm (or send /done)."]
+    lines += ["Send more parts, or tap <b>Save</b>."]
     return lines_html(*lines)
 
 
 async def refresh_capture(bot, chat_id: int) -> None:
-    """A fresh status message with ✅ Save at the bottom of the chat (the previous one is removed),
+    """A fresh status message with Save at the bottom of the chat (the previous one is removed),
     so there's never a need to scroll up to save."""
     await asyncio.sleep(CAPTURE_REFRESH)
     state = capture.get(chat_id)
@@ -1835,8 +1829,8 @@ async def set_control(update: Update, context: ContextTypes.DEFAULT_TYPE, target
         return
     msg, bot, chat_id = update.message, context.bot, update.effective_chat.id
     track(chat_id, msg.message_id)
-    raw = msg.text or msg.caption or ""
-    rest = after_command(raw)
+    raw = (msg.text or msg.caption or "") if menu_input.get() is None else menu_input.get()
+    rest = cmd_text(msg)
     replied = msg.reply_to_message
     doc = msg.document or (replied.document if replied else None)
     label = TARGET_LABEL[target]
@@ -1844,7 +1838,7 @@ async def set_control(update: Update, context: ContextTypes.DEFAULT_TYPE, target
         save_identity(target, "")
         fallback = ("the lead goes back to the Chat persona's voice" if target == "lead"
                     else "the agents work without an identity")
-        await send_html(bot, chat_id, f"🗑 The {label} was removed — {fallback}.")
+        await send_html(bot, chat_id, f"The {label} was removed — {fallback}.")
         return
     try:
         if doc:
@@ -1890,7 +1884,7 @@ async def finish_capture(bot, chat_id: int, save: bool) -> None:
         with contextlib.suppress(TelegramError):
             await state["prompt"].edit_reply_markup(None)
     if not save:
-        await send_html(bot, chat_id, f"✖️ Changing the {label} was cancelled.")
+        await send_html(bot, chat_id, f"Cancelled — the {label} stayed the same.")
     elif not state["parts"]:
         await send_html(bot, chat_id, f"⚠️ I didn't receive any text — the {label} stayed the same.")
     else:
@@ -1952,7 +1946,7 @@ async def view_control(update: Update, context: ContextTypes.DEFAULT_TYPE, targe
     p = load_target(target)
     if target in IDENTITY_FILES and not p.strip():
         fallback = ("The lead uses the Chat persona's voice." if target == "lead" else "The agents work without an identity.")
-        await send_html(bot, chat_id, lines_html(f"📜 <b>No {label} set.</b> {fallback}",
+        await send_html(bot, chat_id, lines_html(f"<b>No {label} set.</b> {fallback}",
                                                  f"Set one: <code>{TARGET_VIEW[target].replace('/', '/set', 1)}</code>"))
         return
     # a file only — an exact copy, with the size in the caption (no text messages in the chat)
@@ -1960,7 +1954,7 @@ async def view_control(update: Update, context: ContextTypes.DEFAULT_TYPE, targe
              "agents": "agents_identity.txt"}[target]
     m = await bot.send_document(
         chat_id, InputFile(io.BytesIO(p.encode("utf-8")), filename=fname),
-        caption=f"📜 Current {label} — {len(p):,} characters · {p.count(chr(10)) + 1:,} lines")
+        caption=f"Current {label} — {len(p):,} characters · {p.count(chr(10)) + 1:,} lines")
     track(chat_id, m.message_id)
 
 
@@ -1986,7 +1980,7 @@ async def cmd_settitle(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         return
     chat_id = update.effective_chat.id
     track(chat_id, update.message.message_id)
-    raw = after_command(update.message.text or "").strip()
+    raw = cmd_text(update.message).strip()
     if not raw:
         await send_html(context.bot, chat_id, lines_html(
             "Usage: <code>/settitle App Name</code> (Latin characters)",
@@ -1995,7 +1989,7 @@ async def cmd_settitle(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         return
     if raw.lower() in ("off", "none", "remove"):
         save_title("")
-        await send_html(context.bot, chat_id, "🗑 X-Title removed — it's no longer sent.")
+        await send_html(context.bot, chat_id, "X-Title removed — it's no longer sent.")
         return
     title = " ".join(raw.split())  # one line, no line breaks
     if not title.isascii():
@@ -2005,7 +1999,7 @@ async def cmd_settitle(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         ))
         return
     save_title(title[:100])
-    note = "🔒 Stored encrypted" if vault.enabled() else "⚠️ Not encrypted — add PERSONA_KEY to store it encrypted"
+    note = "Stored encrypted" if vault.enabled() else "⚠️ Not encrypted — add PERSONA_KEY to store it encrypted"
     await send_html(context.bot, chat_id, lines_html(
         f"✅ X-Title saved: <code>{esc(title[:100])}</code>",
         note,
@@ -2018,8 +2012,8 @@ async def cmd_title(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     chat_id = update.effective_chat.id
     track(chat_id, update.message.message_id)
     t = load_title()
-    await send_html(context.bot, chat_id, (f"🏷 Current X-Title: <code>{esc(t)}</code>" if t
-                                                  else "🏷 No X-Title (nothing is sent). Set one with /settitle"))
+    await send_html(context.bot, chat_id, (f"Current X-Title: <code>{esc(t)}</code>" if t
+                                                  else "No X-Title (nothing is sent). Set one with /settitle"))
 
 
 # ----- Snippets (saved text/files) -----
@@ -2051,7 +2045,7 @@ async def cmd_snip(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
     msg, bot, chat_id = update.message, context.bot, update.effective_chat.id
     track(chat_id, msg.message_id)
-    rest = after_command(msg.text or msg.caption or "")
+    rest = cmd_text(msg)
     parts = rest.split(maxsplit=1)
     if not parts or not SNIP_NAME.fullmatch(parts[0]):
         await send_html(bot, chat_id, lines_html(
@@ -2083,7 +2077,7 @@ async def cmd_snip(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     kind = "file" if typ == "file" else "text"
     await send_html(bot, chat_id, lines_html(
         f"✅ Snippet <code>!{esc(name)}</code> saved ({kind})",
-        f"📏 {len(content):,} characters",
+        f"{len(content):,} characters",
         f"Use it by writing <code>!{esc(name)}</code> in any message.",
     ))
 
@@ -2100,9 +2094,9 @@ async def cmd_snippets(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             "Add one: <code>/snip name text</code>, then write <code>!name</code> in your message.",
         ))
         return
-    rows = ["🔖 <b>Snippets</b>", ""]
+    rows = ["<b>Snippets</b>", ""]
     for name, s in snips.items():
-        kind = "📎" if s.get("type") == "file" else "📝"
+        kind = "" if s.get("type") == "file" else ""
         preview = " ".join((s.get("content") or "").split())[:40]
         rows.append(f"{kind} <code>!{esc(name)}</code> — {esc(preview)}")
     rows += ["", "To delete: <code>/delsnip name</code>"]
@@ -2119,7 +2113,7 @@ async def cmd_delsnip(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     if name in snips:
         del snips[name]
         save_snippets(snips)
-        await send_html(context.bot, chat_id, f"🗑 Snippet <code>!{esc(name)}</code> deleted")
+        await send_html(context.bot, chat_id, f"Snippet <code>!{esc(name)}</code> deleted")
     else:
         await send_html(context.bot, chat_id, "⚠️ No snippet with that name. See /snippets")
 
@@ -2137,26 +2131,19 @@ def param_label(key: str, mode: str) -> str:
 
 
 def settings_html(mode: str = "chat") -> str:
-    def show(k):
-        v = cfg(k, mode)
-        if v is None or v == "default":
-            return "<i>default</i>"
-        if isinstance(v, bool):
-            return "✅" if v else "❌"
-        if k in ("model", "worker_model"):
-            return f"<code>{esc(str(v))}</code> · <i>{esc(provider_text(v))}</i>"
-        if k == "backend":
-            return esc(backend_label())
-        return f"<code>{esc(str(v))}</code>"
-
-    title = "💻 <b>Coding mode settings</b>" if mode == "agent" else "⚙️ <b>Settings</b>"
-    rows = [title, "", f"• <b>🔀 Backend:</b> {esc(backend_label())} <i>(same models — switch with the buttons)</i>"]
-    rows += [f"• <b>{param_label(k, mode)}:</b> {show(k)}" for k in mode_params(mode)]
-    rows += [f"• <b>GitHub:</b> {'✅ connected' if github_tools.enabled() else '❌ not connected (add GH_PAT)'}"]
+    model = cfg("model", mode)
+    rows = ["<b>Coding settings</b>" if mode == "agent" else "<b>Settings</b>", "",
+            f"Backend: {esc(backend_label())}",
+            f"Model: <code>{esc(str(model))}</code> · {esc(provider_text(model))}"]
     if mode == "agent":
-        rows += [f"• <b>📁 Current project:</b> <code>{esc(current_project())}</code>",
-                 "", "<i>Coding settings are independent of Chat — changing one never affects the other.</i>"]
-    rows += ["", "<i>Numbers:</i> <code>/set temperature 0.7</code> · <code>/set max_tokens 2000</code> · <code>/set top_p off</code>"]
+        wm = cfg("worker_model", mode)
+        rows += [f"Agents: <code>{esc(str(wm))}</code> · {esc(provider_text(wm))}",
+                 f"Project: <code>{esc(current_project())}</code>"]
+    extra = [f"{k} {cfg(k, mode)}" for k in ("temperature", "top_p", "max_tokens") if cfg(k, mode) is not None]
+    if extra:
+        rows.append("Advanced: " + " · ".join(esc(x) for x in extra))
+    rows.append(f"GitHub: {'connected' if github_tools.enabled() else 'not connected'}")
+    rows += ["", "<i>Tap a button to change it.</i>"]
     return lines_html(*rows)
 
 
@@ -2168,37 +2155,34 @@ def settings_keyboard(mode: str = "chat") -> InlineKeyboardMarkup:
 
     def toggle(label, key):
         on = cfg(key, mode)
-        return InlineKeyboardButton(f"{'✅' if on else '❌'} {label}", callback_data=f"{tag}:{key}:{'off' if on else 'on'}")
+        return InlineKeyboardButton(f"{label}: {'on' if on else 'off'}", callback_data=f"{tag}:{key}:{'off' if on else 'on'}")
 
     def head(text):
-        return [InlineKeyboardButton(text, callback_data="noop")]
+        return [InlineKeyboardButton(f"— {text} —", callback_data="noop")]
 
     e, be = cfg("effort", mode), backend_name()
-    backend_row = [btn("💳 Paid (OpenRouter)", "backend", "openrouter", be), btn("🆓 Free (NVIDIA)", "backend", "nvidia", be)]
+    backend_row = [btn("Paid · OpenRouter", "backend", "openrouter", be), btn("Free · NVIDIA", "backend", "nvidia", be)]
+    efforts = [btn({"default": "auto"}.get(x, x), "effort", x, e) for x in EFFORTS]
     if mode != "agent":
         return InlineKeyboardMarkup([
-            head("🔀 Backend (same models):"),
-            backend_row,
-            head("🧠 Reasoning effort:"),
-            [btn({"default": "default"}.get(x, x), "effort", x, e) for x in EFFORTS],
+            head("Backend"), backend_row,
+            head("Reasoning"), efforts,
             [toggle("Thinking", "show_thinking"), toggle("Web search", "web_search")],
             [toggle("Long replies as a page", "long_pages")],
-            [toggle("txt file after each reply", "export_txt")],
-            [InlineKeyboardButton("💻 Switch to Coding mode", callback_data="set:agent_mode:on")],
+            [toggle("Text file after each reply", "export_txt")],
+            [InlineKeyboardButton("Switch to Coding mode", callback_data="set:agent_mode:on")],
         ])
+    perm = cfg("permissions", mode)
     return InlineKeyboardMarkup([
-        head("🔀 Backend (same models):"),
-        backend_row,
-        head("🧠 Lead reasoning:"),
-        [btn({"default": "default"}.get(x, x), "effort", x, e) for x in EFFORTS],
-        head("👷 Parallel agents:"),
-        [btn(str(n), "max_agents", n, cfg("max_agents", mode)) for n in (2, 3, 4, 6, 8)],
-        [toggle("📝 Plan first", "plan_mode"), toggle("Thinking", "show_thinking")],
-        [toggle("Web search", "web_search"), toggle("Long as a page", "long_pages")],
-        [toggle("🎭 Persona voice", "persona_voice"), toggle("txt after each reply", "export_txt")],
-        [btn("🔓 Auto-run", "permissions", "auto", cfg("permissions", mode)),
-         btn("🔐 Ask first", "permissions", "ask", cfg("permissions", mode))],
-        [InlineKeyboardButton("💬 Back to Chat mode", callback_data="set:agent_mode:off")],
+        head("Backend"), backend_row,
+        head("Lead reasoning"), efforts,
+        head("Agents at once"), [btn(str(n), "max_agents", n, cfg("max_agents", mode)) for n in (2, 3, 4, 6, 8)],
+        head("Commands and GitHub changes"),
+        [btn("Run automatically", "permissions", "auto", perm), btn("Ask me first", "permissions", "ask", perm)],
+        [toggle("Plan first", "plan_mode"), toggle("Thinking", "show_thinking")],
+        [toggle("Web search", "web_search"), toggle("Long replies as a page", "long_pages")],
+        [toggle("Lead identity", "persona_voice"), toggle("Text file", "export_txt")],
+        [InlineKeyboardButton("Back to Chat mode", callback_data="set:agent_mode:off")],
     ])
 
 
@@ -2224,7 +2208,7 @@ async def on_settings_button(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await q.answer()
         return
     save_setting(key, parse_value(key, raw), mode)
-    await q.answer("Done ✅")
+    await q.answer("Done ")
     if key == "agent_mode":  # switching versions: the keyboard, the menu and the panel all change
         await switch_mode(context.bot, q.message.chat_id, bool(cfg("agent_mode")), q.message)
         return
@@ -2284,20 +2268,18 @@ def code_welcome_html() -> str:
     ws = get_ws()
     n, size = ws.stats()
     return lines_html(
-        "💻 <b>Coding mode</b>",
-        f"🧠 Lead: <code>{esc(str(cfg('model', 'agent')))}</code> · reasoning {esc(str(cfg('effort', 'agent')))}",
-        f"🔀 Backend: {esc(backend_label())} — switch it in ⚙️ Coding settings",
-        f"👷 Agents: <code>{esc(str(cfg('worker_model', 'agent')))}</code> — up to {_max_agents()} in parallel",
-        f"📁 Project: <code>{esc(ws.name)}</code> ({n} files · {human(size)}) — /project to switch",
+        "<b>Coding mode</b>",
         "",
-        "Ask for any project or coding task: I understand it, plan, split the work across agents, write, run and test, and come back with the result.",
-        "• Send files or a <code>zip</code> and they're saved into the project · <code>@path</code> attaches a project file",
-        "• Write while it works and your message reaches the lead right away · ⏹ stops · \"think hard\" or ultrathink = maximum reasoning",
-        "• /plan plan before executing · /undo undo · /files /zip · <code>$ cmd</code> runs a command · <code># note</code> saves to memory · /watch CI",
-        "• /init writes project memory · /review · /security_review · /context /status /cost /doctor",
-        "• /setleadpersona gives the lead its own identity · /setagentpersona gives every agent one",
+        f"Lead: <code>{esc(str(cfg('model', 'agent')))}</code>",
+        f"Agents: <code>{esc(str(cfg('worker_model', 'agent')))}</code> · up to {_max_agents()} at once",
+        f"Backend: {esc(backend_label())}",
+        f"Project: <code>{esc(ws.name)}</code> · {n} files · {human(size)}",
         "",
-        "<i>This is the Coding version: its settings and look are its own — the persona, snippets and GitHub are shared with Chat.</i>",
+        "Describe what you want built or fixed. The lead plans, splits the work across agents, runs and tests it,",
+        "then reports back. Write while it works to steer it.",
+        "",
+        f"<b>{MENU_BTN}</b> has every command (files, undo, diff, GitHub, memory…).",
+        "Shortcuts: <code>$ command</code> runs it · <code># note</code> saves to memory · <code>@file</code> attaches a file.",
     )
 
 
@@ -2310,6 +2292,7 @@ async def refresh_owner_menu(bot) -> None:
 
 
 async def switch_mode(bot, chat_id: int, on: bool, settings_msg: Message | None = None) -> None:
+    _set_menu_open(chat_id, False)  # the main buttons come back
     save_setting("agent_mode", on)
     await refresh_owner_menu(bot)
     if settings_msg is not None:  # an open settings panel turns into the other version's panel
@@ -2321,7 +2304,7 @@ async def switch_mode(bot, chat_id: int, on: bool, settings_msg: Message | None 
         await send_html(bot, chat_id, code_welcome_html(), main_keyboard(True))
     else:
         await send_html(bot, chat_id, lines_html(
-            "💬 <b>Chat mode</b>",
+            "<b>Chat mode</b>",
             "Back to normal chat with its own settings. Coding projects and their memory are kept — return with /code.",
         ), main_keyboard(True))
 
@@ -2344,8 +2327,8 @@ async def cmd_plan(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     on = not cfg("plan_mode", "agent")
     save_setting("plan_mode", on, "agent")
     await send_html(context.bot, chat_id, lines_html(
-        "📝 <b>Plan mode on</b>" if on else "⚡️ <b>Plan mode off</b>",
-        "The lead explores and presents a plan, and executes only after you approve ✅" if on else "The lead executes directly.",
+        "<b>Plan mode on</b>" if on else "<b>Plan mode off</b>",
+        "The lead explores and presents a plan, and executes only after you approve it." if on else "The lead executes directly.",
     ))
 
 
@@ -2356,12 +2339,12 @@ def list_projects() -> list[str]:
 
 def projects_html() -> str:
     cur = current_project()
-    rows = [f"📁 <b>Current project:</b> <code>{esc(cur)}</code>", ""]
+    rows = [f"<b>Current project:</b> <code>{esc(cur)}</code>", ""]
     for name in list_projects()[:30]:
         n, size = Workspace(ws_base(), name).stats()
         cps = checkpoints().count(name)
         rows.append(f"{'●' if name == cur else '○'} <code>{esc(name)}</code> — {n} files · {human(size)}"
-                    + (f" · ↩️ {cps}" if cps else ""))
+                    + (f" · {cps} undo point{'s' if cps != 1 else ''}" if cps else ""))
     rows += ["", "Switch/create: <code>/project name</code> · delete: <code>/project delete name</code>",
              "Clone from GitHub: <code>/clone owner/repo</code>"]
     return lines_html(*rows)
@@ -2369,7 +2352,7 @@ def projects_html() -> str:
 
 def projects_kb() -> InlineKeyboardMarkup | None:
     cur = current_project()
-    rows = [[_btn(("● " if n == cur else "📁 ") + n, f"proj:{n}")] for n in list_projects()[:20]
+    rows = [[_btn(("● " if n == cur else "") + n, f"proj:{n}")] for n in list_projects()[:20]
             if len(f"proj:{n}".encode()) <= 64]
     return InlineKeyboardMarkup(rows) if rows else None
 
@@ -2379,7 +2362,7 @@ async def switch_project(bot, chat_id: int, name: str) -> None:
     save_setting("project", ws.name, "agent")
     n, size = ws.stats()
     await send_html(bot, chat_id, lines_html(
-        f"📁 <b>Project:</b> <code>{esc(ws.name)}</code>",
+        f"<b>Project:</b> <code>{esc(ws.name)}</code>",
         f"{n} files · {human(size)}" if n else "Empty project — ready to start.",
         "" if cfg("agent_mode") else "Switch on /code to work on it.",
     ))
@@ -2399,8 +2382,8 @@ async def cmd_project(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             if name not in list_projects():
                 raise WorkspaceError("No project with that name")
             await send_html(context.bot, chat_id, lines_html(
-                f"🗑 Delete project <code>{esc(name)}</code> with all its files?", "This can't be undone."),
-                InlineKeyboardMarkup([[_btn("🗑 Delete permanently", f"projdel:{name}"[:64]), _btn("✖️ No", "noop")]]))
+                f"Delete project <code>{esc(name)}</code> with all its files?", "This can't be undone."),
+                InlineKeyboardMarkup([[_btn("Delete permanently", f"projdel:{name}"[:64]), _btn("No", "noop")]]))
             return
         await switch_project(context.bot, chat_id, valid_name(args[0]))
     except WorkspaceError as e:
@@ -2434,7 +2417,7 @@ async def on_project_button(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         save_setting("project", "main", "agent")
     with contextlib.suppress(TelegramError):
         await q.edit_message_reply_markup(None)
-    await send_html(context.bot, q.message.chat_id, f"🗑 Project <code>{esc(name)}</code> deleted.")
+    await send_html(context.bot, q.message.chat_id, f"Project <code>{esc(name)}</code> deleted.")
 
 
 async def send_file(bot, chat_id: int, data: bytes, filename: str, caption: str = "") -> None:
@@ -2456,7 +2439,7 @@ async def cmd_files(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await send_html(context.bot, chat_id, "⚠️ " + esc(str(e)))
         return
     n, size = ws.stats()
-    head = f"🗂 <b>{esc(ws.name)}</b> — {n} files · {human(size)}"
+    head = f"<b>{esc(ws.name)}</b> — {n} files · {human(size)}"
     if len(text) > 3500:
         await send_html(context.bot, chat_id, head)
         await send_file(context.bot, chat_id, text.encode(), f"{ws.name}-files.txt")
@@ -2478,7 +2461,7 @@ async def cmd_get(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     except WorkspaceError as e:
         await send_html(context.bot, chat_id, "⚠️ " + str(e))
         return
-    await send_file(context.bot, chat_id, full.read_bytes(), full.name, f"📄 {ws.rel(full)}")
+    await send_file(context.bot, chat_id, full.read_bytes(), full.name, f"{ws.rel(full)}")
 
 
 async def send_zip(bot, chat_id: int) -> None:
@@ -2489,7 +2472,7 @@ async def send_zip(bot, chat_id: int) -> None:
         await send_html(bot, chat_id, "⚠️ " + esc(str(e)))
         return
     n, _ = ws.stats()
-    await send_file(bot, chat_id, data, f"{ws.name}.zip", f"📦 {ws.name} — {n} files")
+    await send_file(bot, chat_id, data, f"{ws.name}.zip", f"{ws.name} — {n} files")
 
 
 async def cmd_zip(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2502,7 +2485,7 @@ async def cmd_sh(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Run a command directly in the project (like ! in Claude Code). Shortcut: start a message with "$ "."""
     if (chat_id := await _owner_cmd(update, context)) is None:
         return
-    command = after_command(update.message.text or "").strip()
+    command = cmd_text(update.message).strip()
     if not command:
         await send_html(context.bot, chat_id, "Usage: <code>/sh ls -la</code> — or just send <code>$ ls -la</code>")
         return
@@ -2531,7 +2514,7 @@ async def do_undo(bot, chat_id: int, cp_id: str | None = None) -> None:
         t.checkpoint = None
     left = checkpoints().count(project)
     await send_html(bot, chat_id, lines_html(
-        f"↩️ <b>Undid:</b> {esc(top.get('label', '')[:100])}",
+        f"<b>Undid:</b> {esc(top.get('label', '')[:100])}",
         f"Restored {restored} files to how they were before the request" + (f" · couldn't restore {len(skipped)} (too big)" if skipped else ""),
         "<i>Changes made by commands (installs, deleting via shell…) aren't tracked, like in Claude Code.</i>",
         f"{left} undo points left." if left else "",
@@ -2550,7 +2533,7 @@ async def cmd_diff(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not diffs:
         await send_html(context.bot, chat_id, "No changes yet.")
         return
-    await send_file(context.bot, chat_id, next(reversed(diffs.values())).encode(), "changes.diff", "📄 Diff of the latest request")
+    await send_file(context.bot, chat_id, next(reversed(diffs.values())).encode(), "changes.diff", "Diff of the latest request")
 
 
 async def cmd_memory(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2559,11 +2542,11 @@ async def cmd_memory(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         return
     ws = get_ws()
     f = ws.root / "AGENTS.md"
-    note = after_command(update.message.text or "").strip()
+    note = cmd_text(update.message).strip()
     if note:
         cur = f.read_text(encoding="utf-8") if f.is_file() else "# AGENTS.md — project memory\n"
         f.write_text(cur.rstrip("\n") + f"\n- {note}\n", encoding="utf-8")
-        await send_html(context.bot, chat_id, "🧠 Added to project memory (AGENTS.md).")
+        await send_html(context.bot, chat_id, "Added to project memory (AGENTS.md).")
         return
     if not f.is_file():
         await send_html(context.bot, chat_id, lines_html(
@@ -2572,9 +2555,9 @@ async def cmd_memory(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         return
     text = f.read_text(encoding="utf-8", errors="replace")
     if len(text) > 3500:
-        await send_file(context.bot, chat_id, text.encode(), "AGENTS.md", "🧠 Project memory")
+        await send_file(context.bot, chat_id, text.encode(), "AGENTS.md", "Project memory")
     else:
-        await send_html(context.bot, chat_id, "🧠 <b>AGENTS.md</b>\n<pre>" + esc(text) + "</pre>")
+        await send_html(context.bot, chat_id, "<b>AGENTS.md</b>\n<pre>" + esc(text) + "</pre>")
 
 
 async def summarize_messages(msgs: list) -> str:
@@ -2617,23 +2600,22 @@ async def cmd_compact(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         (save_agent_histories if agent_on else save_histories)()
         last_turn.pop(chat_id, None)
     await send_html(context.bot, chat_id, lines_html(
-        "🗜 <b>Conversation compacted</b>", f"{before:,} → {len(summary):,} characters — the context is kept as a summary."))
+        "<b>Conversation compacted</b>", f"{before:,} → {len(summary):,} characters — the context is kept as a summary."))
 
 
 async def cmd_cost(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if (chat_id := await _owner_cmd(update, context)) is None:
         return
     data = _read_json(dpath("usage.json"), {})
-    rows = ["💰 <b>Usage</b>", "", "<b>Since this run started:</b>"]
-    rows += [f"• <code>{esc(m)}</code>: {agent.usage_line(u)}" for m, u in session_usage.models.items()] or ["—"]
-    rows += ["", f"<b>All time (since {esc(data.get('since', '—'))}):</b>"]
+    rows = ["<b>Usage</b>", "", "<b>This run</b>"]
+    rows += [f"<code>{esc(m)}</code> — {agent.usage_line(u)}" for m, u in session_usage.models.items()] or ["—"]
+    rows += ["", f"<b>All time</b> (since {esc(data.get('since', '—'))})"]
     total = {"prompt": 0, "completion": 0, "cost": 0.0, "calls": 0}
     for m, u in (data.get("models") or {}).items():
-        rows.append(f"• <code>{esc(m)}</code>: {agent.usage_line(u)}")
+        rows.append(f"<code>{esc(m)}</code> — {agent.usage_line(u)}")
         for k in total:
             total[k] += u.get(k, 0)
-    rows += ["", f"<b>Total:</b> {agent.usage_line(total)}",
-             "<i>Cost as reported by OpenRouter with each request.</i>"]
+    rows += ["", f"Total: {agent.usage_line(total)}", "<i>Costs as reported by OpenRouter (NVIDIA is free).</i>"]
     await send_html(context.bot, chat_id, lines_html(*rows))
 
 
@@ -2653,7 +2635,7 @@ async def cmd_clone(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await context.bot.send_chat_action(chat_id, ChatAction.TYPING)
         msg = await ws.clone(repo, args[1] if len(args) > 1 else None, github_tools.token())
         save_setting("project", ws.name, "agent")
-        await send_html(context.bot, chat_id, lines_html(f"⬇️ {esc(msg)}", f"📁 Current project: <code>{esc(ws.name)}</code>"))
+        await send_html(context.bot, chat_id, lines_html(f"{esc(msg)}", f"Current project: <code>{esc(ws.name)}</code>"))
     except WorkspaceError as e:
         await send_html(context.bot, chat_id, "⚠️ " + esc(str(e)))
 
@@ -2687,8 +2669,8 @@ async def cmd_push(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             created = True
             res = await ws.push(repo, branch, message, github_tools.token())
         await send_html(context.bot, chat_id, lines_html(
-            *([f"➕ Created the private repository <code>{esc(repo)}</code>"] if created else []),
-            f"⬆️ <b>Pushed</b> to <code>{esc(repo)}</code> · 🌿 {esc(branch)} · <code>{res['commit']}</code>",
+            *([f"Created the private repository <code>{esc(repo)}</code>"] if created else []),
+            f"<b>Pushed</b> to <code>{esc(repo)}</code> · {esc(branch)} · <code>{res['commit']}</code>",
             f'<a href="{esc(res["url"])}">Open on GitHub</a>' if res["url"].startswith("http") else ""))
     except WorkspaceError as e:
         await send_html(context.bot, chat_id, "⚠️ " + esc(str(e)))
@@ -2708,11 +2690,11 @@ def make_approver(bot, chat_id: int, ui: "ResponseUI"):
         key = secrets.token_hex(4)
         fut = asyncio.get_running_loop().create_future()
         approvals[key] = fut
-        kb = InlineKeyboardMarkup([[_btn("✅ Allow", f"perm:{key}:y"), _btn("✅ Allow all (this request)", f"perm:{key}:a")],
-                                   [_btn("❌ Deny", f"perm:{key}:n")]])
-        html = f"🔐 <b>Approval needed</b> — {esc(what)}\n<pre>{esc(detail[:1500])}</pre>"
+        kb = InlineKeyboardMarkup([[_btn("Allow", f"perm:{key}:y"), _btn("Allow all (this request)", f"perm:{key}:a")],
+                                   [_btn("Deny", f"perm:{key}:n")]])
+        html = f"<b>Approval needed</b> — {esc(what)}\n<pre>{esc(detail[:1500])}</pre>"
         msg = await send_html(bot, chat_id, html, kb)
-        before, ui.status = ui.status, "🔐 Waiting for your approval…"
+        before, ui.status = ui.status, "Waiting for your approval…"
         choice = "t"
         try:
             choice = await asyncio.wait_for(fut, 900)
@@ -2722,7 +2704,7 @@ def make_approver(bot, chat_id: int, ui: "ResponseUI"):
             approvals.pop(key, None)
             ui.status = before
             verdict = {"y": "✅ Allowed", "a": "✅ Allowed (all for this request)", "n": "❌ Denied",
-                       "t": "⌛️ Timed out — denied"}.get(choice, "❌ Denied")
+                       "t": "Timed out — denied"}.get(choice, "❌ Denied")
             if msg:
                 with contextlib.suppress(TelegramError):
                     await msg.edit_text(f"{html}\n<b>{verdict}</b>", parse_mode=ParseMode.HTML)
@@ -2835,7 +2817,7 @@ async def cmd_context(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
              ("Tool definitions", len(json.dumps(tools, ensure_ascii=False))),
              (f"Conversation ({len(hist)} messages)", sum(len(str(m.get("content"))) for m in hist))]
     total = sum(n for _, n in parts)
-    rows = [f"🧮 <b>Context for the next request</b> — <code>{esc(ws.name)}</code>", ""]
+    rows = [f"<b>Context for the next request</b> — <code>{esc(ws.name)}</code>", ""]
     rows += [f"• {esc(name)}: ~{_tok(n):,} tokens" for name, n in parts]
     rows += ["", f"<b>Total:</b> ~{_tok(total):,} tokens (+ your message)",
              "<i>Old code versions are never resent — the lead reads current files on demand, and older requests "
@@ -2848,33 +2830,34 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         return
     ws = get_ws()
     n, size = ws.stats()
-    git = "not a git repo"
+    git = "not a git repository"
     if (ws.root / ".git").exists():
         code, out = await ws.git(["status", "--short", "--branch"])
         if not code:
             lines = out.splitlines()
             git = f"{esc(lines[0].lstrip('# ')) if lines else '?'} · {len(lines) - 1} changed"
-    jobs = ws.job(None, "list")
-    running = jobs.count("running")
-    total = session_usage.total()
+    running = ws.job(None, "list").count("running")
+    lead_id = "own identity" if load_identity("lead").strip() else "Chat persona's voice"
+    if not cfg("persona_voice", "agent"):
+        lead_id += " (off)"
     rows = [
-        "📊 <b>Status</b> — what's set up right now",
-        "",
-        f"• <b>Version:</b> {'💻 Coding' if cfg('agent_mode') else '💬 Chat'}",
-        f"• <b>Backend:</b> {esc(backend_label())}",
-        f"• <b>Lead:</b> <code>{esc(str(cfg('model', 'agent')))}</code> · {esc(provider_text(cfg('model', 'agent')))} · "
-        f"effort {esc(str(cfg('effort', 'agent')))}",
-        f"• <b>Agents:</b> <code>{esc(str(cfg('worker_model', 'agent')))}</code> · {esc(provider_text(cfg('worker_model', 'agent')))} · "
-        f"up to {_max_agents()} in parallel",
-        f"• <b>Project:</b> <code>{esc(ws.name)}</code> — {n} files · {human(size)} · git: {git}",
-        f"• <b>Identities:</b> lead {'✅ own' if load_identity('lead').strip() else '— Chat persona voice'}"
-        f"{'' if cfg('persona_voice', 'agent') else ' (🎭 off)'} · agents {'✅' if load_identity('agents').strip() else '—'}",
-        f"• <b>Plan mode:</b> {'on' if cfg('plan_mode', 'agent') else 'off'} · "
-        f"<b>Permissions:</b> {esc(str(cfg('permissions', 'agent')))}",
-        f"• <b>GitHub:</b> {'connected' if github_tools.enabled() else 'not connected'} · "
-        f"<b>CI watches:</b> {len(load_watches())}",
-        f"• <b>Background jobs:</b> {running} running · <b>Undo points:</b> {checkpoints().count(ws.name)}",
-        f"• <b>This session:</b> {agent.usage_line(total)}",
+        "<b>Status</b>", "",
+        f"Mode: {'Coding' if cfg('agent_mode') else 'Chat'}",
+        f"Backend: {esc(backend_label())}",
+        "", "<b>Models</b>",
+        f"Lead: <code>{esc(str(cfg('model', 'agent')))}</code> · {esc(provider_text(cfg('model', 'agent')))} · "
+        f"reasoning {esc(str(cfg('effort', 'agent')))}",
+        f"Agents: <code>{esc(str(cfg('worker_model', 'agent')))}</code> · up to {_max_agents()} at once",
+        "", "<b>Project</b>",
+        f"<code>{esc(ws.name)}</code> · {n} files · {human(size)}",
+        f"git: {git}",
+        f"Undo points: {checkpoints().count(ws.name)} · background jobs running: {running}",
+        "", "<b>Coding options</b>",
+        f"Plan first: {'on' if cfg('plan_mode', 'agent') else 'off'} · commands: {esc(str(cfg('permissions', 'agent')))}",
+        f"Lead: {lead_id} · agents: {'own identity' if load_identity('agents').strip() else 'no identity'}",
+        f"GitHub: {'connected' if github_tools.enabled() else 'not connected'} · CI watches: {len(load_watches())}",
+        "", "<b>Usage this run</b>",
+        agent.usage_line(session_usage.total()),
     ]
     await send_html(context.bot, chat_id, "\n".join(rows))
 
@@ -2887,9 +2870,9 @@ async def cmd_jobs(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not jobs:
         await send_html(context.bot, chat_id, "No background jobs in this project.")
         return
-    rows = ["📟 <b>Background jobs</b>", ""]
+    rows = ["<b>Background jobs</b>", ""]
     rows += [f"• <code>{j.id}</code> {esc(j.status())} — <code>{esc(j.command[:80])}</code>" for j in jobs]
-    kb = [[_btn(f"⏹ Stop job {j.id}", f"jobkill:{j.id}")] for j in jobs if j.running][:10]
+    kb = [[_btn(f"Stop job {j.id}", f"jobkill:{j.id}")] for j in jobs if j.running][:10]
     await send_html(context.bot, chat_id, "\n".join(rows), InlineKeyboardMarkup(kb) if kb else None)
 
 
@@ -2917,8 +2900,8 @@ async def cmd_todos(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not board or not board.todos:
         await send_html(context.bot, chat_id, "No plan yet — the lead writes one for multi-step work.")
         return
-    icon = {"pending": "⬜", "in_progress": "🔄", "completed": "✅"}
-    rows = [f"📋 <b>Latest plan</b> — <code>{esc(board.project)}</code>", ""]
+    icon = {"pending": "○", "in_progress": "▸", "completed": "✓"}
+    rows = [f"<b>Latest plan</b> — <code>{esc(board.project)}</code>", ""]
     rows += [f"{icon[t['status']]} {esc(t['content'])}" for t in board.todos]
     await send_html(context.bot, chat_id, "\n".join(rows))
 
@@ -2934,14 +2917,14 @@ async def cmd_export(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         out.append(f"## {who}\n\n{m['content'] if isinstance(m['content'], str) else '[non-text content]'}\n")
     if journal := journal_text(project):
         out.append(f"## Project journal\n\n{journal}\n")
-    await send_file(context.bot, chat_id, "\n".join(out).encode(), f"{project}-session.md", "📤 Session export")
+    await send_file(context.bot, chat_id, "\n".join(out).encode(), f"{project}-session.md", "Session export")
 
 
 async def cmd_agents(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if (chat_id := await _owner_cmd(update, context)) is None:
         return
     ws = get_ws()
-    rows = ["🤖 <b>Agent types</b> — the lead picks one per task", ""]
+    rows = ["<b>Agent types</b> — the lead picks one per task", ""]
     for name, spec in agent.agent_types(ws).items():
         flags = " · read-only" if spec.get("readonly") else ""
         flags += f" · model {esc(spec['model'])}" if spec.get("model") else ""
@@ -2955,64 +2938,60 @@ async def cmd_agents(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
 
 async def ping_rows() -> list[str]:
-    """Checks every API key for real (a 1-token request each, all at the same time)."""
+    """Checks every API key for real (one tiny streamed request each, all at the same time)."""
     rows = []
     try:
         async with httpx.AsyncClient(timeout=15) as http:
             t0 = time.monotonic()
             r = await http.get(f"{OPENROUTER_BASE_URL}/key", headers={"Authorization": f"Bearer {OPENROUTER_API_KEY}"})
         ok = r.status_code == 200
-        rows.append(f"{'✅' if ok else '❌'} 💳 OpenRouter — {'answers' if ok else f'HTTP {r.status_code}'} "
+        rows.append(f"{'✅' if ok else '❌'} OpenRouter — {'answers' if ok else f'HTTP {r.status_code}'} "
                     f"({time.monotonic() - t0:.1f}s)")
     except Exception as e:
-        rows.append(f"❌ 💳 OpenRouter — unreachable: {esc(type(e).__name__)}")
+        rows.append(f"❌ OpenRouter — unreachable ({esc(type(e).__name__)})")
     if not len(nvidia_pool):
-        rows.append("⚠️ 🆓 NVIDIA — no keys set (secrets NVIDIA_KEY_1..3)")
+        rows.append("⚠️ NVIDIA — no keys (add NVIDIA_KEY_1..3)")
         return rows
     model = config.NVIDIA_MODELS.get(config.WORKER_MODEL, config.WORKER_MODEL)
     results = await asyncio.gather(*(nvidia_pool.ping(s, model) for s in nvidia_pool.slots))
     for slot, (ok, what, secs) in zip(nvidia_pool.slots, results):
         icon = "✅" if ok else "⚠️" if ok is None else "❌"
-        rows.append(f"{icon} 🆓 NVIDIA {esc(slot.name)} — {esc(what)}" + ("" if ok else f" ({secs:.1f}s)"))
+        rows.append(f"{icon} NVIDIA {esc(slot.name)} — {esc(what)}")
+    rows.append("NVIDIA load (last minute): " + " · ".join(
+        f"{esc(x['name'])} {x['last_minute']}/{nvidia_pool.rpm}" for x in nvidia_pool.status()))
     return rows
 
 
 async def cmd_doctor(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Health check of everything the bot depends on."""
+    """Health check of everything the bot depends on, in short sections."""
     if (chat_id := await _owner_cmd(update, context)) is None:
         return
     await context.bot.send_chat_action(chat_id, ChatAction.TYPING)
-    rows = ["🩺 <b>Doctor</b> — checks everything the bot depends on", "", "✅ OK · ⚠️ optional / worth a look · ❌ broken", ""]
 
-    def line(ok: bool | None, text: str) -> None:
-        rows.append(f"{'✅' if ok else '⚠️' if ok is None else '❌'} {text}")
+    def mark(ok: bool | None) -> str:
+        return "✅" if ok else "⚠️" if ok is None else "❌"
 
-    # 📡 every API key, checked for real (a 1-token request per NVIDIA key, all at the same time)
-    rows += ["📡 <b>API keys</b>", *await ping_rows()]
-    if len(nvidia_pool):
-        rows += [f"   NVIDIA load (last minute / limit): " + " · ".join(
-            f"{esc(x['name'])} {x['last_minute']}/{nvidia_pool.rpm}" for x in nvidia_pool.status())]
-    rows += ["", "🧩 <b>Everything else</b>"]
+    rows = ["<b>Health check</b>", "", "<b>API keys</b>", *await ping_rows(), "", "<b>Services</b>"]
     if github_tools.enabled():
         try:
-            line(True, f"GitHub token — signed in as <code>{esc(await github_tools.login())}</code>")
+            rows.append(f"✅ GitHub — signed in as <code>{esc(await github_tools.login())}</code>")
         except Exception as e:
-            line(False, f"GitHub token rejected: {esc(str(e)[:120])}")
+            rows.append(f"❌ GitHub — token rejected ({esc(str(e)[:80])})")
     else:
-        line(None, "GitHub not connected (add the GH_PAT secret)")
+        rows.append("⚠️ GitHub — not connected (add GH_PAT)")
+    durable_ok = state_store.enabled and not state_store.last_error
+    rows.append(f"{mark(durable_ok or (None if not state_store.enabled else False))} Durable copy — "
+                f"{esc(state_store.status())}")
+    rows.append(f"{mark(vault.enabled() or None)} Encryption — "
+                + ("on" if vault.enabled() else "off (add PERSONA_KEY)"))
+    rows += ["", "<b>Models</b>", f"Backend: {esc(backend_label())}"]
     for label, mode, key in (("Chat", "chat", "model"), ("Coding lead", "agent", "model"),
                              ("Coding agents", "agent", "worker_model")):
         m = cfg(key, mode)
-        line(True, f"{label}: <code>{esc(str(m))}</code> on {esc(provider_text(m))} (fixed, no fallbacks)")
-    line(True, f"Backend: {esc(backend_label())}")
-    line(state_store.enabled and not state_store.last_error or None,
-         f"Durable copy of persona/rules/settings (repo variables): {esc(state_store.status())}")
-    line(vault.enabled() or None, "PERSONA_KEY set — persona and rules encrypted" if vault.enabled()
-         else "PERSONA_KEY missing — persona and rules stored unencrypted")
-    for tool in ("git", "python3", "node", "npm"):
-        line(bool(shutil.which(tool)) or None, f"{tool} {'available' if shutil.which(tool) else 'not installed'}")
+        rows.append(f"{label}: <code>{esc(str(m))}</code> · {esc(provider_text(m))}")
+    tools = [f"{t} {'✓' if shutil.which(t) else '—'}" for t in ("git", "python3", "node", "npm")]
     free = shutil.disk_usage(DATA_DIR if DATA_DIR.exists() else Path(".")).free
-    line(free > 1_000_000_000 or None, f"Free disk: {human(free)}")
+    rows += ["", "<b>Machine</b>", " · ".join(tools), f"Free disk: {human(free)}"]
     await send_html(context.bot, chat_id, "\n".join(rows))
 
 
@@ -3057,15 +3036,15 @@ async def on_agent_button(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             await q.answer("The diff is no longer stored", show_alert=True)
             return
         await q.answer()
-        await send_file(bot, chat_id, text.encode(), "changes.diff", "📄 Diff of the changes")
+        await send_file(bot, chat_id, text.encode(), "changes.diff", "Diff of the changes")
     elif kind == "rep":
         if not (text := reports.get(rest)):
             await q.answer("The reports are no longer stored", show_alert=True)
             return
         await q.answer()
-        await send_file(bot, chat_id, text.encode(), "agents-reports.md", "🤖 Agent reports")
+        await send_file(bot, chat_id, text.encode(), "agents-reports.md", "Agent reports")
     elif kind == "zip":
-        await q.answer("📦 Preparing the file…")
+        await q.answer("Preparing the file…")
         await send_zip(bot, chat_id)
     elif kind == "ask":
         key, _, idx = rest.partition(":")
@@ -3081,7 +3060,7 @@ async def on_agent_button(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         answer = opts[int(idx)]
         with contextlib.suppress(TelegramError):
             await q.edit_message_reply_markup(REGEN_KB)
-        await send_html(bot, chat_id, f"↩️ <b>You chose:</b> {esc(answer)}")
+        await send_html(bot, chat_id, f"<b>You chose:</b> {esc(answer)}")
         await generate(bot, chat_id, Turn(None, answer, answer, {}, q.from_user.id, mode="agent",
                                           project=current_project()))
     elif kind == "plan":
@@ -3128,14 +3107,14 @@ async def alert_failure(bot, repo: str, w: dict, r: dict) -> None:
     key = new_key()
     _remember(watch_alerts, key, {"repo": repo, "run": r, "digest": text, "chat": w["chat"]}, keep=60)
     jobs = ", ".join(str(j.get("job")) for j in d.get("failed_jobs") or []) or "—"
-    html = lines_html(f"🔴 <b>CI failed</b> — <code>{esc(repo)}</code>",
-                      f"⚙️ {esc(str(r.get('workflow')))} · 🌿 {esc(str(r.get('branch')))} · <code>{esc(str(r.get('sha')))}</code>",
+    html = lines_html(f"<b>CI failed</b> — <code>{esc(repo)}</code>",
+                      f"{esc(str(r.get('workflow')))} · {esc(str(r.get('branch')))} · <code>{esc(str(r.get('sha')))}</code>",
                       f"❌ {esc(jobs)}")
     if r.get("url"):
         html += f'\n<a href="{esc(r["url"])}">Open the run on GitHub</a>'
     html += f"\n<blockquote expandable>{esc(text[:1500])}</blockquote>"
-    kb = InlineKeyboardMarkup([[_btn("🛠 Fix it with agents", f"wfix:{key}"), _btn("🔁 Re-run", f"wre:{key}")],
-                               [_btn("🔕 Stop watching", f"woff:{key}")]])
+    kb = InlineKeyboardMarkup([[_btn("Fix it with agents", f"wfix:{key}"), _btn("Re-run", f"wre:{key}")],
+                               [_btn("Stop watching", f"woff:{key}")]])
     await send_html(bot, w["chat"], html, kb, keep=False)
     k = f"{r.get('workflow')}|{r.get('branch')}"
     streak = w.setdefault("autofix_streak", {})
@@ -3154,7 +3133,7 @@ async def start_ci_fix(bot, key: str) -> bool:
         project = valid_name(repo.split("/")[-1])
     except WorkspaceError:
         project = "main"
-    text = (f"🔴 CI failed in repository {repo}\n"
+    text = (f"CI failed in repository {repo}\n"
             f"- workflow: {r.get('workflow')} · branch: {r.get('branch')} · commit: {r.get('sha')} · run_id: {r.get('id')}\n"
             f"- link: {r.get('url')}\n\nFailure details:\n{a['digest'][:7000]}\n\n"
             f"Task: fix the root cause of the failure. If the repository isn't cloned in this project, clone it (git_clone) on branch "
@@ -3163,8 +3142,8 @@ async def start_ci_fix(bot, key: str) -> bool:
     short = f"Fix the CI failure in {repo} ({r.get('workflow')} on {r.get('branch')}, run {r.get('id')})"
     save_setting("project", project, "agent")
     get_ws(project)
-    await send_html(bot, a["chat"], lines_html(f"🛠 <b>The lead started fixing the CI failure</b> in <code>{esc(repo)}</code>",
-                                               f"📁 Project: <code>{esc(project)}</code>"))
+    await send_html(bot, a["chat"], lines_html(f"<b>The lead started fixing the CI failure</b> in <code>{esc(repo)}</code>",
+                                               f"Project: <code>{esc(project)}</code>"))
     asyncio.create_task(generate(bot, a["chat"], Turn(None, text, short, {}, OWNER_ID, mode="agent", project=project)))
     return True
 
@@ -3199,7 +3178,7 @@ async def watch_tick(bot) -> None:
                 w.setdefault("autofix_streak", {}).pop(k, None)
                 await send_html(bot, w["chat"], lines_html(
                     f"✅ <b>CI is green again</b> — <code>{esc(repo)}</code>",
-                    f"⚙️ {esc(str(r.get('workflow')))} · 🌿 {esc(str(r.get('branch')))} · <code>{esc(str(r.get('sha')))}</code>"),
+                    f"{esc(str(r.get('workflow')))} · {esc(str(r.get('branch')))} · <code>{esc(str(r.get('sha')))}</code>"),
                     keep=False)
         if not primed:
             w["primed"], changed = True, True
@@ -3231,9 +3210,9 @@ async def cmd_watch(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     async with watch_lock:
         data = load_watches()
         if not args:
-            rows = ["👀 <b>CI watching</b>", ""]
-            rows += [f"• <code>{esc(r)}</code>" + (f" · 🌿 {esc(w['branch'])}" if w.get("branch") else "")
-                     + (" · 🛠 auto-fix" if w.get("auto") else "") for r, w in data.items()] or ["No repositories are being watched."]
+            rows = ["<b>CI watching</b>", ""]
+            rows += [f"• <code>{esc(r)}</code>" + (f" · {esc(w['branch'])}" if w.get("branch") else "")
+                     + (" · auto-fix" if w.get("auto") else "") for r, w in data.items()] or ["No repositories are being watched."]
             rows += ["", "Add: <code>/watch owner/repo [branch] [auto]</code>",
                      "<code>auto</code> = the lead fixes failures and pushes on its own · stop: <code>/watch off owner/repo</code>"]
             await send_html(bot, chat_id, lines_html(*rows))
@@ -3250,7 +3229,7 @@ async def cmd_watch(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if off:
             data.pop(repo, None)
             _write_json(dpath("watches.json"), data)
-            await send_html(bot, chat_id, f"🔕 Stopped watching <code>{esc(repo)}</code>.")
+            await send_html(bot, chat_id, f"Stopped watching <code>{esc(repo)}</code>.")
             return
         extra = [a for a in args[1:]]
         auto = any(a.lower() == "auto" for a in extra)
@@ -3264,12 +3243,12 @@ async def cmd_watch(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                       "seen": sorted(r["id"] for r in runs if r.get("status") == "completed")}
         _write_json(dpath("watches.json"), data)
     last = runs[0] if runs else None
-    icon = {"success": "✅", "failure": "❌", None: "⏳"}.get(last.get("conclusion") if last else None, "⚪️") if last else ""
+    icon = {"success": "✅", "failure": "❌", None: ""}.get(last.get("conclusion") if last else None, "") if last else ""
     await send_html(bot, chat_id, lines_html(
-        f"👀 <b>Watching CI</b> in <code>{esc(repo)}</code>" + (f" · 🌿 {esc(branch)}" if branch else ""),
+        f"<b>Watching CI</b> in <code>{esc(repo)}</code>" + (f" · {esc(branch)}" if branch else ""),
         f"Latest run: {icon} {esc(str(last.get('workflow')))} on {esc(str(last.get('branch')))}" if last else "No runs yet.",
-        "🛠 Auto-fix is on: on any failure the lead fixes it, pushes, and watches until it's green." if auto
-        else "Any failure sends you an alert with a \"🛠 Fix it with agents\" button.",
+        "Auto-fix is on: on any failure the lead fixes it, pushes, and watches until it's green." if auto
+        else "Any failure sends you an alert with a \"Fix it with agents\" button.",
     ))
 
 
@@ -3284,14 +3263,14 @@ async def on_watch_button(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await q.answer("This alert is old — open /watch", show_alert=True)
         return
     if kind == "wfix":
-        await q.answer("🛠 Fix started")
+        await q.answer("Fix started")
         with contextlib.suppress(TelegramError):
             await q.edit_message_reply_markup(None)
         await start_ci_fix(context.bot, key)
     elif kind == "wre":
         try:
             await github_tools.rerun(a["repo"], a["run"]["id"])
-            await q.answer("🔁 Re-running the failed jobs")
+            await q.answer("Re-running the failed jobs")
         except Exception as e:
             await q.answer(f"Couldn't: {str(e)[:150]}", show_alert=True)
     elif kind == "woff":
@@ -3299,7 +3278,7 @@ async def on_watch_button(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             data = load_watches()
             data.pop(a["repo"], None)
             _write_json(dpath("watches.json"), data)
-        await q.answer("🔕 Stopped watching")
+        await q.answer("Stopped watching")
         with contextlib.suppress(TelegramError):
             await q.edit_message_reply_markup(None)
 
@@ -3311,9 +3290,134 @@ async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
 # ================= Startup =================
 
 # The action map: every "action" in config.json points to a function here. Names and menus live in config.json.
+# ================= The Menu button: every command as a button, no "/" needed =================
+
+# (label, action, prompt) — a prompt means the command needs input: the bot asks, and the next message is the answer
+CHAT_MENU = [
+    [("Persona", "persona", None), ("Set persona", "setpersona", None)],
+    [("Rules", "rules", None), ("Set rules", "setrules", None)],
+    [("Snippets", "snippets", None),
+     ("Save snippet", "snip", "Send the snippet as <code>name text</code>. Then write <code>!name</code> in any message to use it.")],
+    [("Status", "status", None), ("Health check", "doctor", None), ("Usage", "cost", None)],
+    [("App title", "settitle", "Send the app name OpenRouter shows (Latin letters), or <code>off</code> to remove it."),
+     ("Wipe all memory", "resetall", "Type <code>YES</code> to wipe the conversation memory of every chat.")],
+]
+CODE_MENU = [
+    [("Files", "files", None), ("Get a file", "get", "Send the file path, e.g. <code>src/app.py</code>."),
+     ("Download project", "zip", None)],
+    [("Diff", "diff", None), ("Undo", "undo", None), ("Plan mode", "plan", None)],
+    [("Review", "review", None), ("Security review", "security_review", None), ("Init memory", "init", None)],
+    [("Project memory", "memory", None),
+     ("Add a note", "memory", "Send the note to save in the project memory (AGENTS.md)."),
+     ("Run a command", "sh", "Send the shell command to run in the project.")],
+    [("Clone repo", "clone", "Send the repository (<code>name</code> or <code>owner/name</code>), optionally followed by a branch."),
+     ("Push", "push", "Send: <code>repository [branch] [commit message]</code>"),
+     ("Watch CI", "watch", "Send: <code>repository [branch] [auto]</code> — or <code>list</code> to see what's watched.")],
+    [("Context", "context", None), ("Task list", "todos", None), ("Agents", "agents", None), ("Jobs", "jobs", None)],
+    [("Lead identity", "leadpersona", None), ("Set lead identity", "setleadpersona", None)],
+    [("Agents identity", "agentpersona", None), ("Set agents identity", "setagentpersona", None)],
+    [("PR comments", "pr_comments", "Send the pull request as <code>owner/repo#number</code>."),
+     ("Compact", "compact", None), ("Export", "export", None)],
+    [("Status", "status", None), ("Health check", "doctor", None), ("Usage", "cost", None)],
+]
+MENU_ITEMS = {label: (action, prompt) for rows in (CHAT_MENU, CODE_MENU) for row in rows
+              for label, action, prompt in row}
+LEGACY_ACTIONS = {"new_chat": "new", "code_new": "new", "settings": "settings", "code_settings": "settings",
+                  "agent_mode": "agent", "chat_mode": "chat", "project": "project"}
+UI_FILE = "ui.json"
+awaiting: dict[int, tuple[str, str]] = {}   # chat → (action, label) waiting for the owner's input
+
+
+def _menu_open() -> set:
+    return set(_read_json(dpath(UI_FILE), {}).get("menu_open", []))
+
+
+def _set_menu_open(chat_id: int, on: bool) -> None:
+    data = _read_json(dpath(UI_FILE), {})
+    ids = set(data.get("menu_open", []))
+    (ids.add if on else ids.discard)(chat_id)
+    data["menu_open"] = sorted(ids)
+    _write_json(dpath(UI_FILE), data)
+
+
+def menu_keyboard() -> ReplyKeyboardMarkup:
+    rows = CODE_MENU if cfg("agent_mode") else CHAT_MENU
+    return ReplyKeyboardMarkup([[label for label, _, _ in row] for row in rows] + [[BACK_BTN]],
+                               resize_keyboard=True, is_persistent=True, input_field_placeholder="Pick a command…")
+
+
+async def cmd_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if (chat_id := await _owner_cmd(update, context)) is None:
+        return
+    _set_menu_open(chat_id, True)
+    await send_html(context.bot, chat_id, "Pick a command. <b>Back</b> returns to the main buttons.", menu_keyboard())
+
+
+async def run_action(update: Update, context, action: str, text: str = "") -> None:
+    """Runs a command as if it was typed, with `text` as what comes after it."""
+    fn = _actions().get(action)
+    if not fn:
+        return
+    token = menu_input.set(text)
+    context.args = text.split() if text else []
+    try:
+        await fn(update, context)
+    finally:
+        menu_input.reset(token)
+
+
+async def menu_router(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Runs before everything else: Menu/Back, the menu's buttons, answers to a button's question, old labels."""
+    msg = update.message
+    if not msg or msg.text is None or not is_owner(update):
+        return
+    chat_id, text = msg.chat_id, msg.text.strip()
+    if text.startswith("/"):                 # a typed command cancels a pending question
+        awaiting.pop(chat_id, None)
+        return
+    if text == MENU_BTN:
+        awaiting.pop(chat_id, None)
+        await cmd_menu(update, context)
+        raise ApplicationHandlerStop
+    if text == BACK_BTN:
+        awaiting.pop(chat_id, None)
+        _set_menu_open(chat_id, False)
+        track(chat_id, msg.message_id)
+        await send_html(context.bot, chat_id, "Main buttons.", main_keyboard(True))
+        raise ApplicationHandlerStop
+    if text in config.LEGACY_BUTTONS:        # a keyboard from before the update
+        awaiting.pop(chat_id, None)
+        await run_action(update, context, LEGACY_ACTIONS.get(config.LEGACY_BUTTONS[text], "start"))
+        raise ApplicationHandlerStop
+    if text in MENU_ITEMS and chat_id in _menu_open():
+        awaiting.pop(chat_id, None)
+        action, prompt = MENU_ITEMS[text]
+        if prompt:
+            awaiting[chat_id] = (action, text)
+            track(chat_id, msg.message_id)
+            await send_html(context.bot, chat_id, lines_html(
+                f"<b>{esc(text)}</b>", prompt, "<i>Send it as your next message, or tap Back to cancel.</i>"))
+        else:
+            await run_action(update, context, action)
+        raise ApplicationHandlerStop
+    if chat_id in awaiting and text not in (NEW_CHAT_BTN, SETTINGS_BTN, AGENT_BTN, CHAT_BTN, PROJECT_BTN,
+                                            CODE_NEW_BTN, CODE_SETTINGS_BTN):
+        action, label = awaiting.pop(chat_id)
+        if action == "resetall":
+            if text.lower() in ("yes", "y"):
+                await run_action(update, context, "resetall")
+            else:
+                await send_html(context.bot, chat_id, "Cancelled — nothing was wiped.")
+        else:
+            await run_action(update, context, action, "" if (action == "watch" and text.lower() == "list") else text)
+        raise ApplicationHandlerStop
+    awaiting.pop(chat_id, None)
+
+
 def _actions() -> dict:
     return {
         "start": cmd_start,
+        "menu": cmd_menu,
         "new": cmd_new,
         "settings": cmd_settings,
         "setpersona": cmd_setpersona,
@@ -3402,6 +3506,7 @@ def build_app() -> Application:
     if api := os.getenv("TELEGRAM_API_BASE"):  # optional: a local Bot API server
         builder = builder.base_url(f"{api}/bot").base_file_url(f"{api}/file/bot")
     app = builder.build()  # concurrent_updates so the stop button works while a reply is running
+    app.add_handler(MessageHandler(filters.UpdateType.MESSAGE & filters.TEXT, menu_router), group=-2)
     app.add_handler(MessageHandler(filters.UpdateType.MESSAGE, capture_messages), group=-1)
 
     # register the commands from config.json
@@ -3422,7 +3527,8 @@ def build_app() -> Application:
     app.add_handler(MessageHandler(filters.Regex(f"^{re.escape(CHAT_BTN)}$"), cmd_chat))
     app.add_handler(MessageHandler(filters.Regex(f"^{re.escape(PROJECT_BTN)}$"), cmd_project))
     app.add_handler(MessageHandler(filters.Regex(f"^{re.escape(CODE_NEW_BTN)}$"), cmd_new))
-    app.add_handler(MessageHandler(filters.Regex(f"^{re.escape(CODE_SETTINGS_BTN)}$"), cmd_settings))
+    if CODE_SETTINGS_BTN != SETTINGS_BTN:
+        app.add_handler(MessageHandler(filters.Regex(f"^{re.escape(CODE_SETTINGS_BTN)}$"), cmd_settings))
 
     app.add_handler(CallbackQueryHandler(on_stop, pattern=r"^stop$"))
     app.add_handler(CallbackQueryHandler(on_regen, pattern=r"^regen$"))

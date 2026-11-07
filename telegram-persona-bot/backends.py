@@ -165,13 +165,12 @@ class KeyPool:
                 pass
             except asyncio.TimeoutError:
                 slot.last_status = "slow"
-                return None, (f"key accepted ({accepted:.1f}s) · the model is busy — no token yet, "
-                              f"requests may wait in NVIDIA's queue"), self.clock() - start
+                return None, "key accepted · model busy (queued)", self.clock() - start
             slot.last_status = "ok"
-            return True, f"answers · first token in {self.clock() - start:.1f}s", self.clock() - start
+            return True, f"answers · first token {self.clock() - start:.1f}s", self.clock() - start
         except APIStatusError as e:
             slot.last_status = f"HTTP {e.status_code}"
-            meaning = {401: "key rejected (401)", 403: "key rejected or no access (403)",
+            meaning = {401: "key rejected (401)", 403: "key rejected (403)",
                        429: "rate limited right now (429)",
                        404: "model not found (404)"}.get(e.status_code, f"HTTP {e.status_code}")
             if e.status_code == 429:
@@ -181,8 +180,7 @@ class KeyPool:
             return False, meaning, self.clock() - start
         except asyncio.TimeoutError:
             slot.last_status = "timeout"
-            return False, f"NVIDIA didn't even accept the request in {timeout:.0f}s (network or overload)", \
-                self.clock() - start
+            return False, f"no response in {timeout:.0f}s", self.clock() - start
         except Exception as e:  # connection errors and the like
             slot.last_status = type(e).__name__
             return False, f"{type(e).__name__}", self.clock() - start

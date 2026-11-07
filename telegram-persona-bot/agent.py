@@ -1105,8 +1105,8 @@ def describe(name: str, raw_args: str) -> str | None:
     return None
 
 
-_ICON = {"waiting": "⏳", "running": "🟢", "done": "✅", "failed": "❌", "skipped": "⏭", "stopped": "⏹"}
-_TODO = {"pending": "⬜", "in_progress": "🔄", "completed": "✅"}
+_ICON = {"waiting": "○", "running": "▸", "done": "✓", "failed": "✗", "skipped": "–", "stopped": "■"}
+_TODO = {"pending": "○", "in_progress": "▸", "completed": "✓"}
 
 
 def short_tokens(n: int) -> str:
@@ -1162,47 +1162,47 @@ def board_html(board: Board, final: bool, files: list[dict] | None = None, statu
 
     if not final:
         u = board.usage.total()
-        live = [f"⏱ {_mm(time.monotonic() - board.started)}"]
+        live = [_mm(time.monotonic() - board.started)]
         if u["prompt"] + u["completion"]:
             live.append(f"{short_tokens(u['prompt'] + u['completion'])} tokens")
         if u["cost"]:
             live.append(f"${u['cost']:.3f}")
-        rows = [_l(f"🛠 <b>Working…</b> · 📁 <code>{esc(board.project)}</code> · " + " · ".join(live))]
+        rows = [_l(f"<b>Working…</b> · <code>{esc(board.project)}</code> · " + " · ".join(live))]
         if todo_lines:
-            rows += ["", _l("📋 <b>Plan</b>"), *todo_lines]
+            rows += ["", _l("<b>Plan</b>"), *todo_lines]
         if agents:
             running = sum(a.status == "running" for a in agents)
             fin = sum(a.status in ("done", "failed", "skipped", "stopped") for a in agents)
-            rows += ["", _l(f"🤖 <b>Agents</b> · {running} running · {fin} finished"), *map(agent_line, agents[-14:])]
+            rows += ["", _l(f"<b>Agents</b> · {running} running · {fin} finished"), *map(agent_line, agents[-14:])]
         if status:
             rows += ["", _l(f"<i>{esc(status)}</i>")]
         return _cap("\n".join(rows))
 
     secs = time.monotonic() - board.started
-    title = "⏹ <b>Stopped" if stopped else "🛠 <b>Done"
+    title = "<b>Stopped" if stopped else "<b>Done"
     head = [_l(f"{title} after {render.duration_text(secs)}</b>")]
     stats = []
     if agents:
-        stats.append(f"🤖 {len(agents)} agent" + ("s" if len(agents) != 1 else ""))
+        stats.append(f"{len(agents)} agent" + ("s" if len(agents) != 1 else ""))
     if files:
         n, plus, minus = files_summary(files)
-        stats.append(f"📝 {n} file" + ("s" if n != 1 else "") + f" (+{plus} −{minus})")
+        stats.append(f"{n} file" + ("s" if n != 1 else "") + f" (+{plus} −{minus})")
     if board.commands:
-        stats.append(f"▶️ {len(board.commands)} command" + ("s" if len(board.commands) != 1 else ""))
+        stats.append(f"{len(board.commands)} command" + ("s" if len(board.commands) != 1 else ""))
     u = board.usage.total()
     if u["prompt"] + u["completion"]:
-        stats.append(f"🔢 {short_tokens(u['prompt'] + u['completion'])} tokens")
+        stats.append(f"{short_tokens(u['prompt'] + u['completion'])} tokens")
     if u["cost"]:
-        stats.append(f"💰 ${u['cost']:.3f}")
+        stats.append(f"${u['cost']:.3f}")
     if stats:
         head.append(_l(" · ".join(stats)))
     body = []
     if todo_lines:
-        body += ["📋 <b>Plan</b>", *todo_lines]
+        body += ["<b>Plan</b>", *todo_lines]
     if agents:
-        body += ([""] if body else []) + ["🤖 <b>Agents</b>", *map(agent_line, agents[:20])]
+        body += ([""] if body else []) + ["<b>Agents</b>", *map(agent_line, agents[:20])]
     if files:
-        body += ([""] if body else []) + ["📝 <b>Files</b>", *[_l(_file_line(f)) for f in files[:25]]]
+        body += ([""] if body else []) + ["<b>Files</b>", *[_l(_file_line(f)) for f in files[:25]]]
         if len(files) > 25:
             body.append(_l(f"<i>… and {len(files) - 25} more files</i>"))
     html = "\n".join(head)

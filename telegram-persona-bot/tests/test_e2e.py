@@ -502,7 +502,7 @@ async def scenario():
     user_msg("/start")
     await wait_idle()
     m = last_bot()
-    check("start: welcome + keyboard", "Welcome" in m["text"] and m["message_id"] in S.get("reply_kb", {}), m)
+    check("start: welcome + keyboard", "write anything" in m["text"] and m["message_id"] in S.get("reply_kb", {}), m)
 
     # 2) Search mid-reply: the text written before the search is kept
     SCRIPT["rounds"] = [
@@ -775,7 +775,7 @@ async def scenario():
     panel = last_bot()
     press("set:show_thinking:off", panel["message_id"])
     await wait_idle()
-    check("settings: toggled", bot.cfg("show_thinking") is False and "❌ Thinking" in json.dumps(S["msgs"][panel["message_id"]].get("reply_markup"), ensure_ascii=False))
+    check("settings: toggled", bot.cfg("show_thinking") is False and "Thinking: off" in json.dumps(S["msgs"][panel["message_id"]].get("reply_markup"), ensure_ascii=False))
     before = len(bot_msgs())
     SCRIPT["rounds"] = [[{"reasoning_content": "secret"}] + text_deltas("no thinking")]
     user_msg("hi")
@@ -1071,7 +1071,7 @@ async def agent_scenario(app):
     menus = [c[1] for c in S["calls"] if c[0] == "setMyCommands"]
     names = {c["command"] for c in json.loads(menus[-1]["commands"]) if isinstance(menus[-1]["commands"], str)} \
         if menus and isinstance(menus[-1].get("commands"), str) else {c["command"] for c in (menus[-1].get("commands") or [])}
-    check("code: own / menu", "chat" in names and "project" in names and "setpersona" not in names, names)
+    check("code: short / menu, everything else under Menu", names == {"start", "menu", "new", "settings"}, names)
     check("menu: /start first in every menu", all(bot._menu_commands(sc)[0].command == "start"
                                                   for sc in ("default", "owner", "code")),
           [bot._menu_commands(sc)[0].command for sc in ("default", "owner", "code")])
@@ -1081,7 +1081,7 @@ async def agent_scenario(app):
     user_msg("/set max_agents 3")
     await wait_idle()
     check("code: /set writes code settings only", bot.cfg("max_agents", "agent") == 3
-          and "max_agents" not in json.loads(bot.SETTINGS_FILE.read_text()) and "Coding mode settings" in last_bot()["text"])
+          and "max_agents" not in json.loads(bot.SETTINGS_FILE.read_text()) and "Coding settings" in last_bot()["text"])
     user_msg("/set max_agents 4")
     await wait_idle()
 
@@ -1143,7 +1143,7 @@ async def agent_scenario(app):
           and "Let me plan" not in strip(reply["text"]), reply["text"][:200])
     work = next((x for x in reversed(msgs) if "Done after" in (x.get("text") or "")), None)
     check("team: work panel summary", work and "Agents" in work["text"] and "api.py" in work["text"]
-          and "📋" in work["text"], (work or {}).get("text", "")[:300])
+          and "<b>Plan</b>" in work["text"], (work or {}).get("text", "")[:300])
     think = next((x for x in reversed(msgs) if "Thought for" in (x.get("text") or "")), {})
     check("team: narration moved to thinking", "💬" in think.get("text", "") and "Let me plan" in think.get("text", ""))
     cbs = callbacks(reply)
@@ -1460,7 +1460,7 @@ async def agent_scenario(app):
           and "Tool definitions" in last_bot()["text"])
     user_msg("/status")
     await wait_idle()
-    check("/status", "Status" in last_bot()["text"] and "Lead:" in last_bot()["text"] and "Permissions:" in last_bot()["text"])
+    check("/status", "Status" in last_bot()["text"] and "Lead:" in last_bot()["text"] and "commands:" in last_bot()["text"])
 
     SCRIPT["rounds"] = [tc(("todo_write", {"todos": [{"content": "step one", "status": "completed"},
                                                      {"content": "step two", "status": "in_progress"}]}),
@@ -1469,7 +1469,7 @@ async def agent_scenario(app):
     await wait_idle()
     user_msg("/todos")
     await wait_idle()
-    check("/todos: latest plan", "step two" in last_bot()["text"] and "🔄" in last_bot()["text"])
+    check("/todos: latest plan", "step two" in last_bot()["text"] and "▸" in last_bot()["text"])
     user_msg("/jobs")
     await wait_idle()
     jobs_msg = last_bot()
@@ -1486,7 +1486,7 @@ async def agent_scenario(app):
     bot.OPENROUTER_BASE_URL = f"http://127.0.0.1:{PORT}/or"
     user_msg("/doctor")
     await wait_idle()
-    check("/doctor: health report", "Doctor" in last_bot()["text"] and "OpenRouter" in last_bot()["text"]
+    check("/doctor: health report", "Health check" in last_bot()["text"] and "OpenRouter" in last_bot()["text"]
           and "GitHub" in last_bot()["text"])
 
     (WQ.root / ".agents").mkdir(exist_ok=True)
@@ -1554,7 +1554,7 @@ async def agent_scenario(app):
     user_msg("/settings")
     await wait_idle()
     panel = json.dumps(last_bot().get("reply_markup"), ensure_ascii=False)
-    check("code settings: own panel with permissions + persona voice", "Coding mode settings" in last_bot()["text"]
+    check("code settings: own panel with permissions + persona voice", "Coding settings" in last_bot()["text"]
           and "cset:permissions:ask" in panel and "persona_voice" in panel and "set:agent_mode:off" in panel, panel[:200])
     bot.save_persona("PERSONA-MARKER-123")
     user_msg("/set persona_voice off")
@@ -1574,7 +1574,7 @@ async def agent_scenario(app):
     user_msg("/setleadpersona You are Captain Nora, calm and precise.")
     await wait_idle()
     check("lead identity: saved", bot.load_identity("lead") == "You are Captain Nora, calm and precise."
-          and "lead's identity was saved" in last_bot()["text"], last_bot()["text"][:200])
+          and "identity saved" in last_bot()["text"], last_bot()["text"][:200])
     check("lead identity: stored encrypted on disk", "Captain Nora" not in bot.dpath("lead_persona.json").read_text()
           if bot.vault.enabled() else True)
     user_msg("/setagentpersona")
@@ -1602,7 +1602,7 @@ async def agent_scenario(app):
           and "they win" in wsys and "Captain Nora" not in wsys, wsys[:900])
     user_msg("/status")
     await wait_idle()
-    check("status: shows identities", "lead ✅ own" in last_bot()["text"] and "agents ✅" in last_bot()["text"],
+    check("status: shows identities", "Lead: own identity" in last_bot()["text"] and "agents: own identity" in last_bot()["text"],
           last_bot()["text"])
     user_msg("/leadpersona")
     await wait_idle()
@@ -1758,7 +1758,7 @@ async def speed_scenario(app):
     board = A.Board("p")
     board.usage.add("m", {"prompt": 1500, "completion": 500, "cost": 0.01})
     live = A.board_html(board, False)
-    check("speed: live panel shows elapsed time and tokens", "⏱ 0:0" in live and "2k tokens" in live and "$0.010" in live, live)
+    check("speed: live panel shows elapsed time and tokens", "· 0:0" in live and "2k tokens" in live and "$0.010" in live, live)
     bot.save_setting("agent_mode", False)
 
 
@@ -1930,16 +1930,16 @@ async def backend_scenario(app):
     check("ping: wrong key (403) → rejected", ok is False and "rejected" in what, (ok, what))
     user_msg("/ping")
     await wait_idle(timeout=40)
-    check("/ping: same as /doctor", "Doctor" in last_bot()["text"] and "key 1 — answers" in last_bot()["text"])
+    check("/ping: same as /doctor", "Health check" in last_bot()["text"] and "key 1 — answers" in last_bot()["text"])
     user_msg("/status")
     await wait_idle()
-    check("/status: shows the backend", "Backend:</b> 🆓 NVIDIA" in last_bot()["text"], last_bot()["text"][:400])
+    check("/status: shows the backend", "Backend: NVIDIA (free" in last_bot()["text"], last_bot()["text"][:400])
     press("set:backend:openrouter", panel["message_id"])
     await wait_idle()
     check("settings button: back to OpenRouter", bot.cfg("backend") == "openrouter")
     menu = [c.command for c in bot._menu_commands("owner")]
-    check("menu: no backend commands, /ping folded into /doctor", "backend" not in menu and "doctor" in menu
-          and "ping" not in menu and "free" not in menu, menu)
+    check("menu: no backend commands in the / list", "backend" not in menu and "ping" not in menu
+          and "free" not in menu, menu)
     bot.nvidia_pool = saved_pool
 
 
@@ -2010,6 +2010,79 @@ async def state_scenario(app):
     check("vault: a passphrase PERSONA_KEY still encrypts", out == "True True True", out)
 
 
+async def menu_scenario(app):
+    """Every command from buttons: Menu opens them, Back returns, a command needing input asks for it."""
+    print("\n— Menu buttons —")
+    bot.save_setting("agent_mode", False)
+
+    def kb_labels(m):
+        return [b if isinstance(b, str) else b.get("text") for row in (S.get("reply_kb", {}).get(m["message_id"]) or {}).get("keyboard", []) for b in row]
+
+    user_msg("/start")
+    await wait_idle()
+    check("menu: Menu button on the main keyboard", bot.MENU_BTN in kb_labels(last_bot()), kb_labels(last_bot()))
+    user_msg(bot.MENU_BTN)
+    await wait_idle()
+    labels = kb_labels(last_bot())
+    check("menu: opens the chat commands as buttons", {"Persona", "Set persona", "Rules", "Health check", "Back"} <= set(labels), labels)
+    n_docs = len(docs_sent())
+    user_msg("Persona")
+    await wait_idle()
+    check("menu: Persona sends the file", len(docs_sent()) == n_docs + 1, docs_sent()[-1:])
+    before = bot.load_persona()
+    user_msg("Set persona")
+    await wait_idle()
+    check("menu: Set persona enters input mode (the label isn't saved)", OWNER in bot.capture
+          and bot.load_persona() == before, bot.load_persona()[:40])
+    user_msg("/cancel")
+    await wait_idle()
+    user_msg("App title")
+    await wait_idle()
+    check("menu: a command needing input asks for it", "Send it as your next message" in last_bot()["text"], last_bot()["text"])
+    user_msg("MenuApp")
+    await wait_idle()
+    check("menu: the next message is the answer", bot.load_title() == "MenuApp", bot.load_title())
+    user_msg("Wipe all memory")
+    await wait_idle()
+    user_msg("no")
+    await wait_idle()
+    check("menu: wiping needs YES", "Cancelled" in last_bot()["text"], last_bot()["text"])
+    user_msg("Back")
+    await wait_idle()
+    check("menu: Back returns to the main buttons", bot.NEW_CHAT_BTN in kb_labels(last_bot()) and OWNER not in bot._menu_open())
+    n_calls = len(MODEL_CALLS)
+    SCRIPT["rounds"] = [text_deltas("just chatting")]
+    user_msg("Persona")
+    await wait_idle()
+    check("menu: a label typed with the menu closed is a normal message", len(MODEL_CALLS) == n_calls + 1)
+    user_msg("⚙️ Settings")
+    await wait_idle()
+    check("menu: old keyboard labels still work", "<b>Settings</b>" in last_bot()["text"], last_bot()["text"][:100])
+    # Coding mode menu
+    user_msg("/code")
+    await wait_idle()
+    user_msg(bot.MENU_BTN)
+    await wait_idle()
+    labels = kb_labels(last_bot())
+    check("menu: coding commands as buttons", {"Files", "Undo", "Diff", "Clone repo", "Run a command", "Back"} <= set(labels), labels)
+    user_msg("Run a command")
+    await wait_idle()
+    user_msg("echo from-the-menu")
+    await wait_idle()
+    check("menu: Run a command takes the typed command", "from-the-menu" in last_bot()["text"], last_bot()["text"][-200:])
+    user_msg("Add a note")
+    await wait_idle()
+    user_msg("menu note works")
+    await wait_idle()
+    check("menu: Add a note saves the typed note (not the label)", "menu note works" in (bot.get_ws().root / "AGENTS.md").read_text()
+          and "Add a note" not in (bot.get_ws().root / "AGENTS.md").read_text())
+    user_msg("Back")
+    await wait_idle()
+    user_msg("/chat")
+    await wait_idle()
+    bot.save_title("")
+
+
 async def main():
     srv = ThreadingHTTPServer(("127.0.0.1", PORT), H)
     threading.Thread(target=srv.serve_forever, daemon=True).start()
@@ -2025,6 +2098,7 @@ async def main():
             await asyncio.wait_for(speed_scenario(app), 120)
             await asyncio.wait_for(backend_scenario(app), 120)
             await asyncio.wait_for(state_scenario(app), 120)
+            await asyncio.wait_for(menu_scenario(app), 120)
         finally:
             await app.updater.stop()
             await app.stop()
