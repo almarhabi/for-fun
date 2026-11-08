@@ -123,6 +123,8 @@ jobs:
           NVIDIA_KEYS: ${{ secrets.NVIDIA_KEYS_2 || secrets.NVIDIA_KEYS }}
           AIHUBMIX_KEYS: ${{ secrets.AIHUBMIX_KEYS_2 || secrets.AIHUBMIX_KEYS }}
           ORCAROUTER_KEYS: ${{ secrets.ORCAROUTER_KEYS_2 || secrets.ORCAROUTER_KEYS }}
+          EXPLABS_KEYS: ${{ secrets.EXPLABS_KEYS_2 || secrets.EXPLABS_KEYS }}
+          EXPLABS_API_KEY: ${{ secrets.EXPLABS_API_KEY_2 || secrets.EXPLABS_API_KEY }}
           # older NVIDIA secrets still work (added after the keys above)
           NVIDIA_API_KEYS: ${{ secrets.NVIDIA_KEY_2_1 || secrets.NVIDIA_KEY_1 }},${{ secrets.NVIDIA_KEY_2_2 || secrets.NVIDIA_KEY_2 }},${{ secrets.NVIDIA_KEY_2_3 || secrets.NVIDIA_KEY_3 }}
           GH_PAT: ${{ secrets.GH_PAT_2 || secrets.GH_PAT }}   # optional: lets the bot write/edit on GitHub and watch CI (owner only)

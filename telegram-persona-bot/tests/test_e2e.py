@@ -1818,10 +1818,10 @@ async def backend_scenario(app):
                500: openai.InternalServerError}.get(code, openai.APIStatusError)
         return cls(message or f"HTTP {code}", response=resp, body=None)
 
-    def usage_chunk(total):
+    def usage_chunk(total, out=10):
         return ChatCompletionChunk.model_validate({
             "id": "1", "object": "chat.completion.chunk", "created": 0, "model": "m", "choices": [],
-            "usage": {"prompt_tokens": total - 10, "completion_tokens": 10, "total_tokens": total}})
+            "usage": {"prompt_tokens": total - out, "completion_tokens": out, "total_tokens": total}})
 
     class FakeSrc:
         """One key of a fake source (or the paid client): scripted failures, delays, mid-stream deaths."""
@@ -1846,7 +1846,8 @@ async def backend_scenario(app):
             self.src, self.closed = src, False
             self.items = ([chunk(role="assistant")] if src.role_first else []) + [DELAY, chunk(content=f"hi from {src.key}")]
             self.items += (["DIE"] if src.die else []) + [chunk(content="!")]
-            self.items += [usage_chunk(src.usage)] if src.usage else []
+            self.items += [usage_chunk(*src.usage) if isinstance(src.usage, tuple) else usage_chunk(src.usage)] \
+                if src.usage else []
 
         def __aiter__(self):
             return self
@@ -1885,6 +1886,15 @@ async def backend_scenario(app):
         return out
 
     ALL = {"NVIDIA_KEYS": "k1\nk2\n k3 \n\nk2", "AIHUBMIX_KEYS": "'a1'\na2", "ORCAROUTER_KEYS": "o1"}
+    ex, ex_log, ex_made, _ = make({"EXPLABS_API_KEY": "e1\ne2"})
+    exr = B.ModelRouter(ex, lambda: "smart")
+    check("ExpLabs: keys from EXPLABS_KEYS (or EXPLABS_API_KEY), offered for DeepSeek only",
+          len(ex["explabs"].pool) == 2 and exr.options(DS) == ["smart", "openrouter", "explabs"]
+          and "explabs" not in exr.options(GLM), (exr.options(DS), exr.options(GLM)))
+    req = ex["explabs"].request({"model": DS, "messages": [], "stream": True, "extra_body": {"provider": {}}})
+    check("ExpLabs: its own model id, 10 a minute, 1M input + 1M output tokens a day", req["model"] ==
+          "deepseek-v4.1-flash" and "extra_body" not in req and ex["explabs"].pool.rpm == 10
+          and ex["explabs"].pool.tpd_in == 1_000_000 and ex["explabs"].pool.tpd_out == 1_000_000, req)
 
     # ----- keys: one secret, one key per line -----
     check("keys: one per line, order kept, quotes/blank lines/duplicates dropped",
@@ -1977,6 +1987,16 @@ async def backend_scenario(app):
     await text_of(st)
     check("pool: tokens counted from the reply's usage", tok.status()[0]["tokens"] == 150, tok.status())
     check("pool: a key over its daily token budget is skipped", tok.pick().name == "key 2", tok.pick())
+    io_src = {}
+    io = B.KeyPool(["i1", "i2"], "u", rpm_per_key=40, max_wait=0.05, name="ExpLabs",
+                   client_factory=lambda k: io_src.setdefault(k, FakeSrc(k, [])), tpd_in_per_key=1000,
+                   tpd_out_per_key=50)
+    io_src["i1"].usage = (100, 60)          # 40 in, 60 out: the output budget (50) is used up, input isn't
+    await text_of(await io.create(model="m", messages=[], stream=True))
+    st0 = io.status()[0]
+    check("pool: input and output tokens counted apart", st0["tokens_in"] == 40 and st0["tokens_out"] == 60, st0)
+    check("pool: a used-up output budget rests the key even with input left", st0["state"] == "out for today"
+          and io.pick().name == "key 2" and io.tokens_left() == 1000, (st0, io.tokens_left()))
     made_q = FakeSrc("q", [])
     quota = B.KeyPool(["q"], "u", client_factory=lambda k: made_q, max_wait=0.05)
 
@@ -2217,7 +2237,7 @@ async def backend_scenario(app):
     check("smart: …but not when that source got much slower", r.rank(GLM)[0].name == "aihubmix")
     B.ROUTE_KEY.reset(key)
     for s_ in provs["aihubmix"].pool.slots:
-        s_.tok.append((time.time(), 990_000))
+        s_.tok.append((time.time(), 990_000, 0))
     check("smart: a big request skips a source whose daily token budget is nearly gone",
           r.rank(GLM, need=50_000)[-1].name == "aihubmix" and r.rank(GLM, need=500)[0].name == "aihubmix",
           ([p.name for p in r.rank(GLM, 50_000)], [p.name for p in r.rank(GLM, 500)]))
@@ -2270,7 +2290,7 @@ async def backend_scenario(app):
     # ----- in Telegram -----
     bot.save_setting("agent_mode", False)
     saved = dict(bot.providers)
-    provs, log, made, paid = make({"NVIDIA_KEYS": "k1\nk2\nk3", "AIHUBMIX_KEYS": "a1\na2"},
+    provs, log, made, paid = make({"NVIDIA_KEYS": "k1\nk2\nk3", "AIHUBMIX_KEYS": "a1\na2", "EXPLABS_KEYS": "e1"},
                                   store=B.UsageStore(DATA / "key_usage.json"))
     bot.providers.clear()
     bot.providers.update(provs)
@@ -2280,7 +2300,7 @@ async def backend_scenario(app):
     panel = last_bot()
     kb = str(callbacks(panel))
     check("settings: a source button per choice for the chat model", all(f"set:main_backend:{n}" in kb for n in
-          ("smart", "openrouter", "nvidia")) and "set:main_backend:aihubmix" not in kb, kb[:600])
+          ("smart", "openrouter", "nvidia", "explabs")) and "set:main_backend:aihubmix" not in kb, kb[:600])
     check("settings: says which sources still need keys", "OrcaRouter (ORCAROUTER_KEYS)" in panel["text"], panel["text"])
     press("set:main_backend:nvidia", panel["message_id"])
     await wait_idle()
@@ -2311,6 +2331,8 @@ async def backend_scenario(app):
           "coding-glm-5.3-flash-free" and aih[-1].get("extra_body") == {"thinking": {"type": "enabled"}}, aih[-1:])
     check("/doctor: shows each key's use (minute, day, tokens)", "/40 a minute" in t and "1/100 today" in t
           and "tokens today" in t and "daily quota" in t, t)
+    check("/doctor: ExpLabs pinged, with its input and output budgets", "ExpLabs key 1 — answers" in t
+          and "/1.0M input today" in t and "/1.0M output today" in t, t)
     user_msg("/status")
     await wait_idle()
     t = last_bot()["text"]

@@ -17,7 +17,7 @@
     "z-ai/glm-5.3": "z-ai/glm-5.3-flash"
   },
   "free_providers": {
-    "_note": "Free model sources. Each one: its API address, the secret that holds its keys (ONE key per line, any number of keys — the order of the lines is kept), per-key limits (rpm = requests a minute, rpd = requests a day, tpd = tokens a day; 0 = no limit), which of the bot's models it serves (bot model → the provider's own model id), and extra request fields per model (how to turn thinking on). A provider without keys is simply not offered. legacy_env: older secret names still read.",
+    "_note": "Free model sources. Each one: its API address, the secret that holds its keys (ONE key per line, any number of keys — the order of the lines is kept), per-key limits (rpm = requests a minute, rpd = requests a day, tpd = tokens a day, tpd_in / tpd_out = input / output tokens a day; 0 = no limit), which of the bot's models it serves (bot model → the provider's own model id), and extra request fields per model (how to turn thinking on). A provider without keys is simply not offered. legacy_env: older secret names still read.",
     "nvidia": {
       "label": "NVIDIA",
       "base_url": "https://integrate.api.nvidia.com/v1",
@@ -84,6 +84,23 @@
       "tpd_per_key": 0,
       "models": {
         "deepseek/deepseek-v4.1-flash-1017": "deepseek/deepseek-v4.1-flash-free"
+      },
+      "model_extra": {}
+    },
+    "explabs": {
+      "label": "ExpLabs",
+      "base_url": "https://api.experientiallabs.ai/v1",
+      "keys_secret": "EXPLABS_KEYS",
+      "legacy_env": [
+        "EXPLABS_API_KEY"
+      ],
+      "rpm_per_key": 10,
+      "rpd_per_key": 0,
+      "tpd_per_key": 0,
+      "tpd_in_per_key": 1000000,
+      "tpd_out_per_key": 1000000,
+      "models": {
+        "deepseek/deepseek-v4.1-flash-1017": "deepseek-v4.1-flash"
       },
       "model_extra": {}
     }

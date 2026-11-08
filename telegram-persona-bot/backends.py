@@ -254,7 +254,7 @@ class UsageStore:
         if not self.path:
             return
         self._data.setdefault(pool, {})[key_id] = [
-            [round(x[0], 1), int(x[1])] if isinstance(x, (list, tuple)) else round(x, 1) for x in items]
+            [round(x[0], 1), *(int(v) for v in x[1:])] if isinstance(x, (list, tuple)) else round(x, 1) for x in items]
         self._dirty = True
         if time.time() - self._flushed_at > 5:  # at most every 5 s (and on shutdown)
             self.flush()
@@ -280,7 +280,7 @@ class Slot:
     key_id: str = ""
     recent: deque = field(default_factory=deque)   # start times of recent requests (monotonic)
     day: deque = field(default_factory=deque)      # start times in the last 24 h (wall clock)
-    tok: deque = field(default_factory=deque)      # (wall time, tokens) in the last 24 h
+    tok: deque = field(default_factory=deque)      # (wall time, input tokens, output tokens) in the last 24 h
     cooldown_until: float = 0.0
     dead_until: float = 0.0
     total: int = 0
@@ -298,10 +298,13 @@ class Slot:
             self.day.popleft()
         return len(self.day)
 
-    def tokens(self, wall: float) -> int:
+    def tokens_io(self, wall: float) -> tuple[int, int]:
         while self.tok and wall - self.tok[0][0] >= DAY:
             self.tok.popleft()
-        return sum(n for _, n in self.tok)
+        return sum(x[1] for x in self.tok), sum(x[2] for x in self.tok)
+
+    def tokens(self, wall: float) -> int:
+        return sum(self.tokens_io(wall))
 
 
 def _retry_after(e: APIStatusError) -> float | None:
@@ -322,7 +325,7 @@ class _Metered:
 
     def __init__(self, stream, prompt_estimate: int, on_done):
         self._s, self._prompt, self._on_done = stream, prompt_estimate, on_done
-        self._chars, self._usage, self._started, self._reported = 0, None, False, False
+        self._chars, self._usage, self._started, self._reported = 0, None, False, False   # usage: (in, out)
 
     def __aiter__(self):
         return self
@@ -335,8 +338,8 @@ class _Metered:
             raise
         self._started = True
         u = getattr(chunk, "usage", None)
-        if u is not None and getattr(u, "total_tokens", None):
-            self._usage = int(u.total_tokens)
+        if u is not None and (getattr(u, "prompt_tokens", None) or getattr(u, "completion_tokens", None)):
+            self._usage = (int(getattr(u, "prompt_tokens", 0) or 0), int(getattr(u, "completion_tokens", 0) or 0))
         for c in getattr(chunk, "choices", None) or []:
             d = getattr(c, "delta", None)
             if d is not None:
@@ -353,9 +356,9 @@ class _Metered:
             return
         self._reported = True
         if self._usage is not None:
-            self._on_done(self._usage)
-        elif self._started:  # no usage sent: the request's size plus what came back
-            self._on_done(self._prompt + int(self._chars / 3.5))
+            self._on_done(*self._usage)
+        elif self._started:  # no usage sent: the request's size, and what came back
+            self._on_done(self._prompt, int(self._chars / 3.5))
 
     async def close(self):
         self._report()
@@ -370,14 +373,17 @@ class KeyPool:
     def __init__(self, keys: list[str], base_url: str, rpm_per_key: int = 40, max_wait: float = 45.0,
                  client_factory=None, clock=time.monotonic, name: str = "NVIDIA", rpd_per_key: int = 0,
                  usage_store: UsageStore | None = None, wall=time.time, secret: str = "NVIDIA_KEYS",
-                 tpd_per_key: int = 0):
+                 tpd_per_key: int = 0, tpd_in_per_key: int = 0, tpd_out_per_key: int = 0):
         # a short connect timeout, and at most 3 minutes of silence between chunks (instead of the SDK's 10)
         factory = client_factory or (lambda key: AsyncOpenAI(api_key=key, base_url=base_url, max_retries=0,
                                                              timeout=httpx.Timeout(180.0, connect=15.0)))
         self.name, self.secret = name, secret
         self.rpm = max(1, int(rpm_per_key))
         self.rpd = max(0, int(rpd_per_key or 0))
-        self.tpd = max(0, int(tpd_per_key or 0))
+        self.tpd = max(0, int(tpd_per_key or 0))            # tokens a day (input + output)
+        self.tpd_in = max(0, int(tpd_in_per_key or 0))      # input tokens a day
+        self.tpd_out = max(0, int(tpd_out_per_key or 0))    # output tokens a day
+        self.metered = bool(self.tpd or self.tpd_in or self.tpd_out)
         self.max_wait = max_wait
         self.clock, self.wall = clock, wall
         self.store = usage_store
@@ -389,18 +395,30 @@ class KeyPool:
             if self.store and self.rpd:
                 s.day.extend(t for t in self.store.load(self.name, key_id)
                              if isinstance(t, (int, float)) and now - t < DAY)
-            if self.store and self.tpd:
-                s.tok.extend((x[0], x[1]) for x in self.store.load(self.name + ":tokens", key_id)
-                             if isinstance(x, list) and len(x) == 2 and now - x[0] < DAY)
+            if self.store and self.metered:
+                for x in self.store.load(self.name + ":tokens", key_id):
+                    if isinstance(x, list) and len(x) in (2, 3) and now - x[0] < DAY:
+                        s.tok.append((x[0], int(x[1]), int(x[2]) if len(x) == 3 else 0))
             self.slots.append(s)
         self._lock = asyncio.Lock()
 
     def __len__(self) -> int:
         return len(self.slots)
 
+    def _token_use(self, s: Slot, wall: float) -> list[float]:
+        """Today's share used of each daily token budget that's set (1.0 = used up)."""
+        if not self.metered:
+            return []
+        i, o = s.tokens_io(wall)
+        return ([(i + o) / self.tpd] if self.tpd else []) + ([i / self.tpd_in] if self.tpd_in else []) + (
+            [o / self.tpd_out] if self.tpd_out else [])
+
+    def _spent(self, s: Slot, wall: float) -> bool:
+        return (bool(self.rpd) and s.today(wall) >= self.rpd) or any(u >= 1 for u in self._token_use(s, wall))
+
     def _usable(self, s: Slot, now: float, wall: float) -> bool:
         return (now >= s.dead_until and now >= s.cooldown_until and s.load(now) < self.rpm
-                and (not self.rpd or s.today(wall) < self.rpd) and (not self.tpd or s.tokens(wall) < self.tpd))
+                and not self._spent(s, wall))
 
     def pick(self) -> Slot | None:
         """The key with the fewest requests in the last minute, then the most daily quota left, then the earlier line."""
@@ -410,7 +428,7 @@ class KeyPool:
             return None
 
         def used_today(s: Slot) -> float:
-            parts = ([s.today(wall) / self.rpd] if self.rpd else []) + ([s.tokens(wall) / self.tpd] if self.tpd else [])
+            parts = ([s.today(wall) / self.rpd] if self.rpd else []) + self._token_use(s, wall)
             return max(parts) if parts else 0.0
 
         return min(usable, key=lambda s: (s.load(now), round(used_today(s), 2), s.index))
@@ -427,7 +445,7 @@ class KeyPool:
                 w = max(w, WINDOW - (now - s.recent[0]))
             if self.rpd and s.today(wall) >= self.rpd:
                 w = max(w, DAY - (wall - s.day[0]))
-            if self.tpd and s.tokens(wall) >= self.tpd:
+            if self.metered and s.tok and any(u >= 1 for u in self._token_use(s, wall)):
                 w = max(w, DAY - (wall - s.tok[0][0]))
             waits.append(w)
         return min(waits) if waits else None
@@ -438,22 +456,30 @@ class KeyPool:
         """Share of today's quota left over the working keys (requests or tokens, whichever is scarcer)."""
         now, wall = self.clock(), self.wall()
         live = [s for s in self.slots if now >= s.dead_until]
-        if not live or not (self.rpd or self.tpd):
+        if not live or not (self.rpd or self.metered):
             return None
         parts = []
         if self.rpd:
             parts.append(sum(max(0, self.rpd - s.today(wall)) for s in live) / (len(live) * self.rpd))
-        if self.tpd:
-            parts.append(sum(max(0, self.tpd - s.tokens(wall)) for s in live) / (len(live) * self.tpd))
+        if self.metered:
+            per_budget = zip(*(self._token_use(s, wall) for s in live))
+            parts += [sum(max(0.0, 1 - u) for u in col) / len(live) for col in per_budget]
         return min(parts)
 
     def tokens_left(self) -> int | None:
-        """Tokens left today on the best working key (None: no token limit)."""
-        if not self.tpd:
+        """Input tokens a request may still use today on the best working key (None: no token limit)."""
+        if not (self.tpd or self.tpd_in):
             return None
         now, wall = self.clock(), self.wall()
-        live = [s for s in self.slots if now >= s.dead_until]
-        return max((max(0, self.tpd - s.tokens(wall)) for s in live), default=0)
+        best = 0
+        for s in self.slots:
+            if now < s.dead_until:
+                continue
+            i, o = s.tokens_io(wall)
+            left = [b for b in ((self.tpd - i - o) if self.tpd else None, (self.tpd_in - i) if self.tpd_in else None)
+                    if b is not None]
+            best = max(best, max(0, min(left)))
+        return best
 
     def capacity(self) -> dict:
         """How busy the pool is: can a key take a request now, how long until one can, how full, quota left."""
@@ -476,10 +502,10 @@ class KeyPool:
             if self.store:
                 self.store.save(self.name, slot.key_id, slot.day)
 
-    def _add_tokens(self, slot: Slot, n: int) -> None:
-        if not self.tpd or n <= 0:
+    def _add_tokens(self, slot: Slot, n_in: int, n_out: int = 0) -> None:
+        if not self.metered or n_in + n_out <= 0:
             return
-        slot.tok.append((self.wall(), int(n)))
+        slot.tok.append((self.wall(), int(n_in), int(n_out)))
         if self.store:
             self.store.save(self.name + ":tokens", slot.key_id, slot.tok)
 
@@ -506,7 +532,7 @@ class KeyPool:
     async def create(self, max_wait: float | None = None, **kw):
         """One request through the pool, moving to another key on 429 / auth / server errors."""
         last: Exception | None = None
-        prompt = estimate_tokens(kw) if self.tpd else 0
+        prompt = estimate_tokens(kw) if self.metered else 0
         for _ in range(max(2, 2 * len(self.slots))):
             try:
                 slot = await self._take(max_wait)
@@ -517,11 +543,12 @@ class KeyPool:
             try:
                 res = await slot.client.chat.completions.create(**kw)
                 slot.last_status = "ok"
-                if self.tpd:
+                if self.metered:
                     if kw.get("stream"):
-                        return _Metered(res, prompt, lambda n, s=slot: self._add_tokens(s, n))
+                        return _Metered(res, prompt, lambda i, o, s=slot: self._add_tokens(s, i, o))
                     u = getattr(res, "usage", None)
-                    self._add_tokens(slot, int(getattr(u, "total_tokens", 0) or 0) or prompt)
+                    self._add_tokens(slot, int(getattr(u, "prompt_tokens", 0) or 0) or prompt,
+                                     int(getattr(u, "completion_tokens", 0) or 0))
                 return res
             except APIStatusError as e:
                 last = e
@@ -568,7 +595,7 @@ class KeyPool:
                 slot.last_status = "slow"
                 return None, "key accepted · model busy (queued)", self.clock() - start
             slot.last_status = "ok"
-            self._add_tokens(slot, 20)
+            self._add_tokens(slot, 12, 8)
             return True, f"answers · first token {self.clock() - start:.1f}s", self.clock() - start
         except APIStatusError as e:
             slot.last_status = f"HTTP {e.status_code}"
@@ -600,12 +627,14 @@ class KeyPool:
         now, wall = self.clock(), self.wall()
         out = []
         for s in self.slots:
-            spent = (self.rpd and s.today(wall) >= self.rpd) or (self.tpd and s.tokens(wall) >= self.tpd)
+            spent = self._spent(s, wall)
             state = ("rejected" if now < s.dead_until else
                      f"resting {s.cooldown_until - now:.0f}s" if now < s.cooldown_until else
                      "out for today" if spent else "ready")
             out.append({"name": s.name, "state": state, "last_minute": s.load(now), "today": s.today(wall),
-                        "tokens": s.tokens(wall), "total": s.total, "failures": s.failures, "last": s.last_status})
+                        "tokens": s.tokens(wall), "tokens_in": s.tokens_io(wall)[0],
+                        "tokens_out": s.tokens_io(wall)[1], "total": s.total, "failures": s.failures,
+                        "last": s.last_status})
         return out
 
 
@@ -1067,7 +1096,9 @@ def build_providers(openrouter_client, free_cfg: dict, env: dict, usage_store: U
         pool = KeyPool(keys, c.get("base_url", ""), int(c.get("rpm_per_key", 20)),
                        float(routing.get("max_wait_seconds", 45)), client_factory, name=c.get("label", name),
                        rpd_per_key=int(c.get("rpd_per_key", 0) or 0), usage_store=usage_store, secret=secret,
-                       tpd_per_key=int(c.get("tpd_per_key", 0) or 0))
+                       tpd_per_key=int(c.get("tpd_per_key", 0) or 0),
+                       tpd_in_per_key=int(c.get("tpd_in_per_key", 0) or 0),
+                       tpd_out_per_key=int(c.get("tpd_out_per_key", 0) or 0))
         out[name] = Provider(name, c.get("label", name), False, c.get("models"), c.get("model_extra"), pool=pool,
                              first_token_timeout=float(routing.get("first_token_timeout", 120)),
                              attempts=int(routing.get("attempts", 2)))

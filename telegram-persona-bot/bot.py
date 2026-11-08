@@ -3083,12 +3083,16 @@ async def ping_rows() -> list[str]:
                 bit += f", {x['today']}/{pool.rpd} today"
             if pool.tpd:
                 bit += f", {agent.short_tokens(x['tokens'])}/{agent.short_tokens(pool.tpd)} tokens today"
+            if pool.tpd_in:
+                bit += f", {agent.short_tokens(x['tokens_in'])}/{agent.short_tokens(pool.tpd_in)} input today"
+            if pool.tpd_out:
+                bit += f", {agent.short_tokens(x['tokens_out'])}/{agent.short_tokens(pool.tpd_out)} output today"
             if x["state"] != "ready":
                 bit += f" ({x['state']})"
             parts.append(bit)
         rows.append(f"{esc(p.label)} use: " + esc(" · ".join(parts)))
-    if any(p.active and (p.pool.rpd or p.pool.tpd) for p in free):
-        rows.append("<i>Each check uses one request of a daily quota.</i>")
+    if any(p.active and (p.pool.rpd or p.pool.metered) for p in free):
+        rows.append("<i>Each check uses a little of a daily quota (one request, a few tokens).</i>")
     return rows
 
 

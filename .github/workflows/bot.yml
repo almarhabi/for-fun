@@ -120,6 +120,8 @@ jobs:
           NVIDIA_KEYS: ${{ secrets.NVIDIA_KEYS }}
           AIHUBMIX_KEYS: ${{ secrets.AIHUBMIX_KEYS }}         # GLM-5.3 Flash free (5 a minute, 100 a day per key)
           ORCAROUTER_KEYS: ${{ secrets.ORCAROUTER_KEYS }}     # optional: DeepSeek V4.1 Flash free
+          EXPLABS_KEYS: ${{ secrets.EXPLABS_KEYS }}           # optional: DeepSeek V4.1 Flash free (10 a minute, 1M in + 1M out tokens a day per key)
+          EXPLABS_API_KEY: ${{ secrets.EXPLABS_API_KEY }}     # the same, if saved under this name
           # older NVIDIA secrets still work (added after the keys above)
           NVIDIA_API_KEYS: ${{ secrets.NVIDIA_KEY_1 }},${{ secrets.NVIDIA_KEY_2 }},${{ secrets.NVIDIA_KEY_3 }}
           GH_PAT: ${{ secrets.GH_PAT }}   # optional: lets the bot write/edit on GitHub and watch CI (owner only)
