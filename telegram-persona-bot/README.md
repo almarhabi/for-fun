@@ -215,22 +215,45 @@ replies as a page, txt file after each reply.
 - Effort levels: default · low · medium · high · max (`xhigh` on OpenRouter).
 - If a provider doesn't support tools: Chat continues without search; Coding needs tools.
 
-## Two backends: 💳 paid (OpenRouter) / 🆓 free (NVIDIA)
+## Model sources: OpenRouter (paid) and free sources, with smart routing
 
-The same models run on either backend, switched by hand with the **🔀 Backend** buttons in ⚙️ Settings
-(both the Chat and the Coding panels) — no command needed. Everything follows the switch — Chat, the Coding lead and the agents.
+Two roles, each with its own choice in Settings (buttons, no command): **the main model** (Chat + the Coding lead)
+and **the coding agents**. Each can be **Smart**, **OpenRouter**, or one free source. Only sources that have keys
+and serve that role's model are offered.
 
-- **💳 OpenRouter:** each model on its fixed provider (above).
-- **🆓 NVIDIA NIM** (`integrate.api.nvidia.com`): `deepseek-ai/deepseek-v4.1-flash` and `z-ai/glm-5.3-flash`
-  (mapping in `config.json` → `nvidia.models`; optional per-model request fields in `nvidia.model_extra`).
-- **Several keys, load spread over them** (`backends.KeyPool`): each request goes to the key with the fewest
-  requests in the last minute; no key goes over `rpm_per_key` (default 40) — when all are full the request waits for
-  the first free slot (up to `max_wait_seconds`); a 429 rests that key and the request moves to another one at once;
-  a 401/403 takes the key out; a bad request (400) isn't retried.
-- **`/doctor`** (also `/ping`) checks every key for real (a 1-token request each, in parallel) plus the
-  OpenRouter key, and shows each NVIDIA key's load. `/status` shows the backend too.
-- Secrets: `NVIDIA_KEY_1`, `NVIDIA_KEY_2`, `NVIDIA_KEY_3` (bot 2 uses `NVIDIA_KEY_2_1..3` if set, otherwise the same
-  three). Never paste keys into code or chat.
+| Source | Serves | Secret (one key per line, any number) | Limits per key |
+|---|---|---|---|
+| OpenRouter (paid) | every model, on its fixed provider | `OPENROUTER_API_KEY` | — |
+| NVIDIA | DeepSeek V4.1 Flash, GLM-5.3 Flash | `NVIDIA_KEYS` (old `NVIDIA_KEY_1..3` still work) | 40 a minute |
+| AIHubMix | GLM-5.3 Flash (`coding-glm-5.3-flash-free`) | `AIHUBMIX_KEYS` | 5 a minute, 100 a day, 1M tokens a day |
+| OrcaRouter | DeepSeek V4.1 Flash (`deepseek/deepseek-v4.1-flash-free`) | `ORCAROUTER_KEYS` | not published (10 a minute assumed) |
+
+Bot 2 reads the `_2` versions (`NVIDIA_KEYS_2`…) if set, otherwise bot 1's. Everything is in `config.json`
+(`free_providers`, `routing`) — a new OpenAI-compatible free source is a few lines there plus its secret in the workflow.
+
+**Keys in a source** (`backends.KeyPool`): each request goes to the key with the fewest requests in the last minute,
+then the most daily quota left, then the earlier line. No key goes over its minute/day/token limits (daily counts
+survive restarts, stored by a hash, never the key). A 429 rests that key and the request moves on at once; a "daily
+quota" 429 rests it an hour; a rejected key (401/403) is taken out; a bad request (400) isn't retried.
+
+**Smart** (`backends.ModelRouter`): free sources first, ranked live by time to first token, failure rate, load, quota
+left (a big request avoids a source whose daily token budget is nearly gone) and which source served the same
+conversation last (its cache). An error moves to the next source at once; a source that hasn't started answering gets
+company after 10–45 s (about 1.5× its usual start) and the first to answer wins, the other is cancelled; two failures
+in a row rest a source (30 s, then longer, up to 10 min) and old observations fade, so it gets another chance.
+"Paid OpenRouter as the last resort" (off by default) adds OpenRouter only after every free source failed.
+
+**A source picked by hand** goes first. Its first failure is retried on it after 3 s; a second failure in a row moves
+to the next source at once (and the log says so) until it recovers; if it is silent for 40 s another source starts
+alongside it.
+
+**Never a dead end on a temporary problem:** timeouts, dropped connections, overload and busy keys are retried —
+Chat, the lead and every agent — with pauses growing from 3 s to 60 s, each try on the healthiest source. Only if
+every source keeps failing for `persist_minutes` (30) does the reply end with the reason. A wrong key, no credit or a
+bad request is reported at once. A reply cut off midway is written again, not doubled.
+
+**Doctor** checks every key of every source for real (a tiny streamed request each, in parallel; on AIHubMix this
+uses one of the day's 100 requests), shows each key's use (minute / day / tokens) and each source's health.
 
 ## Web via Tor / a proxy (optional)
 

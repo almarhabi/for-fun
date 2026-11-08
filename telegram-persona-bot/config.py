@@ -65,12 +65,16 @@ _FALLBACK = {
         "worker_model": {"type": "str", "label": "👷 Agent model", "modes": ["code"]},
         "max_agents": {"type": "int", "label": "👷 Max parallel agents", "modes": ["code"]},
         "persona_voice": {"type": "bool", "label": "🎭 Persona voice in Coding replies (off = fewer tokens)", "modes": ["code"]},
+        "main_backend": {"type": "str", "label": "Main model source", "modes": ["global"]},
+        "agent_backend": {"type": "str", "label": "Coding agents' source", "modes": ["global"]},
+        "paid_fallback": {"type": "bool", "label": "Paid as the last resort", "modes": ["global"]},
     },
     "defaults": {"model": None, "effort": "default", "temperature": None, "top_p": None,
                  "max_tokens": None, "show_thinking": True, "web_search": True, "long_pages": True,
                  "export_txt": False, "agent_mode": False, "plan_mode": False, "permissions": "auto",
                  "worker_model": None, "max_agents": 6, "project": "main",
-                 "persona_voice": True},
+                 "persona_voice": True, "main_backend": "openrouter", "agent_backend": "openrouter",
+                 "paid_fallback": False},
     "code_defaults": {"effort": "high", "show_thinking": True, "web_search": True, "long_pages": True,
                       "export_txt": False, "plan_mode": False, "permissions": "auto", "max_agents": 6,
                       "project": "main", "persona_voice": True},
@@ -115,18 +119,23 @@ MODEL_PROVIDERS: dict = {k: list(v) for k, v in (_data.get("model_providers") or
 LEGACY_MODELS: dict = {k: v for k, v in (_data.get("legacy_models") or {}).items() if not k.startswith("_")}
 
 
-# 🆓 The free backend (NVIDIA NIM): the same models under their NVIDIA ids, and a pool of keys
-NVIDIA: dict = {"base_url": "https://integrate.api.nvidia.com/v1", "rpm_per_key": 40, "max_wait_seconds": 45,
-                "models": {}, "model_extra": {}, **(_data.get("nvidia") or {})}
-NVIDIA_MODELS: dict = {k: v for k, v in (NVIDIA.get("models") or {}).items() if not k.startswith("_")}
-
-
-def nvidia_keys() -> list[str]:
-    """Every NVIDIA key from the environment: NVIDIA_API_KEYS (comma-separated), NVIDIA_API_KEY, NVIDIA_KEY_1..9."""
-    raw = [os.getenv("NVIDIA_API_KEYS", ""), os.getenv("NVIDIA_API_KEY", "")]
-    raw += [os.getenv(f"NVIDIA_KEY_{i}", "") for i in range(1, 10)]
-    keys = [k.strip().strip("\"'") for chunk in raw for k in chunk.replace("\n", ",").split(",")]
-    return list(dict.fromkeys(k for k in keys if k))
+# Free model sources (NVIDIA, AIHubMix, OrcaRouter…): their address, the secret with their keys (one per line),
+# per-key limits, the bot's models under their own ids, and extra request fields (thinking on)
+FREE_PROVIDERS: dict = {k: v for k, v in (_data.get("free_providers") or {}).items()
+                        if not k.startswith("_") and isinstance(v, dict)}
+if not FREE_PROVIDERS and isinstance(_data.get("nvidia"), dict):   # an older config.json
+    FREE_PROVIDERS = {"nvidia": {"label": "NVIDIA", "keys_secret": "NVIDIA_KEYS",
+                                 "legacy_env": ["NVIDIA_API_KEYS", "NVIDIA_API_KEY"] +
+                                               [f"NVIDIA_KEY_{i}" for i in range(1, 10)], **_data["nvidia"]}}
+ROUTING: dict = {"first_token_timeout": 120, "attempts": 2, "hedge_min_seconds": 10, "hedge_max_seconds": 45,
+                 "smart_deadline_seconds": 150, "max_wait_seconds": 45, "picked_patience_seconds": 40,
+                 "persist_minutes": 30,
+                 **{k: v for k, v in (_data.get("routing") or {}).items() if not k.startswith("_")}}
+for _old in ("first_token_timeout", "attempts", "max_wait_seconds"):   # older config: these lived under nvidia
+    if _old in (_data.get("nvidia") or {}) and _old not in (_data.get("routing") or {}):
+        ROUTING[_old] = _data["nvidia"][_old]
+NVIDIA_MODELS: dict = {k: v for k, v in ((FREE_PROVIDERS.get("nvidia") or {}).get("models") or {}).items()
+                       if not k.startswith("_")}
 
 
 def current_model(name: str | None) -> str | None:

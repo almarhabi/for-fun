@@ -422,12 +422,16 @@ def chunk(**delta):
 class FakeStream:
     def __init__(self, deltas, delay):
         self.deltas, self.delay, self.closed = deltas, delay, False
+        self.die_after = None   # the connection drops after this many chunks
 
     def __aiter__(self):
         return self._gen()
 
     async def _gen(self):
-        for d in self.deltas:
+        for i, d in enumerate(self.deltas):
+            if self.die_after is not None and i == self.die_after:
+                import httpx
+                raise httpx.RemoteProtocolError("peer closed connection without sending complete message body")
             await asyncio.sleep(self.delay)
             yield chunk(**d)
 
@@ -457,11 +461,21 @@ async def fake_create(**kw):
     if SCRIPT["no_tools"] and kw.get("tools"):
         import httpx, openai
         raise openai.APIError("No endpoints found that support tool use.", httpx.Request("POST", "https://x"), body=None)
+    if SCRIPT.get("timeouts"):
+        SCRIPT["timeouts"] -= 1
+        import httpx, openai
+        raise openai.APITimeoutError(request=httpx.Request("POST", "https://x"))
     deltas = SCRIPT["rounds"].pop(0) if SCRIPT["rounds"] else [{"content": "OK"}]
-    return FakeStream(deltas, SCRIPT["delay"])
+    st = FakeStream(deltas, SCRIPT["delay"])
+    if SCRIPT.get("die_once"):
+        SCRIPT["die_once"] = False
+        st.die_after = 1
+    return st
 
 
 bot.client.chat.completions.create = fake_create
+bot.worker_client.chat.completions.create = fake_create
+bot.usage_store.path = DATA / "key_usage.json"
 
 
 async def fake_tool(name, args):
@@ -1763,211 +1777,561 @@ async def speed_scenario(app):
 
 
 async def backend_scenario(app):
-    """💳 OpenRouter / 🆓 NVIDIA: the key pool spreads the load, survives 429/401, and the router follows the switch."""
+    """Model sources: key pools (any number of keys, per-minute/day/token limits), the smart router (ranking,
+    hedging, failover, circuit breaker, affinity, paid last resort), patient retries, and the Settings/Doctor UI."""
     import backends as B
     import httpx, openai
-    print("\n— 🔀 Backends —")
+    from types import SimpleNamespace
+    print("\n— Model sources —")
+    GLM, DS = "z-ai/glm-5.3-flash", "deepseek/deepseek-v4.1-flash-1017"
+    DELAY = object()
 
-    def status_error(code):
-        resp = httpx.Response(code, request=httpx.Request("POST", "https://nim.test/v1/chat/completions"),
+    def status_error(code, message=None):
+        resp = httpx.Response(code, request=httpx.Request("POST", "https://src.test/v1/chat/completions"),
                               headers={"retry-after": "30"} if code == 429 else {})
-        cls = {429: openai.RateLimitError, 401: openai.AuthenticationError}.get(code, openai.APIStatusError)
-        return cls(f"HTTP {code}", response=resp, body=None)
+        cls = {429: openai.RateLimitError, 401: openai.AuthenticationError,
+               500: openai.InternalServerError}.get(code, openai.APIStatusError)
+        return cls(message or f"HTTP {code}", response=resp, body=None)
 
-    class FakeNim:
-        def __init__(self, name, log):
-            self.name, self.log, self.fail = name, log, []
-            self.chat = type("C", (), {})()
-            self.chat.completions = type("CC", (), {})()
-            self.chat.completions.create = self.create
+    def usage_chunk(total):
+        return ChatCompletionChunk.model_validate({
+            "id": "1", "object": "chat.completion.chunk", "created": 0, "model": "m", "choices": [],
+            "usage": {"prompt_tokens": total - 10, "completion_tokens": 10, "total_tokens": total}})
+
+    class FakeSrc:
+        """One key of a fake source (or the paid client): scripted failures, delays, mid-stream deaths."""
+        def __init__(self, key, log):
+            self.key, self.log = key, log
+            self.fail, self.delay, self.role_first, self.die, self.usage = [], 0.0, False, False, None
+            self.streams = []
+            self.chat = SimpleNamespace(completions=SimpleNamespace(create=self.create))
 
         async def create(self, **kw):
-            self.log.append((self.name, kw))
+            self.log.append((self.key, kw))
             if self.fail:
                 raise status_error(self.fail.pop(0))
-            if kw.get("stream"):
-                return FakeNimStream(getattr(self, "first_token_delay", 0))
-            return "stream-from-" + self.name
+            if not kw.get("stream"):
+                return "plain-" + self.key
+            st = FakeSrcStream(self)
+            self.streams.append(st)
+            return st
 
-    class FakeNimStream:
-        def __init__(self, delay):
-            self.delay, self.closed = delay, False
+    class FakeSrcStream:
+        def __init__(self, src):
+            self.src, self.closed = src, False
+            self.items = ([chunk(role="assistant")] if src.role_first else []) + [DELAY, chunk(content=f"hi from {src.key}")]
+            self.items += (["DIE"] if src.die else []) + [chunk(content="!")]
+            self.items += [usage_chunk(src.usage)] if src.usage else []
+
+        def __aiter__(self):
+            return self
 
         async def __anext__(self):
-            await asyncio.sleep(self.delay)
-            return "chunk"
+            while self.items and not self.closed:
+                item = self.items.pop(0)
+                if item is DELAY:
+                    await asyncio.sleep(self.src.delay)
+                    continue
+                if item == "DIE":
+                    raise httpx.RemoteProtocolError("peer closed connection")
+                return item
+            raise StopAsyncIteration
 
         async def close(self):
             self.closed = True
 
-    def make_pool(rpm=40, max_wait=0.05):
+    def make(env, routing=None, store=None):
         log, made = [], {}
 
         def factory(key):
-            made[key] = FakeNim(key, log)
+            made[key] = FakeSrc(key, log)
             return made[key]
-        return B.KeyPool(["k1", "k2", "k3", "k2", ""], "https://nim.test/v1", rpm, max_wait, factory), log, made
+        paid = FakeSrc("paid", log)
+        provs = B.build_providers(paid, bot.config.FREE_PROVIDERS, env, store,
+                                  routing or {"first_token_timeout": 0.3, "attempts": 2, "max_wait_seconds": 0.05},
+                                  client_factory=factory)
+        return provs, log, made, paid
 
-    pool, log, made = make_pool()
-    check("pool: duplicate/empty keys dropped", len(pool) == 3, len(pool))
-    for _ in range(9):
+    async def text_of(stream):
+        out = ""
+        async for c in stream:
+            for ch in c.choices:
+                out += ch.delta.content or ""
+        return out
+
+    ALL = {"NVIDIA_KEYS": "k1\nk2\n k3 \n\nk2", "AIHUBMIX_KEYS": "'a1'\na2", "ORCAROUTER_KEYS": "o1"}
+
+    # ----- keys: one secret, one key per line -----
+    check("keys: one per line, order kept, quotes/blank lines/duplicates dropped",
+          B.parse_keys("k1\nk2\n 'k3' \n\nk2", "k4,k5") == ["k1", "k2", "k3", "k4", "k5"])
+    provs, log, made, paid = make({"NVIDIA_KEYS": "k1\nk2", "NVIDIA_KEY_1": "k3", "NVIDIA_API_KEYS": "k1,"})
+    check("keys: older NVIDIA secrets still read, after the new one", [s.name for s in provs["nvidia"].pool.slots]
+          == ["key 1", "key 2", "key 3"] and list(made) == ["k1", "k2", "k3"], list(made))
+    provs, log, made, paid = make(ALL)
+    pool = provs["nvidia"].pool
+    check("keys: every provider gets its own pool", len(pool) == 3 and len(provs["aihubmix"].pool) == 2
+          and len(provs["orcarouter"].pool) == 1, {n: len(p.pool or []) for n, p in provs.items()})
+    await pool.create(model="m", messages=[])
+    check("pool: a tie goes to the earlier line", log[-1][0] == "k1", log[-1][0])
+    for _ in range(8):
         await pool.create(model="m", messages=[])
     counts = {k: sum(1 for n, _ in log if n == k) for k in ("k1", "k2", "k3")}
     check("pool: load spread evenly over the keys", counts == {"k1": 3, "k2": 3, "k3": 3}, counts)
 
-    pool, log, made = make_pool()
+    provs, log, made, paid = make(ALL)
+    pool = provs["nvidia"].pool
     made["k1"].fail = [429]
     res = await pool.create(model="m", messages=[])
-    check("pool: 429 moves the request to another key", res.startswith("stream-from-k") and res != "stream-from-k1"
-          and [n for n, _ in log][:2][0] == "k1", (res, log))
+    check("pool: 429 moves the request to another key", res in ("plain-k2", "plain-k3") and log[0][0] == "k1", res)
     for _ in range(4):
         await pool.create(model="m", messages=[])
-    check("pool: a rate-limited key rests (cooldown)", all(n != "k1" for n, _ in log[2:]),
-          [n for n, _ in log])
-    check("pool: status shows the cooldown", pool.status()[0]["state"].startswith("cooling"), pool.status()[0])
-
-    pool, log, made = make_pool()
+    check("pool: a rate-limited key rests", all(n != "k1" for n, _ in log[2:]) and
+          pool.status()[0]["state"].startswith("resting"), (log, pool.status()[0]))
     made["k2"].fail = [401]
-    for _ in range(4):
-        await pool.create(model="m", messages=[])
-    check("pool: a rejected key (401) is taken out", pool.status()[1]["state"] == "rejected"
-          and sum(1 for n, _ in log if n == "k2") == 1, pool.status())
-    made["k1"].fail = [400]
-    try:
-        await pool.create(model="m", messages=[])
-        bad_request_raised = False
-    except openai.APIStatusError:
-        bad_request_raised = True
-    check("pool: a bad request (400) isn't retried on every key", bad_request_raised)
-
-    pool, log, made = make_pool(rpm=1, max_wait=0.05)
     for _ in range(3):
         await pool.create(model="m", messages=[])
+    check("pool: a rejected key (401) is taken out", pool.status()[1]["state"] == "rejected", pool.status())
+    made["k3"].fail = [400]
     try:
         await pool.create(model="m", messages=[])
-        full = False
-    except B.NoKeyAvailable as e:
-        full = "rate limit" in str(e)
-    check("pool: never exceeds the per-minute limit of any key", full and len(log) == 3, log)
-    empty = B.KeyPool([], "https://nim.test/v1")
+        raised = ""
+    except openai.APIStatusError as e:
+        raised = str(e.status_code)
+    check("pool: a bad request (400) isn't retried on every key", raised == "400", raised)
+    provs, log, made, paid = make(ALL)
+    for k in ("k1", "k2", "k3"):
+        made[k].fail = [500, 500]
     try:
-        await empty.create(model="m", messages=[])
+        await provs["nvidia"].pool.create(model="m", messages=[])
+        raised = ""
+    except openai.APIStatusError as e:
+        raised = str(e.status_code)
+    check("pool: when every key fails, the real error comes back (not 'resting')", raised == "500", raised)
+
+    clock = [1000.0]
+    one = B.KeyPool(["x", "y"], "u", rpm_per_key=1, max_wait=0.05, client_factory=lambda k: FakeSrc(k, []),
+                    clock=lambda: clock[0])
+    await one.create(model="m", messages=[])
+    await one.create(model="m", messages=[])
+    try:
+        await one.create(model="m", messages=[])
         msg = ""
     except B.NoKeyAvailable as e:
         msg = str(e)
-    check("pool: no keys → a clear message", "NVIDIA_KEY_1" in msg, msg)
+    check("pool: never exceeds a key's per-minute limit", "limits right now" in msg, msg)
+    clock[0] += 61
+    check("pool: a minute later the key is free again", (await one.create(model="m", messages=[])).startswith("plain-"))
 
-    kw = {"model": "deepseek/deepseek-v4.1-flash-1017", "extra_headers": {"X-Title": "t"}, "tools": [{"x": 1}],
-          "extra_body": {"provider": {"only": ["deepinfra/fp8"]}, "reasoning": {"enabled": True}, "usage": {"include": True}},
-          "messages": [{"role": "user", "content": "hi"},
-                       {"role": "assistant", "content": "", "reasoning_details": [{"t": 1}]}]}
-    out = B.to_nvidia(kw, bot.config.NVIDIA_MODELS, {})
-    check("nvidia request: NIM model id, no OpenRouter-only fields",
-          out["model"] == "deepseek-ai/deepseek-v4.1-flash" and "extra_body" not in out and "extra_headers" not in out
-          and out["tools"] == [{"x": 1}] and "reasoning_details" not in out["messages"][1]
-          and "reasoning_details" in kw["messages"][1], out)
-    out = B.to_nvidia({"model": "z-ai/glm-5.3-flash", "messages": []}, bot.config.NVIDIA_MODELS,
-                      {"z-ai/glm-5.3-flash": {"chat_template_kwargs": {"enable_thinking": True}}})
-    check("nvidia request: per-model extra fields from config", out["model"] == "z-ai/glm-5.3-flash"
-          and out["extra_body"] == {"chat_template_kwargs": {"enable_thinking": True}}, out)
+    store_path = DATA / "usage-test.json"
+    store = B.UsageStore(store_path)
+    wall = [5_000_000.0]
+    daily = B.KeyPool(["d1", "d2"], "u", rpm_per_key=40, max_wait=0.05, client_factory=lambda k: FakeSrc(k, []),
+                      name="AIHubMix", rpd_per_key=2, usage_store=store, wall=lambda: wall[0])
+    for _ in range(4):
+        await daily.create(model="m", messages=[])
+    try:
+        await daily.create(model="m", messages=[])
+        msg = ""
+    except B.NoKeyAvailable as e:
+        msg = str(e)
+    check("pool: never exceeds a key's daily limit, says when it resets", "used up today" in msg, msg)
+    check("pool: status says 'out for today'", all(x["state"] == "out for today" for x in daily.status()), daily.status())
+    store.flush()
+    again = B.KeyPool(["d1", "d2"], "u", rpm_per_key=40, max_wait=0.05, client_factory=lambda k: FakeSrc(k, []),
+                      name="AIHubMix", rpd_per_key=2, usage_store=B.UsageStore(store_path), wall=lambda: wall[0])
+    check("pool: daily counts survive a restart (no key stored, only a hash)",
+          [x["today"] for x in again.status()] == [2, 2] and '"d1"' not in store_path.read_text(), again.status())
+    wall[0] += 86_401
+    check("pool: a day later the quota is back", again.pick() is not None)
 
-    choice = {"b": "openrouter"}
-    paid_calls = []
+    budget_src = {}
+    tok = B.KeyPool(["t1", "t2"], "u", rpm_per_key=40, max_wait=0.05,
+                    client_factory=lambda k: budget_src.setdefault(k, FakeSrc(k, [])), name="T", tpd_per_key=100)
+    budget_src["t1"].usage = 150
+    st = await tok.create(model="m", messages=[], stream=True)
+    await text_of(st)
+    check("pool: tokens counted from the reply's usage", tok.status()[0]["tokens"] == 150, tok.status())
+    check("pool: a key over its daily token budget is skipped", tok.pick().name == "key 2", tok.pick())
+    made_q = FakeSrc("q", [])
+    quota = B.KeyPool(["q"], "u", client_factory=lambda k: made_q, max_wait=0.05)
 
-    class FakeOR:
-        def __init__(self):
-            self.chat = type("C", (), {})()
-            self.chat.completions = type("CC", (), {})()
+    async def quota_create(**kw):
+        raise status_error(429, "Daily quota exceeded for this key")
+    made_q.chat.completions.create = quota_create
+    try:
+        await quota.create(model="m", messages=[])
+    except Exception:
+        pass
+    check("pool: a 'daily quota' 429 rests the key for an hour", quota.slots[0].cooldown_until - time.monotonic() > 3000
+          and quota.status()[0]["last"] == "daily limit reached", quota.status())
+    try:
+        await B.KeyPool([], "u", name="AIHubMix", secret="AIHUBMIX_KEYS").create(model="m", messages=[])
+        msg = ""
+    except B.NoKeyAvailable as e:
+        msg = str(e)
+    check("pool: no keys → names the secret to add", "AIHUBMIX_KEYS" in msg and "one key per line" in msg, msg)
 
-            async def create(**kw):
-                paid_calls.append(kw)
-                return "paid"
-            self.chat.completions.create = create
-    pool, log, made = make_pool()
-    router = B.ModelRouter(FakeOR(), pool, lambda: choice["b"], bot.config.NVIDIA_MODELS)
-    r1 = await router.chat.completions.create(model="z-ai/glm-5.3-flash", messages=[], extra_body={"provider": {}})
-    choice["b"] = "nvidia"
-    r2 = await router.chat.completions.create(model="z-ai/glm-5.3-flash", messages=[], extra_body={"provider": {}})
-    check("router: follows the switch (paid → free)", r1 == "paid" and r2.startswith("stream-from-")
-          and len(paid_calls) == 1 and "extra_body" not in log[-1][1], (r1, r2))
-    # NVIDIA accepts but never starts answering → bounded wait, one more try, then a clear message
-    pool, log, made = make_pool()
-    for f in made.values():
-        f.first_token_delay = 5
-    slow_router = B.ModelRouter(FakeOR(), pool, lambda: "nvidia", bot.config.NVIDIA_MODELS,
-                                first_token_timeout=0.2, attempts=2)
+    # ----- requests per provider -----
+    kw = {"model": DS, "extra_headers": {"X-Title": "t"}, "tools": [{"x": 1}], "stream": True,
+          "extra_body": {"provider": {"only": ["deepinfra/fp8"]}, "reasoning": {"enabled": True}},
+          "messages": [{"role": "user", "content": "hi"}, {"role": "assistant", "content": "", "reasoning_details": [1]}]}
+    provs, log, made, paid = make(ALL)
+    out = provs["nvidia"].request(kw)
+    check("request (NVIDIA): its model id, thinking on, no OpenRouter-only fields, usage asked for",
+          out["model"] == "deepseek-ai/deepseek-v4.1-flash" and "extra_headers" not in out
+          and out["extra_body"].get("chat_template_kwargs", {}).get("thinking") is True
+          and "provider" not in out["extra_body"] and out["tools"] == [{"x": 1}]
+          and "reasoning_details" not in out["messages"][1] and "reasoning_details" in kw["messages"][1]
+          and out["stream_options"] == {"include_usage": True}, out)
+    out = provs["aihubmix"].request(dict(kw, model=GLM))
+    check("request (AIHubMix): the free GLM id and its thinking switch",
+          out["model"] == "coding-glm-5.3-flash-free" and out["extra_body"] == {"thinking": {"type": "enabled"}}, out)
+    check("request (OpenRouter): sent unchanged", provs["openrouter"].request(kw) == kw)
+    check("serves: AIHubMix only GLM, OrcaRouter only DeepSeek, NVIDIA both",
+          provs["aihubmix"].serves(GLM) and not provs["aihubmix"].serves(DS) and provs["orcarouter"].serves(DS)
+          and not provs["orcarouter"].serves(GLM) and provs["nvidia"].serves(GLM) and provs["nvidia"].serves(DS))
+
+    mode = {"m": "smart", "paid": False}
+    def router(p, **kw2):
+        return B.ModelRouter(p, lambda: mode["m"], lambda: mode["paid"], B.Stats(),
+                             **{"hedge_min": 0.15, "hedge_max": 0.4, "deadline": 2.0, "picked_patience": 0.3, **kw2})
+
+    r = router(provs)
+    check("choices (bot 1 lead, DeepSeek): Smart, OpenRouter, NVIDIA, OrcaRouter",
+          r.options(DS) == ["smart", "openrouter", "nvidia", "orcarouter"], r.options(DS))
+    check("choices (agents / bot 2, GLM): Smart, OpenRouter, NVIDIA, AIHubMix",
+          r.options(GLM) == ["smart", "openrouter", "nvidia", "aihubmix"], r.options(GLM))
+    bare, *_ = make({"NVIDIA_KEYS": "k1"})
+    check("choices: a source without keys isn't offered", router(bare).options(GLM) == ["smart", "openrouter", "nvidia"],
+          router(bare).options(GLM))
+    nothing, *_ = make({})
+    check("choices: no free keys at all → OpenRouter only", router(nothing).options(GLM) == ["openrouter"])
+
+    # pinned
+    mode["m"] = "openrouter"
+    st = await r.chat.completions.create(**kw)
+    check("pinned OpenRouter: the paid client, request unchanged", "hi from paid" in await text_of(st)
+          and log[-1][0] == "paid" and log[-1][1]["extra_body"]["provider"] == {"only": ["deepinfra/fp8"]}, log[-1])
+    pev = []
+    tok_p = B.ROUTE_EVENTS.set(pev.append)
+    mode["m"] = "nvidia"
+    for k in ("k1", "k2", "k3"):
+        made[k].delay = 5
+    t0 = time.monotonic()
+    st = await r.chat.completions.create(model=GLM, messages=[], stream=True)
+    got, took = await text_of(st), time.monotonic() - t0
+    check("picked NVIDIA goes silent: another source joins after its head start, first answer wins",
+          got.startswith("hi from a") and 0.25 < took < 1.5 and any("also trying AIHubMix" in e for e in pev),
+          (got, took, pev))
+    bare1, _, bare_made, _ = make({"NVIDIA_KEYS": "k1"})
+    bare_made["k1"].delay = 5
     t0 = time.monotonic()
     try:
-        await slow_router.chat.completions.create(model="z-ai/glm-5.3-flash", messages=[], stream=True)
-        slow_msg = ""
-    except B.NvidiaSlow as e:
-        slow_msg = str(e)
-    check("router: a silent NVIDIA queue gives up quickly with a clear message",
-          "didn't start answering" in slow_msg and "Paid" in slow_msg and len(log) == 2 and time.monotonic() - t0 < 2,
-          (slow_msg, len(log)))
-    check("router: a slow NVIDIA start isn't retried forever by the caller",
-          not __import__("agent")._transient(B.NvidiaSlow("x")))
-    pool, log, made = make_pool()
-    fast_router = B.ModelRouter(FakeOR(), pool, lambda: "nvidia", bot.config.NVIDIA_MODELS,
-                                bot.config.NVIDIA.get("model_extra"), first_token_timeout=1)
-    st = await fast_router.chat.completions.create(model="z-ai/glm-5.3-flash", messages=[], stream=True)
-    got = [await st.__anext__(), await st.__anext__()]
-    check("router: a normal NVIDIA stream passes through (first chunk kept)", got == ["chunk", "chunk"], got)
-    sent = log[-1][1]
-    check("router: thinking turned on for NVIDIA's models",
-          sent.get("extra_body", {}).get("chat_template_kwargs", {}).get("thinking") is True
-          if bot.config.NVIDIA.get("model_extra") else True, sent.get("extra_body"))
-    router_empty = B.ModelRouter(FakeOR(), B.KeyPool([], "x"), lambda: "nvidia", {})
+        await router(bare1).chat.completions.create(model=GLM, messages=[], stream=True)
+        msg = ""
+    except B.ProviderSlow as e:
+        msg = str(e)
+    check("picked NVIDIA silent, nothing else has keys: a bounded wait, then 'trying again' (never a hang)",
+          "didn't start answering" in msg and time.monotonic() - t0 < 2 and B.retryable(B.ProviderSlow(msg)), msg)
+
+    provs, log, made, paid = make(ALL)
+    r = router(provs)
+
+    def nvidia_fails_once():
+        for s_ in provs["nvidia"].pool.slots:
+            s_.cooldown_until = 0.0
+        for k in ("k1", "k2", "k3"):
+            made[k].fail = [500]
+    nvidia_fails_once()
     try:
-        await router_empty.chat.completions.create(model="m", messages=[])
+        await r.chat.completions.create(model=GLM, messages=[], stream=True)
+        first = ""
+    except openai.APIStatusError as e:
+        first = str(e.status_code)
+    check("picked source fails once: retried on it after a pause (no switch yet)",
+          first == "500" and not any(n.startswith("a") for n, _ in log), (first, [n for n, _ in log]))
+    nvidia_fails_once()
+    t0 = time.monotonic()
+    st = await r.chat.completions.create(model=GLM, messages=[], stream=True)
+    check("picked source fails twice in a row: the next source takes over at once",
+          (await text_of(st)).startswith("hi from a") and time.monotonic() - t0 < 1
+          and any(e.startswith("!NVIDIA failed twice") for e in pev), pev)
+    n0 = len(log)
+    pev.clear()
+    st = await r.chat.completions.create(model=GLM, messages=[], stream=True)
+    check("while it rests, the stand-in serves directly (and the owner is told why)",
+          (await text_of(st)).startswith("hi from a") and not any(n.startswith("k") for n, _ in log[n0:])
+          and any(e.startswith("!NVIDIA failed twice") for e in pev), (pev, [n for n, _ in log[n0:]]))
+    r.stats.get("nvidia", GLM).open_until = 0.0   # its rest is over
+    for s_ in provs["nvidia"].pool.slots:
+        s_.cooldown_until = 0.0
+    st = await r.chat.completions.create(model=GLM, messages=[], stream=True)
+    check("after its rest the picked source is tried first again", (await text_of(st)).startswith("hi from k"))
+    B.ROUTE_EVENTS.reset(tok_p)
+    mode["m"] = "aihubmix"
+    try:
+        await r.chat.completions.create(model=DS, messages=[], stream=True)
+        msg = ""
+    except B.NoRoute as e:
+        msg = str(e)
+    check("pinned to a source that doesn't serve the model → says so", "doesn't serve" in msg, msg)
+    mode["m"] = "orcarouter"
+    try:
+        await router(bare).chat.completions.create(model=DS, messages=[], stream=True)
         msg = ""
     except B.NoKeyAvailable as e:
         msg = str(e)
-    check("router: free backend without keys says what to do", "NVIDIA_KEY_1" in msg and "OpenRouter" in msg, msg)
+    check("pinned to a source without keys → names the secret", "ORCAROUTER_KEYS" in msg and not B.retryable(
+        B.NoKeyAvailable(msg)), msg)
 
-    # In Telegram: /backend, /free, /paid, the settings button, and /ping
-    saved_pool = bot.nvidia_pool
-    bot.nvidia_pool, log, made = make_pool()
+    # smart
+    mode["m"] = "smart"
+    provs, log, made, paid = make(ALL)
+    r = router(provs)
+    events = []
+    tok_ev = B.ROUTE_EVENTS.set(events.append)
+    for k in ("k1", "k2", "k3"):
+        made[k].delay = 3
+    t0 = time.monotonic()
+    st = await r.chat.completions.create(model=GLM, messages=[], stream=True)
+    got, took = await text_of(st), time.monotonic() - t0
+    check("smart: a silent source gets company; the first to answer wins", got.startswith("hi from a") and took < 1.5,
+          (got, took))
+    check("smart: the owner sees what's happening", any("also trying AIHubMix" in e for e in events)
+          and "via AIHubMix" in events, events)
+    await asyncio.sleep(0.05)
+    check("smart: the loser is cancelled and closed", all(s.closed for s in made["k1"].streams), made["k1"].streams)
+    check("smart: the paid source is never used when not allowed", not any(n == "paid" for n, _ in log), log)
+    n0 = len(log)
+    await text_of(await r.chat.completions.create(model=GLM, messages=[], stream=True))
+    check("smart: learns — next time the faster source goes first", log[n0][0].startswith("a"), log[n0][0])
+
+    provs, log, made, paid = make(ALL)
+    r = router(provs)
+    for k in ("k1", "k2", "k3"):
+        made[k].fail = [500, 500, 500]
+    st = await r.chat.completions.create(model=GLM, messages=[], stream=True)
+    check("smart: a failing source → the next one at once", (await text_of(st)).startswith("hi from a"))
+    check("smart: the failure is remembered", r.stats.get("nvidia", GLM).streak == 1, r.stats.summary())
+    r.stats.fail("nvidia", GLM)
+    order = [p.name for p in r.rank(GLM)]
+    check("smart: two failures in a row pause a source (circuit breaker), still a last resort",
+          order == ["aihubmix", "nvidia"] and r.stats.get("nvidia", GLM).open_until > time.monotonic(),
+          (order, r.stats.summary()))
+
+    provs, log, made, paid = make(ALL)
+    r = router(provs)
+    for k in ("k1", "k2", "k3"):
+        made[k].role_first, made[k].delay = True, 3
+    st = await r.chat.completions.create(model=GLM, messages=[], stream=True)
+    check("smart: an empty 'role' chunk isn't mistaken for an answer", (await text_of(st)).startswith("hi from a"))
+
+    provs, log, made, paid = make(ALL)
+    r = router(provs)
+    made["a1"].die = True
+    made["a2"].die = True
+    r.stats.ok("aihubmix", GLM, 0.1)
+    try:
+        await text_of(await r.chat.completions.create(model=GLM, messages=[], stream=True))
+    except httpx.RemoteProtocolError:
+        pass
+    check("smart: a stream that dies midway counts against its source", r.stats.get("aihubmix", GLM).fails > 0)
+
+    provs, log, made, paid = make(ALL)
+    r = router(provs)
+    for k in list(made):
+        made[k].fail = [401] * 4
+    try:
+        await r.chat.completions.create(model=GLM, messages=[], stream=True)
+        msg = ""
+    except Exception as e:
+        msg = str(e)
+    check("smart: every free source failed, paid not allowed → a clear error, nothing paid",
+          "NVIDIA" in msg and "AIHubMix" in msg and not any(n == "paid" for n, _ in log), msg)
+    mode["paid"] = True
+    provs, log, made, paid = make(ALL)
+    r = router(provs)
+    for k in list(made):
+        made[k].fail = [401] * 4
+    st = await r.chat.completions.create(model=GLM, messages=[], stream=True)
+    check("smart + paid last resort: OpenRouter steps in after the free ones failed",
+          "hi from paid" in await text_of(st))
+    provs, log, made, paid = make(ALL)
+    r = router(provs)
+    for k in list(made):
+        made[k].delay = 1.0
+    st = await r.chat.completions.create(model=GLM, messages=[], stream=True)
+    check("smart + paid last resort: paid isn't started while a free source is just slow",
+          "hi from paid" not in await text_of(st) and not any(n == "paid" for n, _ in log), [n for n, _ in log])
+    provs, log, made, paid = make(ALL)
+    r = router(provs, deadline=0.8)
+    for k in list(made):
+        made[k].delay = 5
+    t0 = time.monotonic()
+    st = await r.chat.completions.create(model=GLM, messages=[], stream=True)
+    check("smart + paid last resort: after the deadline OpenRouter gets its chance",
+          "hi from paid" in await text_of(st) and time.monotonic() - t0 < 2.5, time.monotonic() - t0)
+    mode["paid"] = False
+    try:
+        await router(nothing).chat.completions.create(model=GLM, messages=[], stream=True)
+        msg = ""
+    except B.NoRoute as e:
+        msg = str(e)
+    check("smart without any free keys → says what to add or switch", "NVIDIA_KEYS" in msg and "Paid" in msg, msg)
+
+    provs, log, made, paid = make(ALL)
+    r = router(provs)
+    r.stats.ok("nvidia", GLM, 1.0)
+    r.stats.ok("aihubmix", GLM, 0.9)
+    key = B.ROUTE_KEY.set("chat:1")
+    check("smart: without history the faster source leads", r.rank(GLM)[0].name == "aihubmix")
+    r.affinity["chat:1"] = "nvidia"
+    check("smart: a conversation keeps to the source that served it (when close)", r.rank(GLM)[0].name == "nvidia")
+    r.stats.ok("nvidia", GLM, 30.0)
+    r.stats.ok("nvidia", GLM, 30.0)
+    check("smart: …but not when that source got much slower", r.rank(GLM)[0].name == "aihubmix")
+    B.ROUTE_KEY.reset(key)
+    for s_ in provs["aihubmix"].pool.slots:
+        s_.tok.append((time.time(), 990_000))
+    check("smart: a big request skips a source whose daily token budget is nearly gone",
+          r.rank(GLM, need=50_000)[-1].name == "aihubmix" and r.rank(GLM, need=500)[0].name == "aihubmix",
+          ([p.name for p in r.rank(GLM, 50_000)], [p.name for p in r.rank(GLM, 500)]))
+    B.ROUTE_EVENTS.reset(tok_ev)
+
+    # ----- patience -----
+    calls, slept, waits = {"n": 0}, [], []
+
+    async def flaky():
+        calls["n"] += 1
+        if calls["n"] < 3:
+            raise openai.APITimeoutError(request=httpx.Request("POST", "https://x"))
+        return "ok"
+
+    async def no_sleep(s):
+        slept.append(s)
+    res = await B.persist(flaky, lambda e, n, p: waits.append((B.short_reason(e), n, p)), 600, sleep=no_sleep)
+    check("patience: a timeout is retried until it works, with growing pauses", res == "ok" and slept == [3.0, 6.0]
+          and waits[0][0] == "The connection timed out", (res, slept, waits))
+    calls["n"] = 0
+
+    async def denied():
+        calls["n"] += 1
+        raise status_error(401)
+    try:
+        await B.persist(denied, None, 600, sleep=no_sleep)
+    except openai.APIStatusError:
+        pass
+    check("patience: a wrong key isn't retried (it can't get better)", calls["n"] == 1, calls)
+    fake_clock = [0.0]
+
+    async def always_busy():
+        fake_clock[0] += 100
+        raise status_error(503)
+    try:
+        await B.persist(always_busy, None, 600, clock=lambda: fake_clock[0], sleep=no_sleep)
+        gave_up = False
+    except openai.APIStatusError:
+        gave_up = True
+    check("patience: gives up only after the window (30 min by default)", gave_up and fake_clock[0] >= 600
+          and bot.RETRY_WINDOW == 1800, (fake_clock, bot.RETRY_WINDOW))
+    check("patience: what is worth retrying",
+          B.retryable(openai.APIConnectionError(request=httpx.Request("POST", "https://x")))
+          and B.retryable(status_error(429)) and B.retryable(status_error(502)) and not B.retryable(status_error(400))
+          and not B.retryable(status_error(402)) and B.retryable(httpx.ReadTimeout("x"))
+          and B.retryable(B.NoKeyAvailable("All NVIDIA keys are at their limits right now"))
+          and not B.retryable(B.NoKeyAvailable("No NVIDIA keys are set (add the NVIDIA_KEYS secret)"))
+          and not B.retryable(RuntimeError("bug")))
+
+    # ----- in Telegram -----
+    bot.save_setting("agent_mode", False)
+    saved = dict(bot.providers)
+    provs, log, made, paid = make({"NVIDIA_KEYS": "k1\nk2\nk3", "AIHUBMIX_KEYS": "a1\na2"},
+                                  store=B.UsageStore(DATA / "key_usage.json"))
+    bot.providers.clear()
+    bot.providers.update(provs)
     made["k2"].fail = [401]
     user_msg("/settings")
     await wait_idle()
     panel = last_bot()
-    check("settings: backend buttons in the panel", cb_of(panel, "set:backend:nvidia") and cb_of(panel, "set:backend:openrouter"))
-    press("set:backend:nvidia", panel["message_id"])
+    kb = str(callbacks(panel))
+    check("settings: a source button per choice for the chat model", all(f"set:main_backend:{n}" in kb for n in
+          ("smart", "openrouter", "nvidia")) and "set:main_backend:aihubmix" not in kb, kb[:600])
+    check("settings: says which sources still need keys", "OrcaRouter (ORCAROUTER_KEYS)" in panel["text"], panel["text"])
+    press("set:main_backend:nvidia", panel["message_id"])
     await wait_idle()
-    check("settings button: switches to NVIDIA (no command needed)", bot.cfg("backend") == "nvidia"
-          and "NVIDIA (free" in S["msgs"][panel["message_id"]]["text"] and "3 key" in S["msgs"][panel["message_id"]]["text"],
-          S["msgs"][panel["message_id"]]["text"][:300])
-    check("settings: backend row in both panels", "set:backend:nvidia" in str(bot.settings_keyboard("chat").inline_keyboard)
-          and "cset:backend:openrouter" in str(bot.settings_keyboard("agent").inline_keyboard))
+    t = S["msgs"][panel["message_id"]]["text"]
+    check("settings button: pins NVIDIA (no command needed)", bot.cfg("main_backend") == "nvidia"
+          and "NVIDIA (free · 3 keys)" in t, t[:300])
+    akb = str(bot.settings_keyboard("agent").inline_keyboard)
+    check("coding settings: lead and agents each pick their own source", "cset:main_backend:nvidia" in akb
+          and "cset:agent_backend:aihubmix" in akb and "cset:agent_backend:smart" in akb, akb[:800])
+    check("settings: 'paid as last resort' only shows with Smart", "paid_fallback" not in akb)
+    press("cset:agent_backend:smart", panel["message_id"])
+    await wait_idle()
+    check("settings: agents on Smart, lead stays on NVIDIA", bot.cfg("agent_backend") == "smart"
+          and bot.cfg("main_backend") == "nvidia" and "paid_fallback" in str(bot.settings_keyboard("agent").inline_keyboard))
+    press("set:main_backend:groq", panel["message_id"])
+    await wait_idle()
+    check("settings: a stale button is refused politely", bot.cfg("main_backend") == "nvidia"
+          and any(c[0] == "answerCallbackQuery" and "Not available" in str(c[1]) for c in S["calls"][-5:]),
+          S["calls"][-3:])
     user_msg("/doctor")
     await wait_idle(timeout=40)
     t = last_bot()["text"]
-    check("/doctor: pings every key", "key 1 — answers" in t and "key 2 — key rejected (401)" in t
-          and "key 3 — answers" in t and "OpenRouter" in t, t)
-    check("/doctor: shows the load per key", "/40" in t, t)
-    slow_pool, _, slow_made = make_pool()
-    slow_made["k1"].first_token_delay = 5
-    ok, what, _ = await slow_pool.ping(slow_pool.slots[0], "m", timeout=1.0)
-    check("ping: accepted key + slow model → ⚠️ not ❌", ok is None and "key accepted" in what, (ok, what))
-    ok, what, _ = await slow_pool.ping(slow_pool.slots[1], "m", timeout=1.0)
-    check("ping: working key → first token time", ok is True and "first token" in what, (ok, what))
-    slow_made["k3"].fail = [403]
-    ok, what, _ = await slow_pool.ping(slow_pool.slots[2], "m", timeout=1.0)
-    check("ping: wrong key (403) → rejected", ok is False and "rejected" in what, (ok, what))
-    user_msg("/ping")
-    await wait_idle(timeout=40)
-    check("/ping: same as /doctor", "Health check" in last_bot()["text"] and "key 1 — answers" in last_bot()["text"])
+    check("/doctor: pings every key of every source", "NVIDIA key 1 — answers" in t and
+          "NVIDIA key 2 — key rejected (401)" in t and "AIHubMix key 1 — answers" in t and "AIHubMix key 2" in t
+          and "OrcaRouter — no keys (add the ORCAROUTER_KEYS secret" in t, t)
+    aih = [kw2 for n, kw2 in log if n == "a1"]
+    check("/doctor: AIHubMix is pinged with its free model and thinking on", aih and aih[-1]["model"] ==
+          "coding-glm-5.3-flash-free" and aih[-1].get("extra_body") == {"thinking": {"type": "enabled"}}, aih[-1:])
+    check("/doctor: shows each key's use (minute, day, tokens)", "/40 a minute" in t and "1/100 today" in t
+          and "tokens today" in t and "daily quota" in t, t)
     user_msg("/status")
     await wait_idle()
-    check("/status: shows the backend", "Backend: NVIDIA (free" in last_bot()["text"], last_bot()["text"][:400])
-    press("set:backend:openrouter", panel["message_id"])
-    await wait_idle()
-    check("settings button: back to OpenRouter", bot.cfg("backend") == "openrouter")
+    t = last_bot()["text"]
+    check("/status: where the lead and the agents run", "via NVIDIA (free · 3 keys)" in t and "Smart — free first" in t, t)
+
+    # a timeout or a dropped connection in the middle of a reply never ends it with an error
+    mode_main = bot.cfg("main_backend")
+    bot.save_setting("main_backend", "openrouter")
+    SCRIPT.update(error=None, timeouts=1, rounds=[text_deltas("Recovered answer", 50)])
+    user_msg("hello after a timeout")
+    await wait_idle(timeout=30)
+    t = last_bot().get("text", "")
+    check("patience in the bot: a timeout is retried, the reply arrives", "Recovered answer" in t
+          and "error occurred" not in t, t)
+    thinking = " ".join(m.get("text") or "" for m in bot_msgs()[-4:])
+    check("patience in the bot: the owner sees why it waited", "timed out — trying again" in thinking, thinking[-400:])
+    SCRIPT.update(die_once=True, rounds=[text_deltas("Whole answer", 4), text_deltas("Whole answer", 4)])
+    user_msg("hello after a dropped stream")
+    await wait_idle(timeout=30)
+    t = last_bot().get("text", "")
+    check("patience in the bot: a reply cut off midway is written again, not doubled",
+          "Whole answer" in t and t.count("Whole") == 1, t)
+    bot.save_setting("main_backend", mode_main)
+
+    # the older single switch carries over
+    data = bot._read_json(bot.SETTINGS_FILE, {})
+    keep = {k: data.pop(k) for k in ("main_backend", "agent_backend") if k in data}
+    data["backend"] = "nvidia"
+    bot._write_json(bot.SETTINGS_FILE, data)
+    check("old setting 'free' → Smart for both roles", bot.cfg("main_backend") == "smart"
+          and bot.cfg("agent_backend") == "smart")
+    data["backend"] = "openrouter"
+    bot._write_json(bot.SETTINGS_FILE, data)
+    check("old setting 'paid' → OpenRouter for both roles", bot.cfg("main_backend") == "openrouter"
+          and bot.cfg("agent_backend") == "openrouter")
+    data.pop("backend")
+    data.update(keep)
+    bot._write_json(bot.SETTINGS_FILE, data)
+    check("parse: aliases for the sources", bot.parse_value("main_backend", "free") == "smart"
+          and bot.parse_value("agent_backend", "AIHub") == "aihubmix" and bot.parse_value("main_backend", "paid") == "openrouter")
     menu = [c.command for c in bot._menu_commands("owner")]
-    check("menu: no backend commands in the / list", "backend" not in menu and "ping" not in menu
-          and "free" not in menu, menu)
-    bot.nvidia_pool = saved_pool
+    check("menu: no backend commands in the / list", "backend" not in menu and "ping" not in menu, menu)
+    bot.save_setting("main_backend", "openrouter")
+    bot.save_setting("agent_backend", "openrouter")
+    bot.providers.clear()
+    bot.providers.update(saved)
 
 
 async def state_scenario(app):

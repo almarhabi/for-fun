@@ -21,8 +21,8 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Awaitable, Callable
 
-from openai import APIConnectionError, APIStatusError, APITimeoutError
 
+import backends
 import llm
 import render
 from render import esc
@@ -217,6 +217,7 @@ class AgentState:
     kind: str = "coder"
     status: str = "waiting"      # waiting | running | done | failed | skipped | stopped
     activity: str = ""
+    via: str = ""                # smart routing: the source that served its last round
     rounds: int = 0
     started: float = 0.0
     ended: float = 0.0
@@ -296,6 +297,7 @@ class Env:
     compact_chars: int = 30_000      # superseded results are compacted once they add up to this much
     cmd_timeout: int = 180
     max_timeout: int = 900
+    retry_window: float = 1800.0     # seconds a model call keeps trying through timeouts and busy sources
     web: WebFn | None = None
     web_tools: list = field(default_factory=list)
     gh: Callable[..., Awaitable[str]] | None = None   # (name, raw_args, progress=None)
@@ -547,26 +549,24 @@ async def exec_ws(ctx: ToolCtx, name: str, args: dict) -> str:
 # ================= Worker agents =================
 
 def _transient(e: Exception) -> bool:
-    if isinstance(e, (APIConnectionError, APITimeoutError)):
-        return True
-    return isinstance(e, APIStatusError) and e.status_code in (408, 409, 425, 429, 500, 502, 503, 504)
+    """Would trying again likely work (timeout, dropped connection, overload, a busy source)?"""
+    return backends.retryable(e)
 
 
 async def call_model(env: Env, messages: list, kw: dict, tool_kwargs: dict, on_delta=None,
                      on_retry: Callable[[str], None] | None = None) -> llm.Completion:
-    """A model call with retries for transient errors (provider overload, dropped connection)."""
-    for attempt in range(3):
-        try:
-            res = await llm.stream_chat(env.client, messages, kw, tool_kwargs, env.headers, on_delta)
-            env.board.usage.add(kw["model"], res.usage)
-            return res
-        except Exception as e:
-            if attempt == 2 or not _transient(e):
-                raise
-            if on_retry:
-                on_retry(f"⏳ Provider busy — retry {attempt + 1}")
-            await asyncio.sleep(4 * (attempt + 1) ** 2)
-    raise RuntimeError("unreachable")
+    """A model call that doesn't give up on what waiting can fix (timeouts, dropped connections, busy sources):
+    retried with growing pauses for up to env.retry_window; smart routing moves to a healthier source."""
+    async def attempt() -> llm.Completion:
+        return await llm.stream_chat(env.client, messages, kw, tool_kwargs, env.headers, on_delta)
+
+    def on_wait(e: Exception, n: int, pause: float) -> None:
+        if on_retry:
+            on_retry(f"{backends.short_reason(e).lower()} — trying again in {pause:.0f}s (attempt {n + 1})")
+
+    res = await backends.persist(attempt, on_wait, env.retry_window)
+    env.board.usage.add(kw["model"], res.usage)
+    return res
 
 
 def trim_context(messages: list, limit: int = 240_000, target: int = 140_000, keep_last: int = 8) -> bool:
@@ -772,6 +772,25 @@ async def run_worker(env: Env, st: AgentState, brief: str, claims: Claims, ctx: 
     def on_retry(msg: str) -> None:
         st.activity = msg
 
+    def on_route(text: str) -> None:   # what the router is doing: "Waiting for NVIDIA…", "via AIHubMix"
+        if text.startswith("via "):
+            st.via = text[4:]
+        elif text.startswith("!"):
+            st.activity = text[1:]
+        else:
+            st.activity = text[:1].lower() + text[1:] + "…"
+
+    # each agent keeps to the source that served it (provider-side caching); the router reports what it's doing
+    tokens = (backends.ROUTE_KEY.set(f"agent:{id(env.board)}:{st.id}"), backends.ROUTE_EVENTS.set(on_route))
+    try:
+        await _worker_rounds(env, st, ctx, tools, kw, messages, on_delta, on_retry)
+    finally:
+        backends.ROUTE_KEY.reset(tokens[0])
+        backends.ROUTE_EVENTS.reset(tokens[1])
+
+
+async def _worker_rounds(env: Env, st: AgentState, ctx: "ToolCtx", tools: list, kw: dict, messages: list,
+                         on_delta, on_retry) -> None:
     for rnd in range(env.worker_rounds + 1):
         if rnd == env.worker_rounds:
             messages.append({"role": "user", "content": "⏱ You're out of rounds. Write your final report now, without any tools."})
@@ -1150,7 +1169,8 @@ def board_html(board: Board, final: bool, files: list[dict] | None = None, statu
         todo_lines.append(_l(f"<i>… and {len(board.todos) - 15} more</i>"))
 
     def agent_line(st: AgentState) -> str:
-        head = f"{_ICON[st.status]} <code>{esc(st.id)}</code> · {esc(st.title)}"
+        head = f"{_ICON[st.status]} <code>{esc(st.id)}</code> · {esc(st.title)}" + (
+            f" · <i>{esc(st.via)}</i>" if st.via and st.status == "running" else "")
         if st.status == "running" or (st.status == "waiting" and st.activity):
             return _l(head + (f" — {esc(st.activity)}" if st.activity else ""))
         extra = []

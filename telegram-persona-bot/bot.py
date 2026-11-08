@@ -111,14 +111,28 @@ for noisy in ("httpx", "primp", "ddgs"):
     logging.getLogger(noisy).setLevel(logging.WARNING)
 
 # X-Title isn't written here: it's set from Telegram (/settitle), stored encrypted, and sent with every request
-openrouter_client = AsyncOpenAI(api_key=OPENROUTER_API_KEY, base_url=OPENROUTER_BASE_URL)
-# 🆓 NVIDIA NIM: several keys, the load spread over them (backends.KeyPool)
-nvidia_pool = backends.KeyPool(config.nvidia_keys(), config.NVIDIA["base_url"],
-                               int(config.NVIDIA.get("rpm_per_key", 40)), float(config.NVIDIA.get("max_wait_seconds", 45)))
-# Every request (chat, the coding lead, the agents) goes through the router to the backend the owner picked
-client = backends.ModelRouter(openrouter_client, nvidia_pool, lambda: cfg("backend"), config.NVIDIA_MODELS,
-                              config.NVIDIA.get("model_extra") or {},
-                              float(config.NVIDIA.get("first_token_timeout", 120)), int(config.NVIDIA.get("attempts", 2)))
+# at most 4 minutes of silence mid-reply (instead of 10, three times over): a stuck request is noticed and retried
+openrouter_client = AsyncOpenAI(api_key=OPENROUTER_API_KEY, base_url=OPENROUTER_BASE_URL, max_retries=1,
+                                timeout=httpx.Timeout(240.0, connect=20.0))
+# Free sources (NVIDIA, AIHubMix, OrcaRouter…): each one's keys come from ONE secret, one key per line
+usage_store = backends.UsageStore(DATA_DIR / "key_usage.json")   # daily counts survive restarts
+providers = backends.build_providers(openrouter_client, config.FREE_PROVIDERS, os.environ, usage_store, config.ROUTING)
+router_stats = backends.Stats()   # live health of every source, shared by both routers
+# how long a reply keeps trying through timeouts, dropped connections and busy sources before it gives up
+RETRY_WINDOW = float(config.ROUTING.get("persist_minutes", 30)) * 60
+
+
+def _router(setting: str) -> backends.ModelRouter:
+    r = config.ROUTING
+    return backends.ModelRouter(providers, lambda: cfg(setting), lambda: bool(cfg("paid_fallback")), router_stats,
+                                float(r["hedge_min_seconds"]), float(r["hedge_max_seconds"]),
+                                float(r["smart_deadline_seconds"]),
+                                picked_patience=float(r.get("picked_patience_seconds", 40)))
+
+
+# Two roles, each with its own choice (Settings): smart, OpenRouter, or one free source
+client = _router("main_backend")           # Chat + the coding lead
+worker_client = _router("agent_backend")   # the coding agents (and summaries)
 NO_PREVIEW = LinkPreviewOptions(is_disabled=True)
 PREVIEW = LinkPreviewOptions(is_disabled=False, prefer_large_media=False)
 tph = telegraph.Telegraph(TELEGRAPH_FILE, short_name="PersonaBot")
@@ -297,6 +311,9 @@ GLOBAL_KEYS = config.GLOBAL_KEYS
 def cfg(key: str, mode: str = "chat"):
     """A setting value. The bot has two versions: mode="chat" (💬) or "agent" (💻 Coding) — each has its own settings."""
     data = _read_json(SETTINGS_FILE, {})
+    if key in ("main_backend", "agent_backend") and key not in data and data.get("backend") in ("nvidia", "openrouter"):
+        # the older single switch: paid stays paid, free becomes smart (free first, now with failover)
+        return "openrouter" if data["backend"] == "openrouter" else "smart"
     if mode == "agent" and key not in GLOBAL_KEYS:
         code = data.get("code") if isinstance(data.get("code"), dict) else {}
         value = code.get(key, CODE_DEFAULTS.get(key))
@@ -309,22 +326,26 @@ def cfg(key: str, mode: str = "chat"):
     return value
 
 
-def backend_name() -> str:
-    return "nvidia" if cfg("backend") == "nvidia" else "openrouter"
+def role_router(role: str = "main") -> backends.ModelRouter:
+    return worker_client if role == "agents" else client
 
 
-def backend_label() -> str:
-    if backend_name() == "nvidia":
-        return f"NVIDIA (free · {len(nvidia_pool)} key{'s' if len(nvidia_pool) != 1 else ''})"
-    return "OpenRouter (paid)"
+def provider_text(model, role: str = "main") -> str:
+    """Where a role's model runs right now, for display."""
+    r, m = role_router(role), config.current_model(model) or str(model)
+    if r.mode() == "openrouter":
+        prov = config.provider_for(m)
+        return "OpenRouter (paid) · " + (", ".join(prov["only"]) if prov else "auto")
+    return r.describe(m)
 
 
-def provider_text(model) -> str:
-    """Where a model runs right now, for display: its fixed OpenRouter provider, or NVIDIA."""
-    if backend_name() == "nvidia":
-        return f"NVIDIA {config.NVIDIA_MODELS.get(config.current_model(model) or '', model)}"
-    prov = config.provider_for(model)
-    return ", ".join(prov["only"]) if prov else "auto"
+def source_name(name: str) -> str:
+    return "Smart" if name == "smart" else providers[name].label if name in providers else name
+
+
+def missing_sources() -> list[str]:
+    """Free sources with no keys yet, with the secret that would turn each on."""
+    return [f"{p.label} ({p.pool.secret})" for p in providers.values() if p.pool is not None and not p.active]
 
 
 def save_setting(key: str, value, mode: str = "chat") -> None:
@@ -351,16 +372,17 @@ def parse_value(key: str, raw: str):
         if low in ("off", "false", "0", "no"):
             return False
         raise ValueError("use on or off")
+    if key in ("main_backend", "agent_backend"):
+        alias = {"free": "smart", "auto": "smart", "paid": "openrouter", "or": "openrouter", "default": "openrouter",
+                 "nim": "nvidia", "aihub": "aihubmix", "orca": "orcarouter"}
+        value = alias.get(low, low)
+        if value == "smart" or value in providers:
+            return value
+        raise ValueError("values: smart / " + " / ".join(providers))
     if low in ("off", "none", "default"):
         if key == "effort":
             return "default"
         return DEFAULTS[key] if key in ("model", "worker_model", "max_agents") else None
-    if key == "backend":
-        if low in ("nvidia", "free", "nim"):
-            return "nvidia"
-        if low in ("openrouter", "paid", "or"):
-            return "openrouter"
-        raise ValueError("values: openrouter (paid) / nvidia (free)")
     if key == "permissions":
         if low not in ("auto", "ask"):
             raise ValueError("values: auto / ask")
@@ -583,6 +605,7 @@ class ResponseUI:
         self.reply_md = ""
         self._reply_base = ""
         self.status = ""
+        self.via = ""                          # smart routing: the source that answered the last round
         self.sources: list[dict] = []
         self.started = self.last_think = time.monotonic()
         self.stopped = self.finishing = False
@@ -806,7 +829,8 @@ no_tools: set[str] = set()  # model/provider pairs that don't support tools
 
 
 def tools_key(kw: dict) -> str:
-    return kw["model"] + "|" + json.dumps(kw.get("extra_body", {}).get("provider"), sort_keys=True)
+    return (kw["model"] + "|" + client.mode() + "|"
+            + json.dumps(kw.get("extra_body", {}).get("provider"), sort_keys=True))
 
 
 def keep_recent_reasoning(history: deque, keep: int = 10) -> None:
@@ -825,8 +849,26 @@ async def stream_round(ui: ResponseUI, messages: list, kw: dict, tool_kwargs: di
     """One round with the model. Returns (reply text, reasoning, reasoning details, tool calls)."""
     headers = {"X-Title": t} if (t := load_title()) else {}
 
-    waiting = (f"Waiting for {'NVIDIA (free) — its queue can be slow' if backend_name() == 'nvidia' else 'the model'}…")
+    waiting = "Waiting for the model…"
     ui.status = waiting   # shown until the first token arrives, so a slow start is never a blank screen
+
+    def on_route(text: str) -> None:
+        """The router says what it does: "Waiting for NVIDIA — also trying AIHubMix", "via AIHubMix"."""
+        nonlocal waiting
+        if text.startswith("!"):   # a notice worth keeping in the log ("NVIDIA failed twice — moving on")
+            ui.parts.append(["s", text[1:]])
+            ui._round_part = None
+            return
+        if text.startswith("via "):
+            source = text[4:]
+            if ui.via and ui.via != source:
+                ui.parts.append(["s", f"Switched to {source}"])
+                ui._round_part = None
+            ui.via = source
+            return
+        if ui.status == waiting:
+            ui.status = text + "…"
+        waiting = text + "…"
 
     def on_delta(raw: str, reasoning: str, _calls) -> None:
         if ui.status == waiting:
@@ -835,9 +877,14 @@ async def stream_round(ui: ResponseUI, messages: list, kw: dict, tool_kwargs: di
         ui.set_round_reasoning(reasoning + tag_think)
         ui.set_round_answer(answer)
 
+    events = backends.ROUTE_EVENTS.set(on_route)
+    # the same conversation keeps to the source that served it last (its cache, steady behaviour)
+    route = backends.ROUTE_KEY.set(f"{'lead' if ui.board is not None else 'chat'}:{ui.chat_id}")
     try:
         res = await llm.stream_chat(client, messages, kw, tool_kwargs, headers, on_delta)
     finally:
+        backends.ROUTE_EVENTS.reset(events)
+        backends.ROUTE_KEY.reset(route)
         if ui.status == waiting:
             ui.status = ""
     if ui.board is not None:
@@ -849,7 +896,7 @@ async def stream_round(ui: ResponseUI, messages: list, kw: dict, tool_kwargs: di
 
 def error_hint(e: Exception) -> str:
     if isinstance(e, backends.NoKeyAvailable):
-        return str(e) + " /doctor checks every key."
+        return str(e) + " Doctor (in the Menu) checks every key."
     code = getattr(e, "status_code", None)
     msg = str(e).lower()
     if code == 401:
@@ -956,7 +1003,7 @@ async def _generate(bot, chat_id: int, turn: Turn) -> None:
                 tool_kwargs = {"tools": tools_list, "tool_choice": "none"}
             ui.begin_round()
             try:
-                content, reasoning, details, calls = await stream_round(ui, messages, kw, tool_kwargs)
+                content, reasoning, details, calls = await lead_round(ui, messages, kw, tool_kwargs)
             except APIError as e:
                 # some providers don't support tools: continue without them instead of failing the reply
                 if not tool_kwargs or "tool" not in str(e).lower():
@@ -965,7 +1012,7 @@ async def _generate(bot, chat_id: int, turn: Turn) -> None:
                 tools_list, tool_kwargs = [], {}
                 ui.add_step("⚠️ Tools aren't supported by this provider — continued without them")
                 ui.begin_round()
-                content, reasoning, details, calls = await stream_round(ui, messages, kw, tool_kwargs)
+                content, reasoning, details, calls = await lead_round(ui, messages, kw, tool_kwargs)
             rounds += 1
             final_details = details
             if not calls:
@@ -1124,7 +1171,8 @@ def make_env(ws: Workspace, changes: Changes, board: "agent.Board", web_on: bool
     except (TypeError, ValueError):
         parallel = int(AGENT_CFG["max_parallel"])
     return agent.Env(
-        client=client, ws=ws, changes=changes, board=board, worker_kw=worker_kwargs(),
+        client=worker_client, ws=ws, changes=changes, board=board, worker_kw=worker_kwargs(),
+        retry_window=RETRY_WINDOW,
         max_parallel=max(1, min(parallel, 8)), max_tasks=int(AGENT_CFG["max_tasks_per_dispatch"]),
         worker_rounds=int(AGENT_CFG["worker_rounds"]), cmd_timeout=int(AGENT_CFG["command_timeout"]),
         preload_chars=int(AGENT_CFG.get("preload_chars", 60_000)),
@@ -1138,16 +1186,20 @@ def make_env(ws: Workspace, changes: Changes, board: "agent.Board", web_on: bool
 
 
 async def lead_round(ui: ResponseUI, messages: list, kw: dict, tool_kwargs: dict):
-    """A lead round with retries when the provider is overloaded (long work isn't lost to a transient error)."""
-    for attempt in range(3):
-        try:
-            return await stream_round(ui, messages, kw, tool_kwargs)
-        except Exception as e:
-            if attempt == 2 or not agent._transient(e):
-                raise
-            ui.add_step(f"Provider busy — retry {attempt + 1}")
-            ui.begin_round()
-            await asyncio.sleep(4 * (attempt + 1) ** 2)
+    """A round that doesn't give up on what waiting can fix: a timeout, a dropped connection, a busy or failing
+    source is retried (smart routing moves to a healthier source) for up to RETRY_WINDOW. Only what waiting can't
+    fix — a wrong key, no credit, a bad request — ends the reply, with the reason."""
+    base = ui.reply_md
+
+    async def attempt():
+        ui.reply_md = base   # a reply cut off midway is written again, not doubled
+        ui.begin_round()
+        return await stream_round(ui, messages, kw, tool_kwargs)
+
+    def on_wait(e: Exception, n: int, pause: float) -> None:
+        ui.add_step(f"{backends.short_reason(e)} — trying again in {pause:.0f}s (attempt {n + 1})")
+
+    return await backends.persist(attempt, on_wait, RETRY_WINDOW)
 
 
 def _btn(text: str, data: str) -> InlineKeyboardButton:
@@ -2142,13 +2194,17 @@ def param_label(key: str, mode: str) -> str:
 
 def settings_html(mode: str = "chat") -> str:
     model = cfg("model", mode)
-    rows = ["<b>Coding settings</b>" if mode == "agent" else "<b>Settings</b>", "",
-            f"Backend: {esc(backend_label())}",
-            f"Model: <code>{esc(str(model))}</code> · {esc(provider_text(model))}"]
     if mode == "agent":
         wm = cfg("worker_model", mode)
-        rows += [f"Agents: <code>{esc(str(wm))}</code> · {esc(provider_text(wm))}",
-                 f"Project: <code>{esc(current_project())}</code>"]
+        rows = ["<b>Coding settings</b>", "",
+                f"Lead: <code>{esc(str(model))}</code>", f"   via {esc(provider_text(model, 'main'))}",
+                f"Agents: <code>{esc(str(wm))}</code>", f"   via {esc(provider_text(wm, 'agents'))}",
+                f"Project: <code>{esc(current_project())}</code>"]
+    else:
+        rows = ["<b>Settings</b>", "", f"Model: <code>{esc(str(model))}</code>",
+                f"   via {esc(provider_text(model, 'main'))}"]
+    if missing := missing_sources():
+        rows.append("Not set up yet: " + esc(", ".join(missing)))
     extra = [f"{k} {cfg(k, mode)}" for k in ("temperature", "top_p", "max_tokens") if cfg(k, mode) is not None]
     if extra:
         rows.append("Advanced: " + " · ".join(esc(x) for x in extra))
@@ -2170,12 +2226,27 @@ def settings_keyboard(mode: str = "chat") -> InlineKeyboardMarkup:
     def head(text):
         return [InlineKeyboardButton(f"— {text} —", callback_data="noop")]
 
-    e, be = cfg("effort", mode), backend_name()
-    backend_row = [btn("Paid · OpenRouter", "backend", "openrouter", be), btn("Free · NVIDIA", "backend", "nvidia", be)]
+    def source_rows(role: str, setting: str, model) -> list:
+        """One button per source that can serve this model: Smart, OpenRouter, each free source with keys."""
+        r, m = role_router(role), config.current_model(model) or str(model)
+        current = r.mode()
+        names = r.options(m)
+        if current not in names:   # still show (and mark) a choice that no longer fits
+            names.append(current)
+        buttons = [btn(source_name(n) + ("" if n == "smart" or providers[n].serves(m) else " (no)"),
+                       setting, n, current) for n in names]
+        return [buttons[i:i + 3] for i in range(0, len(buttons), 3)]
+
+    def fallback_row() -> list:
+        if "smart" not in (client.mode(), worker_client.mode()):
+            return []
+        return [[toggle("Paid OpenRouter as the last resort", "paid_fallback")]]
+
+    e = cfg("effort", mode)
     efforts = [btn({"default": "auto"}.get(x, x), "effort", x, e) for x in EFFORTS]
     if mode != "agent":
         return InlineKeyboardMarkup([
-            head("Backend"), backend_row,
+            head("Model source"), *source_rows("main", "main_backend", cfg("model", mode)), *fallback_row(),
             head("Reasoning"), efforts,
             [toggle("Thinking", "show_thinking"), toggle("Web search", "web_search")],
             [toggle("Long replies as a page", "long_pages")],
@@ -2184,7 +2255,8 @@ def settings_keyboard(mode: str = "chat") -> InlineKeyboardMarkup:
         ])
     perm = cfg("permissions", mode)
     return InlineKeyboardMarkup([
-        head("Backend"), backend_row,
+        head("Lead source"), *source_rows("main", "main_backend", cfg("model", mode)),
+        head("Agents source"), *source_rows("agents", "agent_backend", cfg("worker_model", mode)), *fallback_row(),
         head("Lead reasoning"), efforts,
         head("Agents at once"), [btn(str(n), "max_agents", n, cfg("max_agents", mode)) for n in (2, 3, 4, 6, 8)],
         head("Commands and GitHub changes"),
@@ -2217,8 +2289,13 @@ async def on_settings_button(update: Update, context: ContextTypes.DEFAULT_TYPE)
     if key not in PARAMS:
         await q.answer()
         return
-    save_setting(key, parse_value(key, raw), mode)
-    await q.answer("Done ")
+    try:
+        value = parse_value(key, raw)
+    except ValueError:
+        await q.answer("Not available any more", show_alert=True)
+        return
+    save_setting(key, value, mode)
+    await q.answer("Done")
     if key == "agent_mode":  # switching versions: the keyboard, the menu and the panel all change
         await switch_mode(context.bot, q.message.chat_id, bool(cfg("agent_mode")), q.message)
         return
@@ -2281,8 +2358,9 @@ def code_welcome_html() -> str:
         "<b>Coding mode</b>",
         "",
         f"Lead: <code>{esc(str(cfg('model', 'agent')))}</code>",
+        f"   via {esc(provider_text(cfg('model', 'agent'), 'main'))}",
         f"Agents: <code>{esc(str(cfg('worker_model', 'agent')))}</code> · up to {_max_agents()} at once",
-        f"Backend: {esc(backend_label())}",
+        f"   via {esc(provider_text(cfg('worker_model', 'agent'), 'agents'))}",
         f"Project: <code>{esc(ws.name)}</code> · {n} files · {human(size)}",
         "",
         "Describe what you want built or fixed. The lead plans, splits the work across agents, runs and tests it,",
@@ -2576,7 +2654,7 @@ async def summarize_messages(msgs: list) -> str:
         return c if isinstance(c, str) else "[non-text content]"
     transcript = "\n\n".join(f"{'User' if m['role'] == 'user' else 'Assistant'}: {body(m)}" for m in msgs)
     kw = worker_kwargs()
-    res = await llm.stream_chat(client, [
+    res = await llm.stream_chat(worker_client, [
         {"role": "system", "content": "Summarize the following conversation densely and precisely, keeping everything needed to continue it: "
                                       "the goals, decisions, technical details, names and numbers, what was done and what remains. "
                                       "Use the conversation's language, short bullet points, no preamble."},
@@ -2625,7 +2703,7 @@ async def cmd_cost(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         rows.append(f"<code>{esc(m)}</code> — {agent.usage_line(u)}")
         for k in total:
             total[k] += u.get(k, 0)
-    rows += ["", f"Total: {agent.usage_line(total)}", "<i>Costs as reported by OpenRouter (NVIDIA is free).</i>"]
+    rows += ["", f"Total: {agent.usage_line(total)}", "<i>Costs as reported by OpenRouter (the free sources cost nothing).</i>"]
     await send_html(context.bot, chat_id, lines_html(*rows))
 
 
@@ -2853,11 +2931,11 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     rows = [
         "<b>Status</b>", "",
         f"Mode: {'Coding' if cfg('agent_mode') else 'Chat'}",
-        f"Backend: {esc(backend_label())}",
         "", "<b>Models</b>",
-        f"Lead: <code>{esc(str(cfg('model', 'agent')))}</code> · {esc(provider_text(cfg('model', 'agent')))} · "
-        f"reasoning {esc(str(cfg('effort', 'agent')))}",
+        f"Lead: <code>{esc(str(cfg('model', 'agent')))}</code> · reasoning {esc(str(cfg('effort', 'agent')))}",
+        f"   via {esc(provider_text(cfg('model', 'agent'), 'main'))}",
         f"Agents: <code>{esc(str(cfg('worker_model', 'agent')))}</code> · up to {_max_agents()} at once",
+        f"   via {esc(provider_text(cfg('worker_model', 'agent'), 'agents'))}",
         "", "<b>Project</b>",
         f"<code>{esc(ws.name)}</code> · {n} files · {human(size)}",
         f"git: {git}",
@@ -2959,16 +3037,38 @@ async def ping_rows() -> list[str]:
                     f"({time.monotonic() - t0:.1f}s)")
     except Exception as e:
         rows.append(f"❌ OpenRouter — unreachable ({esc(type(e).__name__)})")
-    if not len(nvidia_pool):
-        rows.append("⚠️ NVIDIA — no keys (add NVIDIA_KEY_1..3)")
-        return rows
-    model = config.NVIDIA_MODELS.get(config.WORKER_MODEL, config.WORKER_MODEL)
-    results = await asyncio.gather(*(nvidia_pool.ping(s, model) for s in nvidia_pool.slots))
-    for slot, (ok, what, secs) in zip(nvidia_pool.slots, results):
+    free = [p for p in providers.values() if p.pool is not None]
+    jobs, labels = [], []
+    for p in free:
+        if not p.active:
+            rows.append(f"— {esc(p.label)} — no keys (add the {esc(p.pool.secret)} secret, one key per line)")
+            continue
+        model = next(iter(p.models), "")   # the first model it serves, under its own id
+        extra = p.model_extra.get(model)
+        for slot in p.pool.slots:
+            jobs.append(p.pool.ping(slot, p.model_id(model), extra_body=extra))
+            labels.append((p, slot))
+    results = await asyncio.gather(*jobs) if jobs else []
+    for (p, slot), (ok, what, _secs) in zip(labels, results):
         icon = "✅" if ok else "⚠️" if ok is None else "❌"
-        rows.append(f"{icon} NVIDIA {esc(slot.name)} — {esc(what)}")
-    rows.append("NVIDIA load (last minute): " + " · ".join(
-        f"{esc(x['name'])} {x['last_minute']}/{nvidia_pool.rpm}" for x in nvidia_pool.status()))
+        rows.append(f"{icon} {esc(p.label)} {esc(slot.name)} — {esc(what)}")
+    for p in free:
+        if not p.active:
+            continue
+        pool = p.pool
+        parts = []
+        for x in pool.status():
+            bit = f"{x['name']} {x['last_minute']}/{pool.rpm} a minute"
+            if pool.rpd:
+                bit += f", {x['today']}/{pool.rpd} today"
+            if pool.tpd:
+                bit += f", {agent.short_tokens(x['tokens'])}/{agent.short_tokens(pool.tpd)} tokens today"
+            if x["state"] != "ready":
+                bit += f" ({x['state']})"
+            parts.append(bit)
+        rows.append(f"{esc(p.label)} use: " + esc(" · ".join(parts)))
+    if any(p.active and (p.pool.rpd or p.pool.tpd) for p in free):
+        rows.append("<i>Each check uses one request of a daily quota.</i>")
     return rows
 
 
@@ -2994,11 +3094,13 @@ async def cmd_doctor(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
                 f"{esc(state_store.status())}")
     rows.append(f"{mark(vault.enabled() or None)} Encryption — "
                 + ("on" if vault.enabled() else "off (add PERSONA_KEY)"))
-    rows += ["", "<b>Models</b>", f"Backend: {esc(backend_label())}"]
-    for label, mode, key in (("Chat", "chat", "model"), ("Coding lead", "agent", "model"),
-                             ("Coding agents", "agent", "worker_model")):
+    rows += ["", "<b>Models</b>"]
+    for label, mode, key, role in (("Chat", "chat", "model", "main"), ("Coding lead", "agent", "model", "main"),
+                                   ("Coding agents", "agent", "worker_model", "agents")):
         m = cfg(key, mode)
-        rows.append(f"{label}: <code>{esc(str(m))}</code> · {esc(provider_text(m))}")
+        rows.append(f"{label}: <code>{esc(str(m))}</code> via {esc(provider_text(m, role))}")
+    if health := router_stats.summary():
+        rows += ["", "<b>Source health (this run)</b>", *map(esc, health)]
     tools = [f"{t} {'✓' if shutil.which(t) else '—'}" for t in ("git", "python3", "node", "npm")]
     free = shutil.disk_usage(DATA_DIR if DATA_DIR.exists() else Path(".")).free
     rows += ["", "<b>Machine</b>", " · ".join(tools), f"Free disk: {human(free)}"]
@@ -3504,6 +3606,7 @@ async def post_init(app: Application) -> None:
 
 async def post_shutdown(app: Application) -> None:
     state_store.flush()  # a change made just before stopping still reaches the durable copy
+    usage_store.flush()  # the free sources' daily counts
     task = app.bot_data.get("watch_task")
     if task:
         task.cancel()
@@ -3564,7 +3667,10 @@ def main() -> None:
     # the Actions cache can come back empty — bring the persona, rules and settings back from the durable copy
     state_store.restore(DATA_DIR)
     load_state()
-    log.info("Bot running via OpenRouter with model %s on %s", cfg("model"), provider_text(cfg("model")))
+    log.info("Bot running: model %s via %s · agents %s via %s · free sources with keys: %s", cfg("model"),
+             provider_text(cfg("model"), "main"), cfg("worker_model", "agent"),
+             provider_text(cfg("worker_model", "agent"), "agents"),
+             ", ".join(f"{p.label} ({len(p.pool)})" for p in providers.values() if p.pool and p.active) or "none")
     build_app().run_polling(allowed_updates=Update.ALL_TYPES)
 
 

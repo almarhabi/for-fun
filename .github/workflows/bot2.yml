@@ -118,7 +118,12 @@ jobs:
           # GLM-5.3 Flash (relace/fp4) is both the lead and the coding agents. Fixed provider, no fallbacks.
           OPENROUTER_MODEL: ${{ vars.OPENROUTER_MODEL_2 || 'z-ai/glm-5.3-flash' }}
           AGENT_MODEL: ${{ vars.AGENT_MODEL_2 }}             # optional (default z-ai/glm-5.3-flash)
-          # 🆓 NVIDIA keys: bot 2's own (NVIDIA_KEY_2_1..3) if set, otherwise the same three as bot 1
+          # Free sources: ONE secret each, one key per line, any number of keys (the line order is kept).
+          # Bot 2's own (the _2 secrets) if set, otherwise the same as bot 1. Pick each role's source in Settings.
+          NVIDIA_KEYS: ${{ secrets.NVIDIA_KEYS_2 || secrets.NVIDIA_KEYS }}
+          AIHUBMIX_KEYS: ${{ secrets.AIHUBMIX_KEYS_2 || secrets.AIHUBMIX_KEYS }}
+          ORCAROUTER_KEYS: ${{ secrets.ORCAROUTER_KEYS_2 || secrets.ORCAROUTER_KEYS }}
+          # older NVIDIA secrets still work (added after the keys above)
           NVIDIA_API_KEYS: ${{ secrets.NVIDIA_KEY_2_1 || secrets.NVIDIA_KEY_1 }},${{ secrets.NVIDIA_KEY_2_2 || secrets.NVIDIA_KEY_2 }},${{ secrets.NVIDIA_KEY_2_3 || secrets.NVIDIA_KEY_3 }}
           GH_PAT: ${{ secrets.GH_PAT_2 || secrets.GH_PAT }}   # optional: lets the bot write/edit on GitHub and watch CI (owner only)
           TOR_PROXY: ${{ env.TOR_PROXY }}   # filled automatically when USE_TOR=true

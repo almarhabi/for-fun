@@ -115,7 +115,12 @@ jobs:
           # Each model always runs on its own fixed provider (set in config.json), with no fallbacks.
           OPENROUTER_MODEL: ${{ vars.OPENROUTER_MODEL }}   # optional override of the main model
           AGENT_MODEL: ${{ vars.AGENT_MODEL }}             # optional override of the coding agents' model
-          # 🆓 the free backend (NVIDIA NIM): up to three keys, the load is spread over them (/backend to switch)
+          # Free sources: ONE secret each, one key per line, any number of keys (the line order is kept).
+          # Pick each role's source in Settings (Smart = free first, switches by itself). No keys = not offered.
+          NVIDIA_KEYS: ${{ secrets.NVIDIA_KEYS }}
+          AIHUBMIX_KEYS: ${{ secrets.AIHUBMIX_KEYS }}         # GLM-5.3 Flash free (5 a minute, 100 a day per key)
+          ORCAROUTER_KEYS: ${{ secrets.ORCAROUTER_KEYS }}     # optional: DeepSeek V4.1 Flash free
+          # older NVIDIA secrets still work (added after the keys above)
           NVIDIA_API_KEYS: ${{ secrets.NVIDIA_KEY_1 }},${{ secrets.NVIDIA_KEY_2 }},${{ secrets.NVIDIA_KEY_3 }}
           GH_PAT: ${{ secrets.GH_PAT }}   # optional: lets the bot write/edit on GitHub and watch CI (owner only)
           TOR_PROXY: ${{ env.TOR_PROXY }}   # filled automatically when USE_TOR=true

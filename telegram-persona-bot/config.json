@@ -16,31 +16,88 @@
     "moonshotai/kimi-k3.1-pro": "deepseek/deepseek-v4.1-flash-1017",
     "z-ai/glm-5.3": "z-ai/glm-5.3-flash"
   },
-  "nvidia": {
-    "_note": "🆓 The free backend (NVIDIA NIM). Same models, mapped to their NVIDIA ids. Keys come from the NVIDIA_KEY_1..3 secrets (NVIDIA_API_KEYS in the bot's environment); requests are spread over them and each key stays under rpm_per_key. model_extra: optional extra request fields per model (e.g. chat_template_kwargs). first_token_timeout/attempts: how long to wait for NVIDIA to start answering before giving up.",
-    "base_url": "https://integrate.api.nvidia.com/v1",
-    "rpm_per_key": 40,
-    "max_wait_seconds": 45,
-    "models": {
-      "deepseek/deepseek-v4.1-flash-1017": "deepseek-ai/deepseek-v4.1-flash",
-      "z-ai/glm-5.3-flash": "z-ai/glm-5.3-flash"
-    },
-    "model_extra": {
-      "deepseek/deepseek-v4.1-flash-1017": {
-        "chat_template_kwargs": {
-          "thinking": true,
-          "enable_thinking": true
-        }
+  "free_providers": {
+    "_note": "Free model sources. Each one: its API address, the secret that holds its keys (ONE key per line, any number of keys — the order of the lines is kept), per-key limits (rpm = requests a minute, rpd = requests a day, tpd = tokens a day; 0 = no limit), which of the bot's models it serves (bot model → the provider's own model id), and extra request fields per model (how to turn thinking on). A provider without keys is simply not offered. legacy_env: older secret names still read.",
+    "nvidia": {
+      "label": "NVIDIA",
+      "base_url": "https://integrate.api.nvidia.com/v1",
+      "keys_secret": "NVIDIA_KEYS",
+      "legacy_env": [
+        "NVIDIA_API_KEYS",
+        "NVIDIA_API_KEY",
+        "NVIDIA_KEY_1",
+        "NVIDIA_KEY_2",
+        "NVIDIA_KEY_3",
+        "NVIDIA_KEY_4",
+        "NVIDIA_KEY_5",
+        "NVIDIA_KEY_6",
+        "NVIDIA_KEY_7",
+        "NVIDIA_KEY_8",
+        "NVIDIA_KEY_9"
+      ],
+      "rpm_per_key": 40,
+      "rpd_per_key": 0,
+      "tpd_per_key": 0,
+      "models": {
+        "deepseek/deepseek-v4.1-flash-1017": "deepseek-ai/deepseek-v4.1-flash",
+        "z-ai/glm-5.3-flash": "z-ai/glm-5.3-flash"
       },
-      "z-ai/glm-5.3-flash": {
-        "chat_template_kwargs": {
-          "thinking": true,
-          "enable_thinking": true
+      "model_extra": {
+        "deepseek/deepseek-v4.1-flash-1017": {
+          "chat_template_kwargs": {
+            "thinking": true,
+            "enable_thinking": true
+          }
+        },
+        "z-ai/glm-5.3-flash": {
+          "chat_template_kwargs": {
+            "thinking": true,
+            "enable_thinking": true
+          }
         }
       }
     },
+    "aihubmix": {
+      "label": "AIHubMix",
+      "base_url": "https://aihubmix.com/v1",
+      "keys_secret": "AIHUBMIX_KEYS",
+      "rpm_per_key": 5,
+      "rpd_per_key": 100,
+      "tpd_per_key": 1000000,
+      "models": {
+        "z-ai/glm-5.3-flash": "coding-glm-5.3-flash-free"
+      },
+      "model_extra": {
+        "z-ai/glm-5.3-flash": {
+          "thinking": {
+            "type": "enabled"
+          }
+        }
+      }
+    },
+    "orcarouter": {
+      "label": "OrcaRouter",
+      "base_url": "https://api.orcarouter.ai/v1",
+      "keys_secret": "ORCAROUTER_KEYS",
+      "rpm_per_key": 10,
+      "rpd_per_key": 0,
+      "tpd_per_key": 0,
+      "models": {
+        "deepseek/deepseek-v4.1-flash-1017": "deepseek/deepseek-v4.1-flash-free"
+      },
+      "model_extra": {}
+    }
+  },
+  "routing": {
+    "_note": "How requests are routed. Smart = free sources first, ranked live by speed, failures, load and quota left. Switching is quick: an error moves to the next source at once; a source that hasn't started answering gets company after hedge_min..hedge_max seconds (about 1.5x its usual start time), and the first to answer wins; two failures in a row rest a source (30 s, then longer). A source picked by hand goes first: its first failure is retried on it after 3 s, a second one moves on; if it's silent for picked_patience_seconds another source joins. first_token_timeout = the longest wait for a source to start; smart_deadline_seconds = the same for Smart; max_wait_seconds = the longest wait for a key to free up. persist_minutes = only when EVERY source keeps failing: how long the bot keeps trying (pauses of 3 s growing to 60 s) before it reports the error.",
     "first_token_timeout": 120,
-    "attempts": 2
+    "attempts": 2,
+    "hedge_min_seconds": 10,
+    "hedge_max_seconds": 45,
+    "smart_deadline_seconds": 150,
+    "max_wait_seconds": 45,
+    "persist_minutes": 30,
+    "picked_patience_seconds": 40
   },
   "efforts": [
     "default",
@@ -457,9 +514,23 @@
         "code"
       ]
     },
-    "backend": {
+    "main_backend": {
       "type": "str",
-      "label": "🔀 Backend (💳 paid OpenRouter · 🆓 free NVIDIA) — switch with the buttons",
+      "label": "Main model source (Chat + the coding lead): smart / openrouter / a free provider",
+      "modes": [
+        "global"
+      ]
+    },
+    "agent_backend": {
+      "type": "str",
+      "label": "Coding agents' source: smart / openrouter / a free provider",
+      "modes": [
+        "global"
+      ]
+    },
+    "paid_fallback": {
+      "type": "bool",
+      "label": "Smart mode: OpenRouter (paid) as the last resort",
       "modes": [
         "global"
       ]
@@ -482,7 +553,9 @@
     "max_agents": 6,
     "project": "main",
     "persona_voice": true,
-    "backend": "openrouter"
+    "main_backend": "openrouter",
+    "agent_backend": "openrouter",
+    "paid_fallback": false
   },
   "code_defaults": {
     "effort": "high",
