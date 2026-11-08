@@ -14,6 +14,8 @@
 import asyncio
 import copy
 import logging
+
+import httpx
 import time
 from collections import deque
 from dataclasses import dataclass, field
@@ -31,6 +33,32 @@ DEAD_AUTH = 900.0       # seconds a rejected key (401/403) stays out
 
 class NoKeyAvailable(RuntimeError):
     """Every NVIDIA key is missing, rejected or still busy after waiting."""
+
+
+class NvidiaSlow(NoKeyAvailable):
+    """NVIDIA accepted the request but never started answering (the free service queues requests)."""
+
+
+class PrefetchedStream:
+    """A stream whose first chunk was already read (to check the model really started answering)."""
+
+    def __init__(self, first, rest):
+        self._first, self._rest, self._sent = first, rest, False
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        if not self._sent:
+            self._sent = True
+            if self._first is StopAsyncIteration:
+                raise StopAsyncIteration
+            return self._first
+        return await self._rest.__anext__()
+
+    async def close(self):
+        if hasattr(self._rest, "close"):
+            await self._rest.close()
 
 
 @dataclass
@@ -62,7 +90,9 @@ def _retry_after(e: APIStatusError) -> float | None:
 class KeyPool:
     def __init__(self, keys: list[str], base_url: str, rpm_per_key: int = 40, max_wait: float = 45.0,
                  client_factory=None, clock=time.monotonic):
-        factory = client_factory or (lambda key: AsyncOpenAI(api_key=key, base_url=base_url, max_retries=0))
+        # a short connect timeout, and at most 3 minutes of silence between chunks (instead of the SDK's 10)
+        factory = client_factory or (lambda key: AsyncOpenAI(api_key=key, base_url=base_url, max_retries=0,
+                                                             timeout=httpx.Timeout(180.0, connect=15.0)))
         self.slots = [Slot(f"key {i + 1}", factory(k)) for i, k in enumerate(dict.fromkeys(k for k in keys if k))]
         self.rpm = max(1, int(rpm_per_key))
         self.max_wait = max_wait
@@ -222,9 +252,11 @@ def to_nvidia(kw: dict, models: dict, model_extra: dict) -> dict:
 class ModelRouter:
     """Looks like an OpenAI client; each request goes to the backend picked right now."""
 
-    def __init__(self, openrouter, pool: KeyPool | None, backend_fn, models: dict, model_extra: dict | None = None):
+    def __init__(self, openrouter, pool: KeyPool | None, backend_fn, models: dict, model_extra: dict | None = None,
+                 first_token_timeout: float = 120.0, attempts: int = 2):
         self.openrouter, self.pool, self.backend_fn = openrouter, pool, backend_fn
         self.models, self.model_extra = models, model_extra or {}
+        self.first_token_timeout, self.attempts = first_token_timeout, max(1, attempts)
         self.chat = SimpleNamespace(completions=SimpleNamespace(create=self._create))
 
     def backend(self) -> str:
@@ -235,5 +267,29 @@ class ModelRouter:
             if not self.pool or not len(self.pool):
                 raise NoKeyAvailable("🆓 NVIDIA is selected but no NVIDIA keys are set — add the NVIDIA_KEY_1..3 "
                                      "secrets, or switch back to 💳 OpenRouter in ⚙️ Settings.")
-            return await self.pool.create(**to_nvidia(kw, self.models, self.model_extra))
+            req = to_nvidia(kw, self.models, self.model_extra)
+            if not req.get("stream"):
+                return await self.pool.create(**req)
+            # NVIDIA's free service can queue a request for a long time without sending anything: wait a bounded
+            # time for the first chunk, try once more, then say so plainly instead of hanging for half an hour
+            for attempt in range(self.attempts):
+                stream = await self.pool.create(**req)
+                try:
+                    first = await asyncio.wait_for(stream.__anext__(), self.first_token_timeout)
+                except StopAsyncIteration:
+                    return PrefetchedStream(StopAsyncIteration, stream)
+                except asyncio.TimeoutError:
+                    log.warning("NVIDIA sent nothing in %.0fs (attempt %d/%d)", self.first_token_timeout,
+                                attempt + 1, self.attempts)
+                    if hasattr(stream, "close"):
+                        try:
+                            await stream.close()
+                        except Exception:
+                            pass
+                    continue
+                return PrefetchedStream(first, stream)
+            minutes = self.first_token_timeout * self.attempts / 60
+            raise NvidiaSlow(f"NVIDIA's free service accepted the request but didn't start answering in "
+                             f"{minutes:.0f} minutes (its queue is busy). Try again later, or switch to "
+                             f"Paid · OpenRouter in Settings.")
         return await self.openrouter.chat.completions.create(**kw)

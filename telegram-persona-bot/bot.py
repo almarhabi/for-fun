@@ -117,7 +117,8 @@ nvidia_pool = backends.KeyPool(config.nvidia_keys(), config.NVIDIA["base_url"],
                                int(config.NVIDIA.get("rpm_per_key", 40)), float(config.NVIDIA.get("max_wait_seconds", 45)))
 # Every request (chat, the coding lead, the agents) goes through the router to the backend the owner picked
 client = backends.ModelRouter(openrouter_client, nvidia_pool, lambda: cfg("backend"), config.NVIDIA_MODELS,
-                              config.NVIDIA.get("model_extra") or {})
+                              config.NVIDIA.get("model_extra") or {},
+                              float(config.NVIDIA.get("first_token_timeout", 120)), int(config.NVIDIA.get("attempts", 2)))
 NO_PREVIEW = LinkPreviewOptions(is_disabled=True)
 PREVIEW = LinkPreviewOptions(is_disabled=False, prefer_large_media=False)
 tph = telegraph.Telegraph(TELEGRAPH_FILE, short_name="PersonaBot")
@@ -824,12 +825,21 @@ async def stream_round(ui: ResponseUI, messages: list, kw: dict, tool_kwargs: di
     """One round with the model. Returns (reply text, reasoning, reasoning details, tool calls)."""
     headers = {"X-Title": t} if (t := load_title()) else {}
 
+    waiting = (f"Waiting for {'NVIDIA (free) — its queue can be slow' if backend_name() == 'nvidia' else 'the model'}…")
+    ui.status = waiting   # shown until the first token arrives, so a slow start is never a blank screen
+
     def on_delta(raw: str, reasoning: str, _calls) -> None:
+        if ui.status == waiting:
+            ui.status = ""
         tag_think, answer = split_think_tags(raw)
         ui.set_round_reasoning(reasoning + tag_think)
         ui.set_round_answer(answer)
 
-    res = await llm.stream_chat(client, messages, kw, tool_kwargs, headers, on_delta)
+    try:
+        res = await llm.stream_chat(client, messages, kw, tool_kwargs, headers, on_delta)
+    finally:
+        if ui.status == waiting:
+            ui.status = ""
     if ui.board is not None:
         ui.board.usage.add(kw["model"], res.usage)
     elif res.usage:

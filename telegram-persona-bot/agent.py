@@ -782,7 +782,7 @@ async def run_worker(env: Env, st: AgentState, brief: str, claims: Claims, ctx: 
             ctx.seen_reads.clear()  # old results were shortened — the next read must come back in full
         else:
             compact_stale(messages, env.compact_chars)
-        st.activity = "💭 thinking…"
+        st.activity = "waiting for the model…"   # becomes "thinking…" / the tool it calls as soon as tokens arrive
         res = await call_model(env, messages, kw, tk, on_delta, on_retry)
         st.rounds += 1
         if not res.calls:

@@ -1890,6 +1890,33 @@ async def backend_scenario(app):
     r2 = await router.chat.completions.create(model="z-ai/glm-5.3-flash", messages=[], extra_body={"provider": {}})
     check("router: follows the switch (paid → free)", r1 == "paid" and r2.startswith("stream-from-")
           and len(paid_calls) == 1 and "extra_body" not in log[-1][1], (r1, r2))
+    # NVIDIA accepts but never starts answering → bounded wait, one more try, then a clear message
+    pool, log, made = make_pool()
+    for f in made.values():
+        f.first_token_delay = 5
+    slow_router = B.ModelRouter(FakeOR(), pool, lambda: "nvidia", bot.config.NVIDIA_MODELS,
+                                first_token_timeout=0.2, attempts=2)
+    t0 = time.monotonic()
+    try:
+        await slow_router.chat.completions.create(model="z-ai/glm-5.3-flash", messages=[], stream=True)
+        slow_msg = ""
+    except B.NvidiaSlow as e:
+        slow_msg = str(e)
+    check("router: a silent NVIDIA queue gives up quickly with a clear message",
+          "didn't start answering" in slow_msg and "Paid" in slow_msg and len(log) == 2 and time.monotonic() - t0 < 2,
+          (slow_msg, len(log)))
+    check("router: a slow NVIDIA start isn't retried forever by the caller",
+          not __import__("agent")._transient(B.NvidiaSlow("x")))
+    pool, log, made = make_pool()
+    fast_router = B.ModelRouter(FakeOR(), pool, lambda: "nvidia", bot.config.NVIDIA_MODELS,
+                                bot.config.NVIDIA.get("model_extra"), first_token_timeout=1)
+    st = await fast_router.chat.completions.create(model="z-ai/glm-5.3-flash", messages=[], stream=True)
+    got = [await st.__anext__(), await st.__anext__()]
+    check("router: a normal NVIDIA stream passes through (first chunk kept)", got == ["chunk", "chunk"], got)
+    sent = log[-1][1]
+    check("router: thinking turned on for NVIDIA's models",
+          sent.get("extra_body", {}).get("chat_template_kwargs", {}).get("thinking") is True
+          if bot.config.NVIDIA.get("model_extra") else True, sent.get("extra_body"))
     router_empty = B.ModelRouter(FakeOR(), B.KeyPool([], "x"), lambda: "nvidia", {})
     try:
         await router_empty.chat.completions.create(model="m", messages=[])
@@ -2010,6 +2037,21 @@ async def state_scenario(app):
     check("vault: a passphrase PERSONA_KEY still encrypts", out == "True True True", out)
 
 
+async def waiting_scenario(app):
+    print("\n— Waiting status —")
+    bot.save_setting("agent_mode", True)
+    SCRIPT.update(error=None, delay=0.9, rounds=[text_deltas("late answer", 50)])
+    user_msg("are you there?")
+    await asyncio.sleep(0.7)
+    panel = next((m.get("text", "") for m in reversed(bot_msgs()) if "Working…" in (m.get("text") or "")), "")
+    check("waiting: the work panel says it's waiting for the model", "Waiting for" in panel, panel)
+    await wait_idle()
+    SCRIPT["delay"] = 0.01
+    check("waiting: the status goes away once it answers", "late answer" in last_bot().get("text", "")
+          and not any("Waiting for" in (m.get("text") or "") for m in bot_msgs()[-3:]), last_bot().get("text", ""))
+    bot.save_setting("agent_mode", False)
+
+
 async def menu_scenario(app):
     """Every command from buttons: Menu opens them, Back returns, a command needing input asks for it."""
     print("\n— Menu buttons —")
@@ -2099,6 +2141,7 @@ async def main():
             await asyncio.wait_for(backend_scenario(app), 120)
             await asyncio.wait_for(state_scenario(app), 120)
             await asyncio.wait_for(menu_scenario(app), 120)
+            await asyncio.wait_for(waiting_scenario(app), 60)
         finally:
             await app.updater.stop()
             await app.stop()

@@ -17,7 +17,7 @@
     "z-ai/glm-5.3": "z-ai/glm-5.3-flash"
   },
   "nvidia": {
-    "_note": "🆓 The free backend (NVIDIA NIM). Same models, mapped to their NVIDIA ids. Keys come from the NVIDIA_KEY_1..3 secrets (NVIDIA_API_KEYS in the bot's environment); requests are spread over them and each key stays under rpm_per_key. model_extra: optional extra request fields per model (e.g. chat_template_kwargs).",
+    "_note": "🆓 The free backend (NVIDIA NIM). Same models, mapped to their NVIDIA ids. Keys come from the NVIDIA_KEY_1..3 secrets (NVIDIA_API_KEYS in the bot's environment); requests are spread over them and each key stays under rpm_per_key. model_extra: optional extra request fields per model (e.g. chat_template_kwargs). first_token_timeout/attempts: how long to wait for NVIDIA to start answering before giving up.",
     "base_url": "https://integrate.api.nvidia.com/v1",
     "rpm_per_key": 40,
     "max_wait_seconds": 45,
@@ -25,7 +25,22 @@
       "deepseek/deepseek-v4.1-flash-1017": "deepseek-ai/deepseek-v4.1-flash",
       "z-ai/glm-5.3-flash": "z-ai/glm-5.3-flash"
     },
-    "model_extra": {}
+    "model_extra": {
+      "deepseek/deepseek-v4.1-flash-1017": {
+        "chat_template_kwargs": {
+          "thinking": true,
+          "enable_thinking": true
+        }
+      },
+      "z-ai/glm-5.3-flash": {
+        "chat_template_kwargs": {
+          "thinking": true,
+          "enable_thinking": true
+        }
+      }
+    },
+    "first_token_timeout": 120,
+    "attempts": 2
   },
   "efforts": [
     "default",
