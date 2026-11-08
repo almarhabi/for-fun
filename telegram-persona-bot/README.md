@@ -228,6 +228,7 @@ and serve that role's model are offered.
 | AIHubMix | GLM-5.3 Flash (`coding-glm-5.3-flash-free`) | `AIHUBMIX_KEYS` | 5 a minute, 100 a day, 1M tokens a day |
 | OrcaRouter | DeepSeek V4.1 Flash (`deepseek/deepseek-v4.1-flash-free`) | `ORCAROUTER_KEYS` | not published (10 a minute assumed) |
 | ExpLabs (Experiential Labs) | DeepSeek V4.1 Flash (`deepseek-v4.1-flash`) | `EXPLABS_KEYS` (or `EXPLABS_API_KEY`) | 10 a minute, 1M input + 1M output tokens a day |
+| OpenRouter Free | the `:free` versions of both models, **only while OpenRouter offers them** (its model list is checked every hour; they join and leave by themselves) | the same `OPENROUTER_API_KEY` (or `OPENROUTER_FREE_KEYS`) | per account: 20 a minute, 1000 a day (50 under $10 of credit bought) |
 
 Bot 2 reads the `_2` versions (`NVIDIA_KEYS_2`…) if set, otherwise bot 1's. Everything is in `config.json`
 (`free_providers`, `routing`) — a new OpenAI-compatible free source is a few lines there plus its secret in the workflow.

@@ -118,6 +118,7 @@ openrouter_client = AsyncOpenAI(api_key=OPENROUTER_API_KEY, base_url=OPENROUTER_
 usage_store = backends.UsageStore(DATA_DIR / "key_usage.json")   # daily counts survive restarts
 providers = backends.build_providers(openrouter_client, config.FREE_PROVIDERS, os.environ, usage_store, config.ROUTING)
 router_stats = backends.Stats()   # live health of every source, shared by both routers
+CATALOG_EVERY = 3600   # seconds between checks of the model lists (OpenRouter's ":free" versions come and go)
 # how long a reply keeps trying through timeouts, dropped connections and busy sources before it gives up
 RETRY_WINDOW = float(config.ROUTING.get("persist_minutes", 30)) * 60
 
@@ -3063,7 +3064,12 @@ async def ping_rows() -> list[str]:
         if not p.active:
             rows.append(f"— {esc(p.label)} — no keys (add the {esc(p.pool.secret)} secret, one key per line)")
             continue
-        model = next(iter(p.models), "")   # the first model it serves, under its own id
+        live = [m for m in p.models if p.serves(m)]
+        if not live:   # e.g. OpenRouter's ":free" versions aren't offered right now
+            rows.append(f"— {esc(p.label)} — waiting: {esc(', '.join(p.waiting_for()))} not offered right now "
+                        "(checked every hour; it joins by itself when it appears)")
+            continue
+        model = live[0]   # the first model it serves now, under its own id
         extra = p.model_extra.get(model)
         for slot in p.pool.slots:
             jobs.append(p.pool.ping(slot, p.model_id(model), extra_body=extra))
@@ -3073,7 +3079,7 @@ async def ping_rows() -> list[str]:
         icon = "✅" if ok else "⚠️" if ok is None else "❌"
         rows.append(f"{icon} {esc(p.label)} {esc(slot.name)} — {esc(what)}")
     for p in free:
-        if not p.active:
+        if not p.active or not any(p.serves(m) for m in p.models):
             continue
         pool = p.pool
         parts = []
@@ -3623,17 +3629,31 @@ async def set_menu(app: Application) -> None:
     await refresh_owner_menu(app.bot)
 
 
+async def catalog_loop() -> None:
+    """Keeps the sources with a model list (OpenRouter Free) up to date: a ":free" version that appears joins the
+    routing by itself, one that disappears leaves it."""
+    while True:
+        try:
+            for change in await backends.refresh_catalogs(providers):
+                log.info("%s", change)
+        except Exception:
+            log.warning("model list check failed", exc_info=True)
+        await asyncio.sleep(CATALOG_EVERY)
+
+
 async def post_init(app: Application) -> None:
     await set_menu(app)
     app.bot_data["watch_task"] = asyncio.create_task(watch_loop(app.bot))  # background CI watching
+    if CATALOG_EVERY > 0 and any(p.catalog_url for p in providers.values()):
+        app.bot_data["catalog_task"] = asyncio.create_task(catalog_loop())
 
 
 async def post_shutdown(app: Application) -> None:
     state_store.flush()  # a change made just before stopping still reaches the durable copy
     usage_store.flush()  # the free sources' daily counts
-    task = app.bot_data.get("watch_task")
-    if task:
-        task.cancel()
+    for name in ("watch_task", "catalog_task"):
+        if task := app.bot_data.get(name):
+            task.cancel()
     kill_all_jobs()  # any server the agents started in the background stops with the bot
 
 

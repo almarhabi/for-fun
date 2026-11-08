@@ -88,6 +88,8 @@ def parse_keys(*chunks: str) -> list[str]:
     for chunk in chunks:
         for line in (chunk or "").replace(",", "\n").split():
             k = line.strip().strip("\"'")
+            if k.lower() == "bearer":   # "Bearer sk-…" pasted whole: the next word is the key
+                continue
             if k:
                 keys.append(k)
     return list(dict.fromkeys(keys))
@@ -317,7 +319,7 @@ def _retry_after(e: APIStatusError) -> float | None:
 
 def _is_quota(e: APIStatusError) -> bool:
     text = f"{getattr(e, 'message', '')} {getattr(e, 'body', '')}".lower()
-    return any(w in text for w in ("per day", "daily", "quota", "today", "/day", "insufficient"))
+    return any(w in text for w in ("per day", "per-day", "daily", "quota", "today", "/day", "insufficient"))
 
 
 class _Metered:
@@ -662,20 +664,33 @@ to_nvidia = to_free  # older name
 
 class Provider:
     def __init__(self, name: str, label: str, paid: bool, models: dict | None = None, model_extra: dict | None = None,
-                 pool: KeyPool | None = None, client=None, first_token_timeout: float = 120.0, attempts: int = 2):
+                 pool: KeyPool | None = None, client=None, first_token_timeout: float = 120.0, attempts: int = 2,
+                 catalog_url: str = ""):
         self.name, self.label, self.paid = name, label, paid
         self.models = {k: v for k, v in (models or {}).items() if not str(k).startswith("_")}
         self.model_extra = {k: v for k, v in (model_extra or {}).items() if not str(k).startswith("_")}
         self.pool, self.client = pool, client
         self.first_token_timeout, self.attempts = first_token_timeout, max(1, attempts)
         self.stream_usage = True
+        # a source whose models come and go (e.g. OpenRouter's ":free" versions): only the ids its public model list
+        # shows right now are served — none until the first check (None = no list to check: always served)
+        self.catalog_url = catalog_url
+        self.live_ids: set | None = set() if catalog_url else None
 
     @property
     def active(self) -> bool:
         return self.client is not None if self.pool is None else len(self.pool) > 0
 
     def serves(self, model: str) -> bool:
-        return self.paid and self.pool is None or model in self.models
+        if self.paid and self.pool is None:
+            return True
+        return model in self.models and (self.live_ids is None or self.models[model] in self.live_ids)
+
+    def waiting_for(self) -> list[str]:
+        """Model ids this source is set up for but doesn't offer right now (per its model list)."""
+        if self.live_ids is None:
+            return []
+        return [v for v in self.models.values() if v not in self.live_ids]
 
     def model_id(self, model: str) -> str:
         return self.models.get(model, model)
@@ -1082,6 +1097,35 @@ async def _close(stream) -> None:
             pass
 
 
+async def refresh_catalogs(providers: dict, fetch=None) -> list[str]:
+    """Checks the public model list of every source that has one; returns what changed ("OpenRouter Free: now
+    offers …" / "no longer offers …"). A failed check keeps what was known."""
+    changes = []
+    for p in providers.values():
+        if not p.catalog_url:
+            continue
+        try:
+            if fetch:
+                data = await fetch(p.catalog_url)
+            else:
+                async with httpx.AsyncClient(timeout=30) as http:
+                    r = await http.get(p.catalog_url)
+                    r.raise_for_status()
+                    data = r.json()
+            ids = {str(m.get("id")) for m in (data.get("data") or []) if isinstance(m, dict)}
+        except Exception as e:
+            log.warning("couldn't check %s's model list: %s", p.label, type(e).__name__)
+            continue
+        now = ids & set(p.models.values())
+        before = p.live_ids or set()
+        for m in sorted(now - before):
+            changes.append(f"{p.label}: now offers {m}")
+        for m in sorted(before - now):
+            changes.append(f"{p.label}: no longer offers {m}")
+        p.live_ids = now
+    return changes
+
+
 def build_providers(openrouter_client, free_cfg: dict, env: dict, usage_store: UsageStore | None = None,
                     routing: dict | None = None, client_factory=None) -> dict:
     """OpenRouter first, then every configured free provider (with or without keys)."""
@@ -1101,5 +1145,5 @@ def build_providers(openrouter_client, free_cfg: dict, env: dict, usage_store: U
                        tpd_out_per_key=int(c.get("tpd_out_per_key", 0) or 0))
         out[name] = Provider(name, c.get("label", name), False, c.get("models"), c.get("model_extra"), pool=pool,
                              first_token_timeout=float(routing.get("first_token_timeout", 120)),
-                             attempts=int(routing.get("attempts", 2)))
+                             attempts=int(routing.get("attempts", 2)), catalog_url=c.get("catalog_url", ""))
     return out
