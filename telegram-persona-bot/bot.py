@@ -261,12 +261,25 @@ def save_identity(who: str, text: str) -> None:
 
 
 def lead_identity() -> tuple[str, str]:
-    """(identity, rules) for the lead: its own identity if set, otherwise the Chat persona as a voice only.
-    Both need Persona voice on."""
+    """(identity, rules) for the lead: its own identity if set, otherwise the Chat persona — either one fully, as
+    who the lead is (not just a voice). Needs "Lead identity" on in the Coding settings."""
     if not (cfg("persona_voice", "agent") and AGENT_CFG.get("persona_voice", True)):
         return "", ""
     own = load_identity("lead")
-    return (own, config.LEAD_IDENTITY_RULES) if own.strip() else (load_persona(), "")
+    return (own if own.strip() else load_persona()), config.LEAD_IDENTITY_RULES
+
+
+def with_reminder(content, on: bool = True):
+    """The new message as sent to the model, with a short note to stay in the identity (the latest thing the model
+    reads, so a long conversation doesn't drift back to a generic voice). Never saved in the history."""
+    note = config.IDENTITY_REMINDER
+    if not (on and note):
+        return content
+    if isinstance(content, str):
+        return f"{content}\n\n{note}"
+    if isinstance(content, list):
+        return [*content, {"type": "text", "text": note}]
+    return content
 
 
 def load_title() -> str:
@@ -288,10 +301,14 @@ def save_snippets(data: dict) -> None:
 
 
 def system_prompt(github: bool = False, confidential: bool = False) -> str:
+    """The identity first (who the model is), then the lock rules, the formatting rules and the tools note, and a
+    closing line that ties everything back to the identity."""
     extra = GITHUB_NOTE if github else ""
     # For non-owners: block revealing the instructions/persona. The owner sees them via /persona and /rules
-    head = (CONFIDENTIAL_NOTE + "\n") if confidential and CONFIDENTIAL_NOTE else ""
-    return f"{head}{load_lock()}\n{STYLE_RULES}{extra}\n<identity>\n{load_persona()}\n</identity>"
+    head = (CONFIDENTIAL_NOTE + "\n\n") if confidential and CONFIDENTIAL_NOTE else ""
+    anchor = f"\n\n{config.IDENTITY_ANCHOR}" if config.IDENTITY_ANCHOR else ""
+    return (f"{head}<identity>\n{load_persona()}\n</identity>\n\n{load_lock().strip()}\n\n"
+            f"{STYLE_RULES.strip()}{extra.rstrip()}{anchor}")
 
 
 # ================= Settings =================
@@ -988,7 +1005,7 @@ async def _generate(bot, chat_id: int, turn: Turn) -> None:
 
     history = histories[chat_id]
     messages = [{"role": "system", "content": system_prompt(github_on, confidential=not owner)}, *history,
-                {"role": "user", "content": turn.content}]
+                {"role": "user", "content": with_reminder(turn.content)}]
     ui = ResponseUI(bot, chat_id, show_thinking, long_pages)
     ui.task = asyncio.current_task()
     active[chat_id] = ui
@@ -1182,7 +1199,8 @@ def make_env(ws: Workspace, changes: Changes, board: "agent.Board", web_on: bool
         gh=(lambda n, a, progress=None: github_tools.run_github(n, a, progress)) if gh_on else None,
         gh_token=github_tools.token(), gh_login=github_tools.login if gh_on else None,
         headers={"X-Title": t} if (t := load_title()) else {}, worker_prompt=config.WORKER_PROMPT,
-        agent_persona=load_identity("agents"), agent_identity_rules=config.AGENT_IDENTITY_RULES)
+        agent_persona=load_identity("agents"), agent_identity_rules=config.AGENT_IDENTITY_RULES,
+        identity_reminder=config.IDENTITY_REMINDER)
 
 
 async def lead_round(ui: ResponseUI, messages: list, kw: dict, tool_kwargs: dict):
@@ -1225,7 +1243,8 @@ async def _generate_agent(bot, chat_id: int, turn: Turn) -> None:
     persona, identity_rules = lead_identity()
     system = agent.lead_system(env, config.LEAD_PROMPT, plan, persona or None, GITHUB_NOTE, journal_text(ws.name),
                                identity_rules)
-    messages = [{"role": "system", "content": system}, *history, {"role": "user", "content": turn.content}]
+    messages = [{"role": "system", "content": system}, *history,
+                {"role": "user", "content": with_reminder(turn.content, bool(persona))}]
     await drop_old_buttons(bot, chat_id)
 
     ui = ResponseUI(bot, chat_id, show_thinking, long_pages, board=board)
@@ -2901,7 +2920,8 @@ async def cmd_context(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
              ("Project memory (AGENTS.md)", len(agent.project_memory(ws))),
              ("Project journal", len(journal_text(ws.name))),
              ("Agent types", len(agent.agent_types_text(ws))),
-             ("Lead identity" if identity_rules else "Persona (voice)", len(persona or "") + len(identity_rules)),
+             ("Lead identity" if load_identity("lead").strip() else "Lead identity (the Chat persona)",
+             len(persona or "") + len(identity_rules)),
              ("Tool definitions", len(json.dumps(tools, ensure_ascii=False))),
              (f"Conversation ({len(hist)} messages)", sum(len(str(m.get("content"))) for m in hist))]
     total = sum(n for _, n in parts)

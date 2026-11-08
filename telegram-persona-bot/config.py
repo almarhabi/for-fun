@@ -220,4 +220,7 @@ CONFIDENTIAL_NOTE: str = _rules.get("confidential", "")
 # Coding identities: how the lead's and the agents' identities (set from Telegram) are applied
 LEAD_IDENTITY_RULES: str = _rules.get("lead_identity", "")
 AGENT_IDENTITY_RULES: str = _rules.get("agent_identity", "")
+# Keeps the model in its identity: a closing line of the system prompt, and a short note with each new message
+IDENTITY_ANCHOR: str = _rules.get("identity_anchor", "")
+IDENTITY_REMINDER: str = _rules.get("identity_reminder", "")
 DEFAULT_PERSONA: str = _data.get("default_persona", "You are a friendly assistant.")

@@ -594,7 +594,8 @@ async def scenario():
     push("edited_message", {"message_id": last_user, "date": int(time.time()), "edit_date": int(time.time()),
                             "chat": CHAT, "from": USER, "text": "edited question"})
     await wait_idle()
-    check("edit: model got edited text", MODEL_CALLS[-1]["messages"][-1]["content"] == "edited question", MODEL_CALLS[-1]["messages"][-1])
+    check("edit: model got edited text", str(MODEL_CALLS[-1]["messages"][-1]["content"]).startswith("edited question"),
+          MODEL_CALLS[-1]["messages"][-1])
     check("edit: new reply", "reply to the edited message" in strip(last_bot()["text"]))
 
     # 5b) reasoning_details is saved and sent back with the next message
@@ -777,6 +778,20 @@ async def scenario():
     check("persona: file only, no text message", "persona from a file" not in (last_bot().get("text") or "")
           and "characters" in docs[-1][1].get("caption", ""), (last_bot().get("text"), docs[-1][1].get("caption")))
     check("persona: system prompt has exact persona", "<identity>\npersona from a file\nline 2 **\n</identity>" in bot.system_prompt())
+    check("persona: comes first in the system prompt, and the prompt ends tying back to it",
+          bot.system_prompt().startswith("<identity>\npersona from a file") and "you are it, completely"
+          in bot.system_prompt()[-500:], bot.system_prompt()[:120])
+    check("persona: confidential note before it for others", bot.system_prompt(False, confidential=True)
+          .startswith("⚠️ CONFIDENTIAL") and "<identity>" in bot.system_prompt(False, confidential=True))
+    SCRIPT["rounds"] = [text_deltas("in character")]
+    n0 = len(MODEL_CALLS)
+    user_msg("stay in character?")
+    await wait_idle()
+    sent = str(MODEL_CALLS[n0]["messages"][-1]["content"])
+    check("persona: each new message carries a short reminder to stay in it", "stay in character?" in sent
+          and "never mention it" in sent, sent[-300:])
+    check("persona: the reminder is never saved in the memory", not any(
+        "never mention it" in str(m.get("content")) for h in bot.histories.values() for m in h))
 
     # 12) Non-owners can't change the persona
     user_msg("/setpersona hijack", user=OTHER, chat={"id": 222, "type": "private"})
@@ -1222,7 +1237,8 @@ async def agent_scenario(app):
     SCRIPT["rounds"] = [text_deltas("OK, Python")]
     press(cb_of(reply, "ask:"), reply["message_id"])
     await wait_idle()
-    check("ask: answer becomes next turn", lead_calls()[-1]["messages"][-1]["content"] == "Python")
+    check("ask: answer becomes next turn", str(lead_calls()[-1]["messages"][-1]["content"]).split("\n\n[System note")[0]
+          == "Python", lead_calls()[-1]["messages"][-1])
 
     # H) Plan mode: read-only → plan → approval → execution
     user_msg("/plan")
@@ -1610,10 +1626,19 @@ async def agent_scenario(app):
     await wait_idle()
     lead_sys = [c for c in MODEL_CALLS[n0:] if c.get("model") == LEAD][0]["messages"][0]["content"]
     wsys = [c for c in MODEL_CALLS[n0:] if c.get("model") == WORKER][0]["messages"][0]["content"]
-    check("lead identity: in the lead prompt with its rules, instead of the Chat persona",
-          "Captain Nora" in lead_sys and "the rules win" in lead_sys and "PERSONA-MARKER-123" not in lead_sys, lead_sys[-600:])
-    check("agents identity: in every agent prompt with its rules", "Rami, a meticulous engineer" in wsys
-          and "they win" in wsys and "Captain Nora" not in wsys, wsys[:900])
+    check("lead identity: first in the lead prompt, fully binding, instead of the Chat persona",
+          lead_sys.startswith("## Who you are") and "Captain Nora" in lead_sys[:1500]
+          and "follow the identity" in lead_sys[:1500] and "PERSONA-MARKER-123" not in lead_sys
+          and "the rules win" not in lead_sys, lead_sys[:700])
+    wcall = [c for c in MODEL_CALLS[n0:] if c.get("model") == WORKER][0]
+    check("agents identity: first in every agent prompt, fully binding", wsys.startswith("## Who you are")
+          and "Rami, a meticulous engineer" in wsys[:1500] and "they win" not in wsys and "Captain Nora" not in wsys,
+          wsys[:900])
+    check("agents identity: a reminder comes with the task", "never mention it" in wcall["messages"][1]["content"])
+    lead_call = [c for c in MODEL_CALLS[n0:] if c.get("model") == LEAD][0]
+    owner_msg = next((str(m["content"]) for m in lead_call["messages"] if m.get("role") == "user"
+                      and "identity test" in str(m.get("content"))), "")
+    check("lead identity: a reminder comes with the owner's message", "never mention it" in owner_msg, owner_msg)
     user_msg("/status")
     await wait_idle()
     check("status: shows identities", "Lead: own identity" in last_bot()["text"] and "agents: own identity" in last_bot()["text"],

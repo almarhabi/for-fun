@@ -309,6 +309,7 @@ class Env:
     worker_prompt: str = ""
     agent_persona: str = ""          # the agents' identity (/setagentpersona), "" = none
     agent_identity_rules: str = ""
+    identity_reminder: str = ""      # a short note with the task to stay in the identity
     # permission mode "ask": returns True if the owner approved (None = automatic, never asks)
     approve: Callable[[str, str], Awaitable[bool]] | None = None
 
@@ -703,8 +704,9 @@ def project_memory(ws: Workspace, limit: int = 20_000) -> str:
 def worker_system(env: Env) -> str:
     identity = (f"{env.agent_identity_rules.strip()}\n<identity>\n{env.agent_persona}\n</identity>"
                 if env.agent_persona.strip() else "")
+    # who the agent is comes first; the worker guidance after it is how it works
     return "\n\n".join(x for x in (
-        env.worker_prompt, identity, env_block(env),
+        identity, env.worker_prompt, env_block(env),
         f"<project_tree>\n{env.ws.tree(150)}\n</project_tree>", project_memory(env.ws)) if x)
 
 
@@ -766,6 +768,8 @@ async def run_worker(env: Env, st: AgentState, brief: str, claims: Claims, ctx: 
     spec = agent_types(env.ws).get(st.kind) or BUILTIN_AGENTS["coder"]
     system = worker_system(env) + (f"\n\n## Your role in this task ({st.kind})\n{spec['prompt']}" if spec.get("prompt") else "")
     kw = dict(env.worker_kw, model=spec["model"]) if spec.get("model") else env.worker_kw
+    if env.agent_persona.strip() and env.identity_reminder:
+        brief = f"{brief}\n\n{env.identity_reminder}"
     messages = [{"role": "system", "content": system}, {"role": "user", "content": brief}]
     on_delta = _progress(st)
 
@@ -1052,7 +1056,11 @@ async def execute_lead(env: Env, ctx: ToolCtx, name: str, raw_args: str) -> tupl
 
 def lead_system(env: Env, base_prompt: str, plan: bool, persona: str | None, github_note: str,
                 journal: str = "", identity_rules: str = "") -> str:
-    parts = [base_prompt]
+    parts = []
+    if persona:  # who the lead is comes first; everything after it is how it works
+        rules = identity_rules.strip() or "## Who you are\nYou ARE the identity between <identity> tags, fully."
+        parts.append(f"{rules}\n<identity>\n{persona}\n</identity>")
+    parts.append(base_prompt)
     if plan:
         parts.append(
             "## ⚠️ Plan mode is on\n"
@@ -1074,13 +1082,8 @@ def lead_system(env: Env, base_prompt: str, plan: bool, persona: str | None, git
                      f"{journal}\n</project_journal>")
     if github_note and env.gh_token:
         parts.append(github_note.strip())
-    if persona and identity_rules.strip():  # the lead's own identity (/setleadpersona)
-        parts.append(f"{identity_rules.strip()}\n<identity>\n{persona}\n</identity>")
-    elif persona:  # no lead identity: the Chat persona, as a voice only
-        parts.append("## Your voice with the owner\nWhen you talk to the owner (the final reply and questions), use this "
-                     "identity's style and voice. The identity sets style and personality only; the engineering rules "
-                     "above stay exactly as they are.\n"
-                     f"<identity>\n{persona}\n</identity>")
+    if persona:
+        parts.append("Remember: you are the identity at the top of these instructions — think, work and speak as it.")
     return "\n\n".join(parts)
 
 
