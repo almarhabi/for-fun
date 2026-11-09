@@ -476,7 +476,6 @@ async def fake_create(**kw):
 bot.client.chat.completions.create = fake_create
 bot.worker_client.chat.completions.create = fake_create
 bot.usage_store.path = DATA / "key_usage.json"
-bot.CATALOG_EVERY = 0   # no real model-list checks in tests
 
 
 async def fake_tool(name, args):
@@ -1887,34 +1886,6 @@ async def backend_scenario(app):
         return out
 
     ALL = {"NVIDIA_KEYS": "k1\nk2\n k3 \n\nk2", "AIHUBMIX_KEYS": "'a1'\na2", "ORCAROUTER_KEYS": "o1"}
-    orf, orf_log, orf_made, _ = make({"OPENROUTER_API_KEY": "Bearer sk-or-v1-abc\n"})
-    orr = B.ModelRouter(orf, lambda: "smart")
-    check("OpenRouter Free: uses the same OpenRouter key (a pasted 'Bearer' is dropped)",
-          len(orf["openrouter_free"].pool) == 1 and orf_made and list(orf_made) == ["sk-or-v1-abc"], list(orf_made))
-    check("OpenRouter Free: not offered while the ':free' version doesn't exist", orr.options(DS) == ["openrouter"]
-          and "deepseek/deepseek-v4.1-flash-1017:free" in orf["openrouter_free"].waiting_for())
-
-    async def fake_catalog(url):
-        return {"data": [{"id": "deepseek/deepseek-v4.1-flash-1017:free"}, {"id": "other/model:free"}]}
-    changes = await B.refresh_catalogs(orf, fetch=fake_catalog)
-    req = orf["openrouter_free"].request({"model": DS, "messages": [], "stream": True,
-                                          "extra_body": {"provider": {"only": ["deepinfra/fp8"]}}})
-    check("OpenRouter Free: joins by itself once OpenRouter lists it", orr.options(DS) == ["smart", "openrouter",
-          "openrouter_free"] and "GLM" not in str(changes) and "now offers deepseek/deepseek-v4.1-flash-1017:free"
-          in str(changes) and not orf["openrouter_free"].serves(GLM), (orr.options(DS), changes))
-    check("OpenRouter Free: the ':free' id, thinking on, no fixed paid provider", req["model"] ==
-          "deepseek/deepseek-v4.1-flash-1017:free" and req["extra_body"] == {"reasoning": {"enabled": True}}, req)
-
-    async def broken_catalog(url):
-        raise httpx.ConnectError("down")
-    await B.refresh_catalogs(orf, fetch=broken_catalog)
-    check("OpenRouter Free: a failed check keeps what was known", orf["openrouter_free"].serves(DS))
-
-    async def gone_catalog(url):
-        return {"data": [{"id": "other/model:free"}]}
-    changes = await B.refresh_catalogs(orf, fetch=gone_catalog)
-    check("OpenRouter Free: leaves by itself when OpenRouter drops it", not orf["openrouter_free"].serves(DS)
-          and "no longer offers" in str(changes), changes)
     ex, ex_log, ex_made, _ = make({"EXPLABS_API_KEY": "e1\ne2"})
     exr = B.ModelRouter(ex, lambda: "smart")
     check("ExpLabs: keys from EXPLABS_KEYS (or EXPLABS_API_KEY), offered for DeepSeek only",
@@ -2319,8 +2290,7 @@ async def backend_scenario(app):
     # ----- in Telegram -----
     bot.save_setting("agent_mode", False)
     saved = dict(bot.providers)
-    provs, log, made, paid = make({"NVIDIA_KEYS": "k1\nk2\nk3", "AIHUBMIX_KEYS": "a1\na2", "EXPLABS_KEYS": "e1",
-                                   "OPENROUTER_API_KEY": "sk-or-test"},
+    provs, log, made, paid = make({"NVIDIA_KEYS": "k1\nk2\nk3", "AIHUBMIX_KEYS": "a1\na2", "EXPLABS_KEYS": "e1"},
                                   store=B.UsageStore(DATA / "key_usage.json"))
     bot.providers.clear()
     bot.providers.update(provs)
@@ -2363,9 +2333,6 @@ async def backend_scenario(app):
           and "tokens today" in t and "daily quota" in t, t)
     check("/doctor: ExpLabs pinged, with its input and output budgets", "ExpLabs key 1 — answers" in t
           and "/1.0M input today" in t and "/1.0M output today" in t, t)
-    check("/doctor: OpenRouter Free says it's waiting for the ':free' version (and isn't pinged)",
-          "OpenRouter Free — waiting: deepseek/deepseek-v4.1-flash-1017:free" in t
-          and not any(n == "sk-or-test" for n, _ in log), t)
     user_msg("/status")
     await wait_idle()
     t = last_bot()["text"]

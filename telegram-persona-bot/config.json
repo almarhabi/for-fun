@@ -17,7 +17,7 @@
     "z-ai/glm-5.3": "z-ai/glm-5.3-flash"
   },
   "free_providers": {
-    "_note": "Free model sources. Each one: its API address, the secret that holds its keys (ONE key per line, any number of keys — the order of the lines is kept), per-key limits (rpm = requests a minute, rpd = requests a day, tpd = tokens a day, tpd_in / tpd_out = input / output tokens a day; 0 = no limit), which of the bot's models it serves (bot model → the provider's own model id), and extra request fields per model (how to turn thinking on). A provider without keys is simply not offered. legacy_env: older secret names still read. catalog_url: a public model list checked every hour — the source serves only the ids it lists right now (OpenRouter's \":free\" versions come and go); until then it isn't offered. OpenRouter Free uses the same OPENROUTER_API_KEY; its limits are per account: 20 a minute, 1000 a day (50 if the account bought less than $10 of credit — a daily-limit 429 then rests it for an hour).",
+    "_note": "Free model sources. Each one: its API address, the secret that holds its keys (ONE key per line, any number of keys — the order of the lines is kept), per-key limits (rpm = requests a minute, rpd = requests a day, tpd = tokens a day, tpd_in / tpd_out = input / output tokens a day; 0 = no limit), which of the bot's models it serves (bot model → the provider's own model id), and extra request fields per model (how to turn thinking on). A provider without keys is simply not offered. legacy_env: older secret names still read.",
     "nvidia": {
       "label": "NVIDIA",
       "base_url": "https://integrate.api.nvidia.com/v1",
@@ -103,34 +103,6 @@
         "deepseek/deepseek-v4.1-flash-1017": "deepseek-v4.1-flash"
       },
       "model_extra": {}
-    },
-    "openrouter_free": {
-      "label": "OpenRouter Free",
-      "base_url": "https://openrouter.ai/api/v1",
-      "keys_secret": "OPENROUTER_FREE_KEYS",
-      "legacy_env": [
-        "OPENROUTER_API_KEY"
-      ],
-      "rpm_per_key": 20,
-      "rpd_per_key": 1000,
-      "tpd_per_key": 0,
-      "models": {
-        "deepseek/deepseek-v4.1-flash-1017": "deepseek/deepseek-v4.1-flash-1017:free",
-        "z-ai/glm-5.3-flash": "z-ai/glm-5.3-flash:free"
-      },
-      "model_extra": {
-        "deepseek/deepseek-v4.1-flash-1017": {
-          "reasoning": {
-            "enabled": true
-          }
-        },
-        "z-ai/glm-5.3-flash": {
-          "reasoning": {
-            "enabled": true
-          }
-        }
-      },
-      "catalog_url": "https://openrouter.ai/api/v1/models"
     }
   },
   "routing": {
